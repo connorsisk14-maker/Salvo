@@ -1,0 +1,182 @@
+export const TASK_STATUSES = [
+  "queued",
+  "planning",
+  "running",
+  "blocked",
+  "completed",
+  "failed",
+  "needs_review",
+  "cancelled"
+] as const;
+
+export type TaskStatus = (typeof TASK_STATUSES)[number];
+
+export const CONTRACT_STATUSES = [
+  "draft",
+  "approved",
+  "active",
+  "superseded",
+  "closed"
+] as const;
+
+export type ContractStatus = (typeof CONTRACT_STATUSES)[number];
+
+export const RUN_STATUSES = [
+  "created",
+  "provisioning",
+  "starting",
+  "running",
+  "evaluating",
+  "completed",
+  "failed",
+  "blocked",
+  "cancelled"
+] as const;
+
+export type RunStatus = (typeof RUN_STATUSES)[number];
+
+export const TERMINAL_RUN_STATUSES = [
+  "completed",
+  "failed",
+  "blocked",
+  "cancelled"
+] as const;
+
+export type TerminalRunStatus = (typeof TERMINAL_RUN_STATUSES)[number];
+
+export const RUN_EXIT_REASONS = [
+  "success",
+  "policy_violation",
+  "timeout",
+  "runner_crash",
+  "stale_runner",
+  "evaluation_failed",
+  "cancelled",
+  "unknown"
+] as const;
+
+export type RunExitReason = (typeof RUN_EXIT_REASONS)[number];
+
+export const POLICY_DENY_REASONS = [
+  "forbidden_path",
+  "path_not_allowlisted",
+  "command_not_allowlisted",
+  "invalid_argument",
+  "cwd_not_allowlisted",
+  "timeout"
+] as const;
+
+export type PolicyDenyReason = (typeof POLICY_DENY_REASONS)[number];
+
+export const AGENT_PROFILES = [
+  "builder",
+  "researcher",
+  "debugger",
+  "documenter"
+] as const;
+
+export type AgentProfile = (typeof AGENT_PROFILES)[number];
+
+export const RETRY_DISPOSITIONS = [
+  "not_needed",
+  "scheduled",
+  "exhausted"
+] as const;
+
+export type RetryDisposition = (typeof RETRY_DISPOSITIONS)[number];
+
+export const EVALUATION_OUTCOMES = ["passed", "failed", "hard_failed"] as const;
+
+export type EvaluationOutcome = (typeof EVALUATION_OUTCOMES)[number];
+
+export const RUN_EVENT_TYPES = [
+  "run.started",
+  "run.heartbeat",
+  "plan.generated",
+  "tool.called",
+  "tool.result",
+  "policy.denied",
+  "artifact.created",
+  "roadblock.detected",
+  "evaluation.completed",
+  "run.final_payload",
+  "run.completed",
+  "run.failed"
+] as const;
+
+export type RunEventType = (typeof RUN_EVENT_TYPES)[number];
+
+export const RUN_EVENT_LEVELS = ["debug", "info", "warn", "error"] as const;
+
+export type RunEventLevel = (typeof RUN_EVENT_LEVELS)[number];
+
+export type TaskId = string;
+export type ContractId = string;
+export type RunId = string;
+export type WorkspaceId = string;
+
+const TASK_TRANSITIONS: Record<TaskStatus, readonly TaskStatus[]> = {
+  queued: ["planning", "cancelled"],
+  planning: ["running", "blocked", "failed", "cancelled", "needs_review"],
+  running: ["completed", "blocked", "failed", "needs_review", "cancelled"],
+  blocked: ["running", "failed", "needs_review", "cancelled"],
+  completed: [],
+  failed: [],
+  needs_review: ["running", "completed", "failed", "cancelled"],
+  cancelled: []
+};
+
+const CONTRACT_TRANSITIONS: Record<ContractStatus, readonly ContractStatus[]> = {
+  draft: ["approved", "superseded", "closed"],
+  approved: ["active", "superseded", "closed"],
+  active: ["superseded", "closed"],
+  superseded: [],
+  closed: []
+};
+
+const RUN_TRANSITIONS: Record<RunStatus, readonly RunStatus[]> = {
+  created: ["provisioning", "starting", "cancelled", "failed"],
+  provisioning: ["starting", "failed", "cancelled", "blocked"],
+  starting: ["running", "failed", "cancelled", "blocked"],
+  running: ["evaluating", "failed", "blocked", "cancelled", "completed"],
+  evaluating: ["completed", "failed", "blocked"],
+  completed: [],
+  failed: [],
+  blocked: [],
+  cancelled: []
+};
+
+function assertTransition<T extends string>(
+  current: T,
+  next: T,
+  allowedMap: Record<T, readonly T[]>,
+  stateName: string
+): void {
+  if (current === next) {
+    return;
+  }
+
+  const allowed = allowedMap[current] ?? [];
+  if (!allowed.includes(next)) {
+    throw new Error(`Invalid ${stateName} transition: ${current} -> ${next}`);
+  }
+}
+
+export function assertTaskTransition(current: TaskStatus, next: TaskStatus): void {
+  assertTransition(current, next, TASK_TRANSITIONS, "task");
+}
+
+export function assertContractTransition(
+  current: ContractStatus,
+  next: ContractStatus
+): void {
+  assertTransition(current, next, CONTRACT_TRANSITIONS, "contract");
+}
+
+export function assertRunTransition(current: RunStatus, next: RunStatus): void {
+  assertTransition(current, next, RUN_TRANSITIONS, "run");
+}
+
+export function isTerminalRunStatus(status: RunStatus): status is TerminalRunStatus {
+  return TERMINAL_RUN_STATUSES.includes(status as TerminalRunStatus);
+}

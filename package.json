@@ -1,0 +1,19 @@
+{
+  "name": "salvo",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@10.8.1",
+  "scripts": {
+    "dev": "pnpm --filter @salvo/web dev",
+    "dev:dashboard": "pnpm --filter @salvo/web dev",
+    "dev:api": "pnpm --filter @salvo/orchestrator-api dev",
+    "dev:orchestrator": "pnpm --filter @salvo/orchestrator-daemon dev",
+    "dev:runner": "pnpm --filter @salvo/agent-runner runner -- --run-id",
+    "dev:research": "pnpm --filter @salvo/research-daemon dev",
+    "dev:all": "pnpm -r --parallel --filter @salvo/web --filter @salvo/orchestrator-api --filter @salvo/orchestrator-daemon --filter @salvo/research-daemon dev",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r --if-present test",
+    "test:e2e": "node scripts/e2e-smoke.mjs"
+  }
+}

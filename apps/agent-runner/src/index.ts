@@ -1,0 +1,224 @@
+import path from "node:path";
+import { mkdir } from "node:fs/promises";
+import { createDbPool, SalvoRepository } from "@salvo/db";
+import {
+  buildToolPolicy,
+  CommandAdapter,
+  FilesystemAdapter,
+  type ToolPolicy
+} from "@salvo/tools";
+
+function parseArg(flag: string): string | undefined {
+  const idx = process.argv.indexOf(flag);
+  if (idx === -1) {
+    return undefined;
+  }
+  return process.argv[idx + 1];
+}
+
+function parseContractPolicy(
+  workspaceRoot: string,
+  contractJson: Record<string, unknown>
+): ToolPolicy {
+  const scope =
+    (contractJson.scope as
+      | { read_paths?: string[]; write_paths?: string[]; forbidden_paths?: string[] }
+      | undefined) ?? {};
+
+  const capabilities =
+    (contractJson.capabilities as { run_tests?: boolean } | undefined) ?? {};
+
+  const allowedCommands = capabilities.run_tests
+    ? ["echo", "ls", "cat", "pnpm", "npm", "node"]
+    : ["echo", "ls", "cat"];
+
+  return buildToolPolicy(workspaceRoot, {
+    allowedReadPaths: scope.read_paths ?? ["."],
+    allowedWritePaths: scope.write_paths ?? ["."],
+    forbiddenPaths: scope.forbidden_paths ?? [".git", "node_modules"],
+    allowedCommandCwds: ["."],
+    allowedCommands,
+    commandTimeoutMs: 20_000
+  });
+}
+
+async function main(): Promise<void> {
+  const runId = parseArg("--run-id");
+  if (!runId) {
+    throw new Error("Missing --run-id");
+  }
+
+  const pool = createDbPool();
+  const repo = new SalvoRepository(pool);
+
+  const context = await repo.getRunWithContext(runId);
+  if (!context) {
+    throw new Error(`Run context not found for ${runId}`);
+  }
+
+  const { run, task, contract } = context;
+  const workspaceRoot = path.resolve(
+    process.env.SALVO_WORKSPACE_ROOT ?? process.cwd(),
+    "runs",
+    run.id
+  );
+
+  await mkdir(workspaceRoot, { recursive: true });
+
+  const policy = parseContractPolicy(workspaceRoot, contract.contract_json);
+  const filesystem = new FilesystemAdapter(workspaceRoot, policy);
+  const command = new CommandAdapter(policy);
+
+  await repo.transitionRunStatus(run.id, "running", {
+    runnerPid: process.pid,
+    startedAt: new Date(),
+    heartbeatAt: new Date()
+  });
+  await repo.transitionTaskStatus(task.id, "running");
+  await repo.appendRunEvent(run.id, "run.started", "info", {
+    run_id: run.id,
+    task_id: task.id,
+    workspace: workspaceRoot,
+    agent_profile: run.agent_profile
+  });
+
+  const heartbeatTimer = setInterval(async () => {
+    await repo.recordHeartbeat(run.id);
+    await repo.appendRunEvent(run.id, "run.heartbeat", "debug", {
+      at: new Date().toISOString()
+    });
+  }, 10_000);
+
+  try {
+    await repo.appendRunEvent(run.id, "plan.generated", "info", {
+      steps: [
+        "Create run summary deliverable",
+        "Emit evidence command output",
+        "Finalize payload"
+      ]
+    });
+
+    const writeResult = await filesystem.writeFile(
+      "run-summary.md",
+      `# Run Summary\n\nTask: ${task.title}\n\nRequest: ${task.original_request}\n`
+    );
+
+    if (!writeResult.ok) {
+      await repo.appendRunEvent(run.id, "policy.denied", "warn", {
+        reason: writeResult.decision.reason,
+        message: writeResult.decision.message,
+        target: "run-summary.md"
+      });
+
+      await repo.appendRunEvent(run.id, "run.final_payload", "error", {
+        status: "blocked",
+        summary: "Run blocked by file policy",
+        deliverables: [],
+        evidence: {
+          tests_run: [],
+          command_results: []
+        },
+        roadblocks: [
+          {
+            type: "policy_denied",
+            description: writeResult.decision.message
+          }
+        ],
+        learnings: [
+          {
+            type: "failure_pattern",
+            title: "Policy denied write",
+            body: writeResult.decision.message
+          }
+        ]
+      });
+
+      await repo.appendRunEvent(run.id, "run.failed", "error", {
+        reason: "policy_denied"
+      });
+      process.exitCode = 1;
+      return;
+    }
+
+    await repo.createArtifact({
+      runId: run.id,
+      taskId: task.id,
+      artifactType: "markdown",
+      path: writeResult.absolutePath,
+      metadataJson: {
+        label: "run summary"
+      }
+    });
+
+    await repo.appendRunEvent(run.id, "artifact.created", "info", {
+      path: writeResult.absolutePath,
+      artifact_type: "markdown"
+    });
+
+    await repo.appendRunEvent(run.id, "tool.called", "info", {
+      tool: "command",
+      command: "echo",
+      args: ["runner evidence"]
+    });
+
+    const commandResult = await command.run("echo", ["runner evidence"], workspaceRoot);
+
+    if (!commandResult.ok) {
+      await repo.appendRunEvent(run.id, "policy.denied", "warn", {
+        reason: commandResult.decision.reason,
+        message: commandResult.decision.message,
+        command: "echo"
+      });
+    } else {
+      await repo.appendRunEvent(run.id, "tool.result", "info", {
+        command: "echo",
+        exit_code: commandResult.exitCode,
+        stdout: commandResult.stdout.trim()
+      });
+    }
+
+    await repo.appendRunEvent(run.id, "run.final_payload", "info", {
+      status: "completed",
+      summary: `Generated run summary for task ${task.id}`,
+      deliverables: ["run-summary.md"],
+      evidence: {
+        tests_run: [],
+        command_results: [
+          commandResult.ok
+            ? {
+                command: "echo",
+                exit_code: commandResult.exitCode
+              }
+            : {
+                command: "echo",
+                denied: true,
+                reason: commandResult.decision.reason
+              }
+        ],
+        files_changed: 1
+      },
+      roadblocks: [],
+      learnings: [
+        {
+          type: "best_practice",
+          title: "Adapter-only execution",
+          body: "Runner used only policy-enforced adapters for file and command operations."
+        }
+      ]
+    });
+
+    await repo.appendRunEvent(run.id, "run.completed", "info", {
+      summary: "Runner completed payload emission"
+    });
+  } catch (error) {
+    await repo.appendRunEvent(run.id, "run.failed", "error", {
+      error: (error as Error).message
+    });
+    process.exitCode = 1;
+  } finally {
+    clearInterval(heartbeatTimer);
+    await repo.close();
+  }
+}
+
+await main();

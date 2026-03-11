@@ -1,0 +1,280 @@
+:root {
+  --paper: #f0eadc;
+  --paper-shadow: #e3dac7;
+  --ink: #172034;
+  --muted: #5d677d;
+  --line: #9b927f;
+  --accent: #1f4d8b;
+  --accent-soft: #d9e7fb;
+  --error: #8f2626;
+  --warn: #8a5c0f;
+  --ok: #29603f;
+  font-family: "IBM Plex Sans", "Avenir Next", "Segoe UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  color: var(--ink);
+  background:
+    radial-gradient(circle at top right, #efe4ce 0%, transparent 32%),
+    repeating-linear-gradient(
+      0deg,
+      #f7f2e5 0,
+      #f7f2e5 24px,
+      #f3ede0 24px,
+      #f3ede0 25px
+    );
+}
+
+h1,
+h2,
+h3,
+strong {
+  font-family: "IBM Plex Mono", "Menlo", monospace;
+}
+
+.app-frame {
+  min-height: 100vh;
+}
+
+.main-panel {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 1.25rem;
+}
+
+.clip-card {
+  position: relative;
+  border: 2px solid var(--line);
+  border-radius: 10px;
+  box-shadow: 6px 6px 0 var(--paper-shadow);
+}
+
+.clip-card::before {
+  content: "";
+  position: absolute;
+  top: -8px;
+  right: 14px;
+  width: 56px;
+  height: 12px;
+  border: 2px solid var(--line);
+  border-bottom: 0;
+  border-radius: 8px 8px 0 0;
+  background: #f7f2e5;
+}
+
+.content {
+  background: var(--paper);
+  padding: 1rem;
+}
+
+.content-header {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  margin-bottom: 0.8rem;
+}
+
+.content-header p {
+  margin: 0;
+}
+
+.panel {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.8rem;
+  background: #f9f5ea;
+  margin-bottom: 0.8rem;
+}
+
+.health-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 0.7rem;
+}
+
+.health-card {
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  padding: 0.7rem;
+  background: #f4ecdd;
+}
+
+.health-card h3 {
+  margin: 0;
+}
+
+.health-card p {
+  margin: 0.35rem 0 0;
+}
+
+.health-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.status-pill {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0.15rem 0.5rem;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  font-family: "IBM Plex Mono", "Menlo", monospace;
+}
+
+.status-healthy {
+  border-color: var(--ok);
+  color: var(--ok);
+  background: #e2f7e9;
+}
+
+.status-stale {
+  border-color: var(--warn);
+  color: var(--warn);
+  background: #fff5dd;
+}
+
+.status-offline {
+  border-color: var(--error);
+  color: var(--error);
+  background: #fde8e8;
+}
+
+.restart-controls {
+  margin-top: 0.8rem;
+  border-top: 1px solid var(--line);
+  padding-top: 0.7rem;
+}
+
+.restart-controls summary {
+  cursor: pointer;
+  font-family: "IBM Plex Mono", "Menlo", monospace;
+  font-weight: 600;
+}
+
+.restart-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.restart-note {
+  margin-top: 0.6rem;
+  font-family: "IBM Plex Mono", "Menlo", monospace;
+  font-size: 0.84rem;
+}
+
+.form-grid {
+  display: grid;
+  gap: 0.6rem;
+}
+
+label {
+  display: block;
+  font-weight: 600;
+}
+
+input,
+textarea {
+  width: 100%;
+  margin-top: 0.2rem;
+  padding: 0.45rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+  font: inherit;
+  font-weight: 400;
+}
+
+.checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-weight: 500;
+}
+
+.checkbox-label input {
+  width: auto;
+  margin: 0;
+}
+
+.button-link {
+  display: inline-block;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.45rem 0.58rem;
+  text-decoration: none;
+  color: inherit;
+  background: #f7f1e2;
+  font: inherit;
+  cursor: pointer;
+}
+
+.button-link:hover {
+  background: #efe7d5;
+}
+
+.button-link:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.grid-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.92rem;
+}
+
+.grid-table th,
+.grid-table td {
+  border: 1px solid var(--line);
+  text-align: left;
+  padding: 0.45rem;
+  vertical-align: top;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.mono {
+  font-family: "IBM Plex Mono", "Menlo", monospace;
+}
+
+.json-block,
+.json-inline {
+  margin: 0;
+  max-height: 260px;
+  overflow: auto;
+  font-family: "IBM Plex Mono", "Menlo", monospace;
+  font-size: 0.78rem;
+  background: #f3ecde;
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+  padding: 0.5rem;
+}
+
+.error-banner {
+  border: 1px solid var(--error);
+  color: var(--error);
+  background: #fde8e8;
+  border-radius: 6px;
+  padding: 0.55rem;
+}
+
+@media (max-width: 900px) {
+  .main-panel {
+    padding: 0.8rem;
+  }
+
+  .grid-table {
+    display: block;
+    overflow-x: auto;
+  }
+}
