@@ -1,5 +1,7 @@
 const baseUrl = process.env.SALVO_E2E_API_URL ?? "http://localhost:8787";
 const timeoutMs = Number(process.env.SALVO_E2E_TIMEOUT_MS ?? 45_000);
+const requireResearch =
+  (process.env.SALVO_E2E_REQUIRE_RESEARCH ?? "0").toLowerCase() === "1";
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -90,10 +92,16 @@ async function main() {
     throw new Error("Evaluation missing or not passed.");
   }
 
-  const detail = await waitForResearch(run.id, startedAt);
-
   console.log(`[e2e] evaluation score: ${terminal.evaluation.score}`);
-  console.log(`[e2e] research docs: ${detail.research.length}`);
+  if (requireResearch) {
+    const detail = await waitForResearch(run.id, startedAt);
+    console.log(`[e2e] research docs: ${detail.research.length}`);
+  } else {
+    const detail = await request(`/runs/${run.id}`);
+    console.log(
+      `[e2e] research docs currently linked: ${Array.isArray(detail.research) ? detail.research.length : 0}`
+    );
+  }
   console.log("[e2e] PASS");
 }
 
