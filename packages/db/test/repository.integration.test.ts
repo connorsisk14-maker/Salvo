@@ -22,7 +22,8 @@ if (!databaseUrl) {
     for (const fileName of [
       "0001_bootstrap.sql",
       "0002_runtime_contract.sql",
-      "0003_daemon_heartbeats.sql"
+      "0003_daemon_heartbeats.sql",
+      "0004_run_cancellation.sql"
     ]) {
       const sql = await readFile(path.join(migrationDir, fileName), "utf8");
       await pool.query(sql);
@@ -153,6 +154,61 @@ if (!databaseUrl) {
     const staleRun = await repo.getRun(run.id);
     assert.equal(staleRun?.status, "failed");
     assert.equal(staleRun?.exit_reason, "stale_runner");
+  });
+
+  test("manual retry request re-queues failed task and appends retry event", async () => {
+    const { run, task } = await createBasicRun();
+
+    await repo.transitionRunStatus(run.id, "starting");
+    await repo.transitionRunStatus(run.id, "running");
+    await repo.transitionRunStatus(run.id, "failed");
+    await repo.transitionTaskStatus(task.id, "planning");
+    await repo.transitionTaskStatus(task.id, "running");
+    await repo.transitionTaskStatus(task.id, "failed");
+
+    const retry = await repo.requestRetryForRun(run.id);
+    assert.equal(retry.task.status, "queued");
+
+    const events = await repo.listRunEvents(run.id);
+    assert.equal(events.some((event) => event.event_type === "run.retry_requested"), true);
+  });
+
+  test("cancel run moves run/task to cancelled and appends cancellation event", async () => {
+    const { run, task } = await createBasicRun();
+
+    await repo.transitionRunStatus(run.id, "starting");
+    await repo.transitionRunStatus(run.id, "running");
+    await repo.transitionTaskStatus(task.id, "planning");
+    await repo.transitionTaskStatus(task.id, "running");
+
+    const cancelled = await repo.cancelRun(run.id);
+    assert.equal(cancelled.run.status, "cancelled");
+    assert.equal(cancelled.task.status, "cancelled");
+
+    const events = await repo.listRunEvents(run.id);
+    assert.equal(events.some((event) => event.event_type === "run.cancelled"), true);
+  });
+
+  test("request run cancellation marks run and clears queue after cancellation", async () => {
+    const { run, task } = await createBasicRun();
+
+    await repo.transitionRunStatus(run.id, "starting");
+    await repo.transitionRunStatus(run.id, "running");
+    await repo.transitionTaskStatus(task.id, "planning");
+    await repo.transitionTaskStatus(task.id, "running");
+
+    const requested = await repo.requestRunCancellation(run.id);
+    assert.notEqual(requested.cancellation_requested_at, null);
+
+    const queue = await repo.listCancellationRequestedRuns(10);
+    assert.equal(queue.some((item) => item.id === run.id), true);
+
+    const requestEvents = await repo.listRunEvents(run.id);
+    assert.equal(requestEvents.some((event) => event.event_type === "run.cancel_requested"), true);
+
+    await repo.cancelRun(run.id);
+    const queueAfterCancel = await repo.listCancellationRequestedRuns(10);
+    assert.equal(queueAfterCancel.some((item) => item.id === run.id), false);
   });
 
   test("research/memory context excludes rejected entries and ranks by confidence", async () => {

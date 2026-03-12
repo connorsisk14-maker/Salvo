@@ -151,8 +151,11 @@ export function buildContractV1(input: BuildContractInput): ContractV1 {
       summary_required: true
     },
     success_criteria: {
-      required_test_commands: [],
-      assertions: ["Runner emits a final payload event."]
+      required_test_commands: ["echo salvo-test"],
+      assertions: [
+        "Runner emits a final payload event.",
+        "At least one deliverable produced."
+      ]
     },
     failure_handling: {
       stop_on_policy_denial: true

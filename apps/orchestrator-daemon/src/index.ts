@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { buildContractV1 } from "@salvo/contracts";
 import { createDbPool, SalvoRepository, type DbRun, type DbRunEvent } from "@salvo/db";
 import { evaluateRun } from "@salvo/evaluation";
@@ -9,9 +9,10 @@ const workerId = `orchestrator-${randomUUID().slice(0, 8)}`;
 
 class OrchestratorDaemon {
   private readonly repo: SalvoRepository;
-  private readonly activeRuns = new Set<string>();
+  private readonly activeRuns = new Map<string, ChildProcess>();
   private claimTimer?: NodeJS.Timeout;
   private staleTimer?: NodeJS.Timeout;
+  private cancellationTimer?: NodeJS.Timeout;
   private heartbeatTimer?: NodeJS.Timeout;
   private stopped = false;
 
@@ -31,12 +32,17 @@ class OrchestratorDaemon {
       void this.staleLoop();
     }, 5_000);
 
+    this.cancellationTimer = setInterval(() => {
+      void this.cancellationLoop();
+    }, 1_500);
+
     this.heartbeatTimer = setInterval(() => {
       void this.publishHeartbeat();
     }, 5_000);
 
     await this.claimLoop();
     await this.staleLoop();
+    await this.cancellationLoop();
   }
 
   async stop(): Promise<void> {
@@ -50,6 +56,9 @@ class OrchestratorDaemon {
     }
     if (this.staleTimer) {
       clearInterval(this.staleTimer);
+    }
+    if (this.cancellationTimer) {
+      clearInterval(this.cancellationTimer);
     }
     if (this.heartbeatTimer) {
       clearInterval(this.heartbeatTimer);
@@ -89,12 +98,19 @@ class OrchestratorDaemon {
       (entry) => entry.source_run_ids
     );
 
+    const requiresManualReview = contract.risk === "high" && !task.approved_at;
+
     const contractRecord = await this.repo.createContract({
       taskId: task.id,
       risk: contract.risk,
-      status: "active",
+      status: requiresManualReview ? "draft" : "active",
       contractJson: contract
     });
+
+    if (requiresManualReview) {
+      await this.repo.transitionTaskStatus(task.id, "needs_review");
+      return;
+    }
 
     const run = await this.repo.createRun({
       taskId: task.id,
@@ -135,12 +151,41 @@ class OrchestratorDaemon {
     }
   }
 
+  private async cancellationLoop(): Promise<void> {
+    const runs = await this.repo.listCancellationRequestedRuns(20);
+    for (const run of runs) {
+      await this.forceCancelRun(run);
+    }
+  }
+
+  private async forceCancelRun(run: DbRun): Promise<void> {
+    const child = this.activeRuns.get(run.id);
+    if (child && !child.killed) {
+      child.kill("SIGTERM");
+      setTimeout(() => {
+        if (!child.killed) {
+          child.kill("SIGKILL");
+        }
+      }, 3_000);
+    } else if (run.runner_pid) {
+      try {
+        process.kill(run.runner_pid, "SIGTERM");
+      } catch {
+        // process may already be gone
+      }
+    }
+
+    try {
+      await this.repo.cancelRun(run.id);
+    } catch {
+      // run may have already reached terminal state concurrently
+    }
+  }
+
   private async launchRun(run: DbRun): Promise<void> {
     if (this.activeRuns.has(run.id)) {
       return;
     }
-
-    this.activeRuns.add(run.id);
 
     const child = spawn(
       "pnpm",
@@ -155,6 +200,7 @@ class OrchestratorDaemon {
         stdio: ["ignore", "pipe", "pipe"]
       }
     );
+    this.activeRuns.set(run.id, child);
 
     child.stdout.on("data", (chunk) => {
       process.stdout.write(`[runner:${run.id}] ${chunk}`);
@@ -209,7 +255,10 @@ class OrchestratorDaemon {
 
     const payload = (finalPayload ?? {}) as {
       deliverables?: string[];
-      evidence?: { command_results?: Array<{ exit_code?: number }> };
+      evidence?: {
+        command_results?: Array<{ exit_code?: number }>;
+        tests_run?: Array<{ command?: string; exit_code?: number; denied?: boolean }>;
+      };
       learnings?: unknown[];
     };
 
@@ -218,11 +267,19 @@ class OrchestratorDaemon {
 
     const contractJson = detail.contract.contract_json as {
       deliverables?: { required_artifacts?: string[] };
+      success_criteria?: {
+        required_test_commands?: string[];
+        assertions?: string[];
+      };
     };
 
     const evaluation = evaluateRun({
       contractCompliance: 100,
       testsExitCode: firstExitCode,
+      testsRun: payload.evidence?.tests_run ?? [],
+      requiredTestCommands: contractJson.success_criteria?.required_test_commands ?? [],
+      requiredAssertions: contractJson.success_criteria?.assertions ?? [],
+      finalPayloadPresent: finalPayload !== null,
       requiredDeliverables: contractJson.deliverables?.required_artifacts ?? ["run-summary.md"],
       producedDeliverables: payload.deliverables ?? [],
       evidencePresent: payload.evidence !== undefined,

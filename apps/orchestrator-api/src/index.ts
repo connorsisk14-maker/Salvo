@@ -17,6 +17,7 @@ function daemonHealthStatus(heartbeatAt: string, thresholdSeconds: number): "hea
 }
 
 type RestartTarget = "orchestrator" | "research";
+type ReviewStatus = "unreviewed" | "accepted" | "rejected";
 
 type RestartResult = {
   daemon: RestartTarget;
@@ -96,6 +97,33 @@ async function forceRestartDaemon(target: RestartTarget): Promise<RestartResult>
     pid: startResult.pid,
     note: killResult.note
   };
+}
+
+function startSseStream(
+  reply: { raw: NodeJS.WritableStream; header: (name: string, value: string) => unknown; hijack: () => void },
+  onTick: () => Promise<Record<string, unknown>> | Record<string, unknown>,
+  intervalMs: number
+): void {
+  reply.header("content-type", "text/event-stream");
+  reply.header("cache-control", "no-cache");
+  reply.header("connection", "keep-alive");
+  reply.hijack();
+
+  const writeEvent = async () => {
+    const payload = await onTick();
+    reply.raw.write(`data: ${JSON.stringify(payload)}\\n\\n`);
+  };
+
+  void writeEvent();
+  const timer = setInterval(() => {
+    void writeEvent();
+  }, intervalMs);
+
+  const cleanup = () => {
+    clearInterval(timer);
+  };
+
+  reply.raw.on?.("close", cleanup);
 }
 
 export async function buildServer() {
@@ -191,6 +219,15 @@ export async function buildServer() {
     }
   });
 
+  app.post<{ Params: { id: string } }>("/tasks/:id/reject", async (req, reply) => {
+    try {
+      const task = await repo.rejectTask(req.params.id);
+      return task;
+    } catch (error) {
+      return reply.status(400).send({ error: (error as Error).message });
+    }
+  });
+
   app.post<{ Params: { id: string } }>("/tasks/:id/cancel", async (req, reply) => {
     try {
       const task = await repo.cancelTask(req.params.id);
@@ -200,7 +237,48 @@ export async function buildServer() {
     }
   });
 
-  app.get("/runs", async () => repo.listRuns(200));
+  app.get("/runs", async () => repo.listRunSummaries(200));
+
+  app.post<{ Params: { id: string } }>("/runs/:id/retry", async (req, reply) => {
+    try {
+      const result = await repo.requestRetryForRun(req.params.id);
+      return {
+        ok: true,
+        source_run_id: result.sourceRun.id,
+        task: result.task
+      };
+    } catch (error) {
+      return reply.status(400).send({ ok: false, error: (error as Error).message });
+    }
+  });
+
+  app.post<{ Params: { id: string } }>("/runs/:id/cancel", async (req, reply) => {
+    try {
+      const run = await repo.getRun(req.params.id);
+      if (!run) {
+        return reply.status(404).send({ ok: false, error: "Run not found" });
+      }
+
+      const activeStatuses = ["created", "provisioning", "starting", "running", "evaluating"];
+      if (activeStatuses.includes(run.status)) {
+        const requested = await repo.requestRunCancellation(req.params.id);
+        return {
+          ok: true,
+          requested: true,
+          run: requested
+        };
+      }
+
+      const result = await repo.cancelRun(req.params.id);
+      return {
+        ok: true,
+        run: result.run,
+        task: result.task
+      };
+    } catch (error) {
+      return reply.status(400).send({ ok: false, error: (error as Error).message });
+    }
+  });
 
   app.get<{ Params: { id: string } }>("/runs/:id", async (req, reply) => {
     const detail = await repo.getRunDetail(req.params.id);
@@ -225,6 +303,77 @@ export async function buildServer() {
       return reply.status(404).send({ error: "Contract not found" });
     }
     return contract;
+  });
+
+  app.get<{
+    Querystring: { status?: ReviewStatus };
+  }>("/research", async (req) => {
+    return repo.listResearchDocuments(200, req.query.status);
+  });
+
+  app.post<{
+    Params: { id: string };
+    Body: { status: ReviewStatus };
+  }>("/research/:id/review", async (req, reply) => {
+    const status = req.body?.status;
+    if (!status || !["unreviewed", "accepted", "rejected"].includes(status)) {
+      return reply.status(400).send({ error: "Invalid review status." });
+    }
+    await repo.setResearchReviewStatus(req.params.id, status);
+    return { ok: true };
+  });
+
+  app.get<{
+    Querystring: { status?: ReviewStatus };
+  }>("/memories", async (req) => {
+    return repo.listMemories(200, req.query.status);
+  });
+
+  app.post<{
+    Params: { id: string };
+    Body: { status: ReviewStatus };
+  }>("/memories/:id/review", async (req, reply) => {
+    const status = req.body?.status;
+    if (!status || !["unreviewed", "accepted", "rejected"].includes(status)) {
+      return reply.status(400).send({ error: "Invalid review status." });
+    }
+    await repo.setMemoryReviewStatus(req.params.id, status);
+    return { ok: true };
+  });
+
+  app.get("/stream/overview", async (_req, reply) => {
+    startSseStream(
+      reply,
+      async () => {
+        const [tasks, runs] = await Promise.all([repo.listTasks(1), repo.listRuns(1)]);
+        return {
+          ts: new Date().toISOString(),
+          last_task: tasks[0]?.updated_at ?? null,
+          last_run: runs[0]?.updated_at ?? null
+        };
+      },
+      1500
+    );
+  });
+
+  app.get<{ Params: { id: string } }>("/stream/runs/:id", async (req, reply) => {
+    const runId = req.params.id;
+    startSseStream(
+      reply,
+      async () => {
+        const [run, events] = await Promise.all([
+          repo.getRun(runId),
+          repo.listRunEvents(runId)
+        ]);
+        return {
+          ts: new Date().toISOString(),
+          run_status: run?.status ?? null,
+          event_count: events.length,
+          last_sequence: events.length > 0 ? events[events.length - 1].sequence_no : null
+        };
+      },
+      1000
+    );
   });
 
   app.post<{ Body: { target: RestartTarget | "all" } }>(

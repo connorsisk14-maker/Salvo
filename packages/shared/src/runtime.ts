@@ -98,9 +98,12 @@ export const RUN_EVENT_TYPES = [
   "policy.denied",
   "artifact.created",
   "roadblock.detected",
+  "run.cancel_requested",
   "evaluation.completed",
+  "run.retry_requested",
   "run.final_payload",
   "run.completed",
+  "run.cancelled",
   "run.failed"
 ] as const;
 
@@ -119,11 +122,11 @@ const TASK_TRANSITIONS: Record<TaskStatus, readonly TaskStatus[]> = {
   queued: ["planning", "cancelled"],
   planning: ["running", "blocked", "failed", "cancelled", "needs_review"],
   running: ["completed", "blocked", "failed", "needs_review", "cancelled"],
-  blocked: ["running", "failed", "needs_review", "cancelled"],
+  blocked: ["queued", "running", "failed", "needs_review", "cancelled"],
   completed: [],
-  failed: [],
-  needs_review: ["running", "completed", "failed", "cancelled"],
-  cancelled: []
+  failed: ["queued", "cancelled"],
+  needs_review: ["queued", "running", "completed", "failed", "cancelled"],
+  cancelled: ["queued"]
 };
 
 const CONTRACT_TRANSITIONS: Record<ContractStatus, readonly ContractStatus[]> = {

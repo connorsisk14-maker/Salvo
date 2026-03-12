@@ -52,6 +52,7 @@ export type DbRun = {
   status: RunStatus;
   worker_id: string | null;
   runner_pid: number | null;
+  cancellation_requested_at: string | null;
   heartbeat_at: string | null;
   started_at: string | null;
   ended_at: string | null;
@@ -61,6 +62,12 @@ export type DbRun = {
   synthesized_at: string | null;
   created_at: string;
   updated_at: string;
+};
+
+export type DbRunSummary = DbRun & {
+  evaluation_outcome: "passed" | "failed" | "hard_failed" | null;
+  hard_fail_reason: string | null;
+  findings_json: string[] | null;
 };
 
 export type DbRunEvent = {

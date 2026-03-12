@@ -42,6 +42,17 @@ function parseContractPolicy(
   });
 }
 
+function splitCommand(commandLine: string): { command: string; args: string[] } {
+  const parts = commandLine.trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) {
+    return { command: "echo", args: [] };
+  }
+  return {
+    command: parts[0],
+    args: parts.slice(1)
+  };
+}
+
 async function main(): Promise<void> {
   const runId = parseArg("--run-id");
   if (!runId) {
@@ -68,6 +79,10 @@ async function main(): Promise<void> {
   const policy = parseContractPolicy(workspaceRoot, contract.contract_json);
   const filesystem = new FilesystemAdapter(workspaceRoot, policy);
   const command = new CommandAdapter(policy);
+  const contractJson = contract.contract_json as {
+    success_criteria?: { required_test_commands?: string[] };
+  };
+  const requiredTestCommands = contractJson.success_criteria?.required_test_commands ?? [];
 
   await repo.transitionRunStatus(run.id, "running", {
     runnerPid: process.pid,
@@ -177,12 +192,46 @@ async function main(): Promise<void> {
       });
     }
 
+    const testsRun: Array<{ command: string; exit_code?: number; denied?: boolean }> = [];
+    for (const testCommand of requiredTestCommands) {
+      const parsed = splitCommand(testCommand);
+      await repo.appendRunEvent(run.id, "tool.called", "info", {
+        tool: "command",
+        command: parsed.command,
+        args: parsed.args,
+        purpose: "required_test_command"
+      });
+
+      const testResult = await command.run(parsed.command, parsed.args, workspaceRoot);
+      if (!testResult.ok) {
+        await repo.appendRunEvent(run.id, "policy.denied", "warn", {
+          reason: testResult.decision.reason,
+          message: testResult.decision.message,
+          command: testCommand
+        });
+        testsRun.push({
+          command: testCommand,
+          denied: true
+        });
+      } else {
+        await repo.appendRunEvent(run.id, "tool.result", "info", {
+          command: testCommand,
+          exit_code: testResult.exitCode,
+          stdout: testResult.stdout.trim()
+        });
+        testsRun.push({
+          command: testCommand,
+          exit_code: testResult.exitCode
+        });
+      }
+    }
+
     await repo.appendRunEvent(run.id, "run.final_payload", "info", {
       status: "completed",
       summary: `Generated run summary for task ${task.id}`,
       deliverables: ["run-summary.md"],
       evidence: {
-        tests_run: [],
+        tests_run: testsRun,
         command_results: [
           commandResult.ok
             ? {

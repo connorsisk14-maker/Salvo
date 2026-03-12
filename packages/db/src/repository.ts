@@ -21,6 +21,7 @@ import type {
   DbDaemonHeartbeat,
   DbEvaluation,
   DbRun,
+  DbRunSummary,
   DbRunEvent,
   DbTask,
   DbWorkspace,
@@ -32,6 +33,15 @@ const TERMINAL_RUN_STATUSES = new Set<RunStatus>([
   "failed",
   "blocked",
   "cancelled"
+]);
+
+const RETRYABLE_RUN_STATUSES = new Set<RunStatus>(["failed", "blocked", "cancelled"]);
+const CANCELLABLE_RUN_STATUSES = new Set<RunStatus>([
+  "created",
+  "provisioning",
+  "starting",
+  "running",
+  "evaluating"
 ]);
 
 export class SalvoRepository {
@@ -152,15 +162,52 @@ export class SalvoRepository {
   }
 
   async approveTask(taskId: string): Promise<DbTask> {
-    const result = await this.pool.query<DbTask>(
-      `update public.salvo_tasks
-       set approved_at = now()
-       where id = $1
-       returning *`,
-      [taskId]
-    );
+    return this.withTransaction(async (client) => {
+      const currentResult = await client.query<DbTask>(
+        `select * from public.salvo_tasks where id = $1 for update`,
+        [taskId]
+      );
+      const current = this.singleOrThrow(currentResult.rows, `Task not found: ${taskId}`);
 
-    return this.singleOrThrow(result.rows, `Task not found: ${taskId}`);
+      let nextStatus = current.status;
+      if (current.status === "needs_review") {
+        assertTaskTransition(current.status, "queued");
+        nextStatus = "queued";
+      }
+
+      const result = await client.query<DbTask>(
+        `update public.salvo_tasks
+         set approved_at = now(),
+             status = $2
+         where id = $1
+         returning *`,
+        [taskId, nextStatus]
+      );
+
+      return this.singleOrThrow(result.rows, `Task not found: ${taskId}`);
+    });
+  }
+
+  async rejectTask(taskId: string): Promise<DbTask> {
+    return this.withTransaction(async (client) => {
+      const currentResult = await client.query<DbTask>(
+        `select * from public.salvo_tasks where id = $1 for update`,
+        [taskId]
+      );
+      const current = this.singleOrThrow(currentResult.rows, `Task not found: ${taskId}`);
+      assertTaskTransition(current.status, "failed");
+
+      const result = await client.query<DbTask>(
+        `update public.salvo_tasks
+         set status = 'failed',
+             cancelled_at = now()
+         where id = $1
+         returning *`,
+        [taskId]
+      );
+
+      return this.singleOrThrow(result.rows, `Task not found: ${taskId}`);
+    });
   }
 
   async cancelTask(taskId: string): Promise<DbTask> {
@@ -297,6 +344,23 @@ export class SalvoRepository {
   async listRuns(limit = 100): Promise<DbRun[]> {
     const result = await this.pool.query<DbRun>(
       `select * from public.salvo_runs order by created_at desc limit $1`,
+      [limit]
+    );
+
+    return result.rows;
+  }
+
+  async listRunSummaries(limit = 100): Promise<DbRunSummary[]> {
+    const result = await this.pool.query<DbRunSummary>(
+      `select
+         r.*,
+         e.outcome as evaluation_outcome,
+         e.hard_fail_reason,
+         e.findings_json
+       from public.salvo_runs r
+       left join public.salvo_evaluations e on e.run_id = r.id
+       order by r.created_at desc
+       limit $1`,
       [limit]
     );
 
@@ -517,6 +581,229 @@ export class SalvoRepository {
         retryRun
       };
     });
+  }
+
+  async requestRetryForRun(runId: string): Promise<{
+    task: DbTask;
+    sourceRun: DbRun;
+  }> {
+    return this.withTransaction(async (client) => {
+      const runResult = await client.query<DbRun>(
+        `select * from public.salvo_runs where id = $1 for update`,
+        [runId]
+      );
+      const sourceRun = this.singleOrThrow(runResult.rows, `Run not found: ${runId}`);
+
+      if (!RETRYABLE_RUN_STATUSES.has(sourceRun.status)) {
+        throw new Error(
+          `Run ${runId} is not retryable from status ${sourceRun.status}.`
+        );
+      }
+
+      const taskResult = await client.query<DbTask>(
+        `select * from public.salvo_tasks where id = $1 for update`,
+        [sourceRun.task_id]
+      );
+      const task = this.singleOrThrow(
+        taskResult.rows,
+        `Task not found for run: ${sourceRun.task_id}`
+      );
+
+      assertTaskTransition(task.status, "queued");
+
+      const updatedTaskResult = await client.query<DbTask>(
+        `update public.salvo_tasks
+         set status = 'queued',
+             claimed_by = null,
+             claimed_at = null,
+             cancelled_at = null
+         where id = $1
+         returning *`,
+        [task.id]
+      );
+      const updatedTask = this.singleOrThrow(updatedTaskResult.rows, "Task retry update failed.");
+
+      const seqResult = await client.query<{ next_sequence: number }>(
+        `select coalesce(max(sequence_no), 0) + 1 as next_sequence
+         from public.salvo_run_events
+         where run_id = $1`,
+        [sourceRun.id]
+      );
+
+      const sequenceNo = seqResult.rows[0]?.next_sequence ?? 1;
+      await client.query(
+        `insert into public.salvo_run_events (
+           run_id,
+           sequence_no,
+           event_type,
+           level,
+           payload_json,
+           schema_version
+         )
+         values ($1, $2, 'run.retry_requested', 'info', $3::jsonb, 1)`,
+        [
+          sourceRun.id,
+          sequenceNo,
+          JSON.stringify({
+            requested_at: new Date().toISOString(),
+            task_id: task.id
+          })
+        ]
+      );
+
+      return {
+        task: updatedTask,
+        sourceRun
+      };
+    });
+  }
+
+  async cancelRun(runId: string): Promise<{
+    run: DbRun;
+    task: DbTask;
+  }> {
+    return this.withTransaction(async (client) => {
+      const runResult = await client.query<DbRun>(
+        `select * from public.salvo_runs where id = $1 for update`,
+        [runId]
+      );
+      const run = this.singleOrThrow(runResult.rows, `Run not found: ${runId}`);
+
+      if (!isTerminalRunStatus(run.status)) {
+        assertRunTransition(run.status, "cancelled");
+      }
+
+      const updatedRunResult = await client.query<DbRun>(
+        `update public.salvo_runs
+         set status = 'cancelled',
+             exit_reason = coalesce(exit_reason, 'cancelled'),
+             outcome_summary = coalesce(outcome_summary, 'Cancelled by user request.'),
+             ended_at = coalesce(ended_at, now()),
+             cancellation_requested_at = null
+         where id = $1
+         returning *`,
+        [runId]
+      );
+      const updatedRun = this.singleOrThrow(updatedRunResult.rows, `Run update failed: ${runId}`);
+
+      const seqResult = await client.query<{ next_sequence: number }>(
+        `select coalesce(max(sequence_no), 0) + 1 as next_sequence
+         from public.salvo_run_events
+         where run_id = $1`,
+        [updatedRun.id]
+      );
+      const sequenceNo = seqResult.rows[0]?.next_sequence ?? 1;
+
+      await client.query(
+        `insert into public.salvo_run_events (
+           run_id,
+           sequence_no,
+           event_type,
+           level,
+           payload_json,
+           schema_version
+         )
+         values ($1, $2, 'run.cancelled', 'info', $3::jsonb, 1)`,
+        [
+          updatedRun.id,
+          sequenceNo,
+          JSON.stringify({
+            cancelled_at: new Date().toISOString()
+          })
+        ]
+      );
+
+      const taskResult = await client.query<DbTask>(
+        `select * from public.salvo_tasks where id = $1 for update`,
+        [updatedRun.task_id]
+      );
+      const task = this.singleOrThrow(taskResult.rows, `Task not found: ${updatedRun.task_id}`);
+
+      let updatedTask = task;
+      if (task.status !== "cancelled") {
+        assertTaskTransition(task.status, "cancelled");
+        const updatedTaskResult = await client.query<DbTask>(
+          `update public.salvo_tasks
+           set status = 'cancelled',
+               cancelled_at = now()
+           where id = $1
+           returning *`,
+          [task.id]
+        );
+        updatedTask = this.singleOrThrow(updatedTaskResult.rows, `Task update failed: ${task.id}`);
+      }
+
+      return {
+        run: updatedRun,
+        task: updatedTask
+      };
+    });
+  }
+
+  async requestRunCancellation(runId: string): Promise<DbRun> {
+    return this.withTransaction(async (client) => {
+      const runResult = await client.query<DbRun>(
+        `select * from public.salvo_runs where id = $1 for update`,
+        [runId]
+      );
+      const run = this.singleOrThrow(runResult.rows, `Run not found: ${runId}`);
+
+      if (!CANCELLABLE_RUN_STATUSES.has(run.status)) {
+        throw new Error(`Run ${runId} cannot be cancelled from status ${run.status}.`);
+      }
+
+      const updatedRunResult = await client.query<DbRun>(
+        `update public.salvo_runs
+         set cancellation_requested_at = now()
+         where id = $1
+         returning *`,
+        [runId]
+      );
+      const updatedRun = this.singleOrThrow(updatedRunResult.rows, `Run update failed: ${runId}`);
+
+      const seqResult = await client.query<{ next_sequence: number }>(
+        `select coalesce(max(sequence_no), 0) + 1 as next_sequence
+         from public.salvo_run_events
+         where run_id = $1`,
+        [updatedRun.id]
+      );
+      const sequenceNo = seqResult.rows[0]?.next_sequence ?? 1;
+
+      await client.query(
+        `insert into public.salvo_run_events (
+           run_id,
+           sequence_no,
+           event_type,
+           level,
+           payload_json,
+           schema_version
+         )
+         values ($1, $2, 'run.cancel_requested', 'warn', $3::jsonb, 1)`,
+        [
+          updatedRun.id,
+          sequenceNo,
+          JSON.stringify({
+            requested_at: new Date().toISOString()
+          })
+        ]
+      );
+
+      return updatedRun;
+    });
+  }
+
+  async listCancellationRequestedRuns(limit = 50): Promise<DbRun[]> {
+    const result = await this.pool.query<DbRun>(
+      `select *
+       from public.salvo_runs
+       where status in ('created', 'provisioning', 'starting', 'running', 'evaluating')
+         and cancellation_requested_at is not null
+       order by cancellation_requested_at asc
+       limit $1`,
+      [limit]
+    );
+
+    return result.rows;
   }
 
   async recordEvaluation(input: RecordEvaluationInput): Promise<DbEvaluation> {
@@ -800,5 +1087,129 @@ export class SalvoRepository {
     );
 
     return result.rows;
+  }
+
+  async listResearchDocuments(
+    limit = 100,
+    reviewStatus?: "unreviewed" | "accepted" | "rejected"
+  ): Promise<
+    {
+      id: string;
+      workspace_id: string;
+      title: string;
+      topic: string;
+      confidence: number;
+      review_status: "unreviewed" | "accepted" | "rejected";
+      source_run_ids: string[];
+      created_at: string;
+    }[]
+  > {
+    const params: unknown[] = [limit];
+    let sql = `
+      select
+        id,
+        workspace_id,
+        title,
+        topic,
+        confidence,
+        review_status,
+        source_run_ids,
+        created_at
+      from public.salvo_research_documents
+    `;
+
+    if (reviewStatus) {
+      sql += " where review_status = $2";
+      params.push(reviewStatus);
+    }
+
+    sql += " order by created_at desc limit $1";
+
+    const result = await this.pool.query<{
+      id: string;
+      workspace_id: string;
+      title: string;
+      topic: string;
+      confidence: number;
+      review_status: "unreviewed" | "accepted" | "rejected";
+      source_run_ids: string[];
+      created_at: string;
+    }>(sql, params);
+
+    return result.rows;
+  }
+
+  async setResearchReviewStatus(
+    researchId: string,
+    reviewStatus: "unreviewed" | "accepted" | "rejected"
+  ): Promise<void> {
+    await this.pool.query(
+      `update public.salvo_research_documents
+       set review_status = $2
+       where id = $1`,
+      [researchId, reviewStatus]
+    );
+  }
+
+  async listMemories(
+    limit = 100,
+    reviewStatus?: "unreviewed" | "accepted" | "rejected"
+  ): Promise<
+    {
+      id: string;
+      workspace_id: string;
+      memory_type: string;
+      title: string;
+      confidence: number;
+      review_status: "unreviewed" | "accepted" | "rejected";
+      source_run_ids: string[];
+      created_at: string;
+    }[]
+  > {
+    const params: unknown[] = [limit];
+    let sql = `
+      select
+        id,
+        workspace_id,
+        memory_type,
+        title,
+        confidence,
+        review_status,
+        source_run_ids,
+        created_at
+      from public.salvo_memories
+    `;
+
+    if (reviewStatus) {
+      sql += " where review_status = $2";
+      params.push(reviewStatus);
+    }
+
+    sql += " order by created_at desc limit $1";
+
+    const result = await this.pool.query<{
+      id: string;
+      workspace_id: string;
+      memory_type: string;
+      title: string;
+      confidence: number;
+      review_status: "unreviewed" | "accepted" | "rejected";
+      source_run_ids: string[];
+      created_at: string;
+    }>(sql, params);
+
+    return result.rows;
+  }
+
+  async setMemoryReviewStatus(
+    memoryId: string,
+    reviewStatus: "unreviewed" | "accepted" | "rejected"
+  ): Promise<void> {
+    await this.pool.query(
+      `update public.salvo_memories
+       set review_status = $2
+       where id = $1`,
+      [memoryId, reviewStatus]
+    );
   }
 }
