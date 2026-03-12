@@ -4,11 +4,11 @@ Local-first agentic harness with a strict runtime contract, policy-enforced adap
 
 ## Components
 
-- `apps/web`: Vite dashboard (Control Center, Tasks & Runs Board, Research Review, Run Detail)
+- `apps/web`: Vite dashboard (Control Center, Tasks & Runs Board, Research Review, Integrations, Run Detail)
 - `apps/orchestrator-api`: control-plane API (`create/read/approve/cancel` + read run/contract/event state)
 - `apps/orchestrator-daemon`: task claim loop, contract generation, runner spawn, evaluation, retry
 - `apps/agent-runner`: bounded runner that only uses policy-enforced adapters
-- `apps/research-daemon`: completed-run synthesis with provenance metadata
+- `apps/research-daemon`: analysis-only learning daemon (ingest, experiment, accepted-only publish)
 
 ## Packages
 
@@ -35,6 +35,9 @@ Raw SQL migrations live in `supabase/migrations`.
 - `0002_runtime_contract.sql` runtime contract tables/indexes, append-only event guard, terminal run immutability
 - `0003_daemon_heartbeats.sql` daemon heartbeat table for orchestrator/research health
 - `0004_run_cancellation.sql` deferred cancellation marker (`cancellation_requested_at`) for active run cancellation
+- `0005_integration_configs.sql` integration configuration storage
+- `0006_llm_api_integration_cutover.sql` `claude_local -> llm_api` migration with compatibility merge
+- `0007_research_analysis_pipeline.sql` research ingestion/experiment tables + contract-family memory scope
 
 ## Local Run
 
@@ -49,6 +52,21 @@ pnpm dev:all
 ```
 
 Then open `http://localhost:5173`.
+
+## UX Quick Start
+
+Use the scripted flow to migrate DB + launch API/orchestrator/research/dashboard in the background:
+
+```bash
+pnpm ux:up
+pnpm ux:status
+```
+
+To stop everything:
+
+```bash
+pnpm ux:down
+```
 
 ## Checks
 
@@ -73,7 +91,25 @@ Control-plane health endpoints:
 - `POST /runs/:id/cancel` (active runs get `run.cancel_requested`; daemon force-cancels and finalizes)
 - `POST /tasks/:id/reject` for `needs_review` tasks
 - `GET /research`, `POST /research/:id/review`
+- `GET /research/experiments`, `POST /research/experiments/:id/review`
 - `GET /memories`, `POST /memories/:id/review`
 - `GET /stream/overview`, `GET /stream/runs/:id` (SSE polling replacement for dashboard updates)
 
 Daemon endpoints are DB-backed via `salvo_daemon_heartbeats` and return `healthy`, `stale`, or `offline`.
+
+## Auditing Completed Work
+
+- Open `Tasks & Runs Board` and use **Open proof** on a task/run.
+- Run detail now includes a **Proof of Work** section with:
+  - recorded artifacts (`salvo_artifacts`)
+  - inline artifact preview (text/markdown) and image/screenshot rendering
+  - final payload evidence (`run.final_payload`)
+  - timeline events and linked synthesis docs
+
+## Integrations + Cost View
+
+- Open `/integrations` in the dashboard for:
+  - live connector/integration status
+  - estimated cost rollups by model and agent profile
+  - token usage totals, updated in real time via SSE refresh
+  - direct config updates for Supabase, LLM API, Process Adapter, and HTTP Adapter

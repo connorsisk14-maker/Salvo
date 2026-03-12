@@ -1,11 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   listMemories,
+  listResearchExperiments,
   listResearch,
   reviewMemory,
+  reviewResearchExperiment,
   reviewResearch,
   streamUrl,
   type ApiMemory,
+  type ApiResearchExperiment,
   type ApiResearchDoc
 } from "../api/control-plane";
 
@@ -14,17 +17,20 @@ type ReviewFilter = "unreviewed" | "accepted" | "rejected";
 export function ResearchReviewPage() {
   const [filter, setFilter] = useState<ReviewFilter>("unreviewed");
   const [docs, setDocs] = useState<ApiResearchDoc[]>([]);
+  const [experiments, setExperiments] = useState<ApiResearchExperiment[]>([]);
   const [memories, setMemories] = useState<ApiMemory[]>([]);
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   async function refresh(nextFilter = filter) {
     try {
-      const [nextDocs, nextMemories] = await Promise.all([
+      const [nextDocs, nextExperiments, nextMemories] = await Promise.all([
         listResearch(nextFilter),
+        listResearchExperiments(nextFilter),
         listMemories(nextFilter)
       ]);
       setDocs(nextDocs);
+      setExperiments(nextExperiments);
       setMemories(nextMemories);
       setError(null);
     } catch (refreshError) {
@@ -74,12 +80,25 @@ export function ResearchReviewPage() {
     }
   }
 
+  async function onReviewExperiment(id: string, status: ReviewFilter) {
+    setBusyKey(`experiment-${id}-${status}`);
+    try {
+      await reviewResearchExperiment(id, status);
+      await refresh();
+    } catch (actionError) {
+      setError((actionError as Error).message);
+    } finally {
+      setBusyKey(null);
+    }
+  }
+
   const reviewCounts = useMemo(
     () => ({
       docs: docs.length,
+      experiments: experiments.length,
       memories: memories.length
     }),
-    [docs.length, memories.length]
+    [docs.length, experiments.length, memories.length]
   );
 
   return (
@@ -106,7 +125,8 @@ export function ResearchReviewPage() {
         </div>
 
         <p className="muted">
-          Showing {reviewCounts.docs} research docs and {reviewCounts.memories} memory entries.
+          Showing {reviewCounts.docs} research docs, {reviewCounts.experiments} experiments, and{" "}
+          {reviewCounts.memories} memory entries.
         </p>
       </section>
 
@@ -149,6 +169,61 @@ export function ResearchReviewPage() {
                     disabled={busyKey === `doc-${doc.id}-rejected`}
                     onClick={() => {
                       void onReviewResearch(doc.id, "rejected");
+                    }}
+                  >
+                    Reject
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </section>
+
+      <section className="panel">
+        <h2>Research Experiments</h2>
+        <table className="grid-table">
+          <thead>
+            <tr>
+              <th>Family</th>
+              <th>Sample Size</th>
+              <th>Confidence</th>
+              <th>Status</th>
+              <th>Published</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {experiments.map((experiment) => (
+              <tr key={experiment.id}>
+                <td>
+                  <strong>{experiment.contract_category}</strong>
+                  <div className="muted">
+                    {experiment.contract_subcategory ?? "-"}
+                  </div>
+                  <div className="mono muted">{experiment.contract_family_key}</div>
+                </td>
+                <td>{experiment.sample_size}</td>
+                <td>{experiment.confidence}</td>
+                <td>{experiment.review_status}</td>
+                <td>{experiment.published_at ? "yes" : "no"}</td>
+                <td>
+                  <button
+                    type="button"
+                    className="button-link"
+                    disabled={busyKey === `experiment-${experiment.id}-accepted`}
+                    onClick={() => {
+                      void onReviewExperiment(experiment.id, "accepted");
+                    }}
+                  >
+                    Accept
+                  </button>
+                  <button
+                    type="button"
+                    className="button-link"
+                    disabled={busyKey === `experiment-${experiment.id}-rejected`}
+                    onClick={() => {
+                      void onReviewExperiment(experiment.id, "rejected");
                     }}
                   >
                     Reject

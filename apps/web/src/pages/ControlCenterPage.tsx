@@ -317,6 +317,7 @@ export function ControlCenterPage() {
               <th>Status</th>
               <th>Task</th>
               <th>Score</th>
+              <th>Proof</th>
             </tr>
           </thead>
           <tbody>
@@ -330,6 +331,11 @@ export function ControlCenterPage() {
                 <td>{run.status}</td>
                 <td className="mono">{run.task_id}</td>
                 <td>{run.score ?? "-"}</td>
+                <td>
+                  <Link to={`/runs/${run.id}#proof`} className="button-link">
+                    Open proof
+                  </Link>
+                </td>
               </tr>
             ))}
           </tbody>

@@ -1,9 +1,12 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
+  artifactContentUrl,
+  getArtifactPreview,
   getRunDetail,
   getRunEvents,
   streamUrl,
+  type ApiArtifactPreview,
   type ApiRunDetail,
   type ApiRunEvent
 } from "../api/control-plane";
@@ -14,9 +17,39 @@ export function RunDetailPage() {
 
   const [detail, setDetail] = useState<ApiRunDetail | null>(null);
   const [events, setEvents] = useState<ApiRunEvent[]>([]);
+  const [artifactPreviews, setArtifactPreviews] = useState<Record<string, ApiArtifactPreview>>({});
+  const [previewBusy, setPreviewBusy] = useState<Record<string, boolean>>({});
   const [error, setError] = useState<string | null>(null);
 
+  async function loadArtifactPreview(artifactId: string) {
+    if (artifactPreviews[artifactId]) {
+      return;
+    }
+
+    setPreviewBusy((current) => ({
+      ...current,
+      [artifactId]: true
+    }));
+    try {
+      const preview = await getArtifactPreview(artifactId);
+      setArtifactPreviews((current) => ({
+        ...current,
+        [artifactId]: preview
+      }));
+    } catch (previewError) {
+      setError((previewError as Error).message);
+    } finally {
+      setPreviewBusy((current) => ({
+        ...current,
+        [artifactId]: false
+      }));
+    }
+  }
+
   useEffect(() => {
+    setArtifactPreviews({});
+    setPreviewBusy({});
+
     async function refresh() {
       if (!runId) {
         return;
@@ -145,6 +178,102 @@ export function RunDetailPage() {
                 ))}
               </tbody>
             </table>
+          </section>
+
+          <section id="proof" className="panel">
+            <h2>Proof of Work</h2>
+            <p className="muted">
+              Artifact records and final payload evidence for this run.
+            </p>
+
+            {detail.artifacts.length === 0 ? (
+              <p className="muted">No artifacts recorded.</p>
+            ) : (
+              <table className="grid-table">
+                <thead>
+                  <tr>
+                    <th>Artifact</th>
+                    <th>Path</th>
+                    <th>Created</th>
+                    <th>Preview</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {detail.artifacts.map((artifact) => (
+                    <tr key={artifact.id}>
+                      <td>{artifact.artifact_type}</td>
+                      <td className="mono">{artifact.path}</td>
+                      <td>{new Date(artifact.created_at).toLocaleString()}</td>
+                      <td>
+                        <button
+                          type="button"
+                          className="button-link"
+                          disabled={previewBusy[artifact.id] === true}
+                          onClick={() => {
+                            void loadArtifactPreview(artifact.id);
+                          }}
+                        >
+                          {previewBusy[artifact.id] ? "Loading..." : "Preview"}
+                        </button>
+                        {" "}
+                        <a
+                          href={artifactContentUrl(artifact.id)}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="button-link"
+                        >
+                          Open file
+                        </a>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+
+            {detail.artifacts.map((artifact) => {
+              const preview = artifactPreviews[artifact.id];
+              if (!preview) {
+                return null;
+              }
+
+              return (
+                <article className="proof-preview-card" key={`preview-${artifact.id}`}>
+                  <h3>{artifact.artifact_type} preview</h3>
+                  {preview.kind === "text" ? (
+                    <>
+                      <pre className="json-block">{preview.content}</pre>
+                      {preview.truncated ? (
+                        <p className="muted">Preview truncated to first 64 KB.</p>
+                      ) : null}
+                    </>
+                  ) : null}
+                  {preview.kind === "image" ? (
+                    <img
+                      src={artifactContentUrl(artifact.id)}
+                      alt={`Artifact ${artifact.id}`}
+                      className="proof-preview-image"
+                    />
+                  ) : null}
+                  {preview.kind === "binary" ? (
+                    <p className="muted">
+                      Binary artifact. Use{" "}
+                      <a href={artifactContentUrl(artifact.id)} target="_blank" rel="noreferrer">
+                        Open file
+                      </a>{" "}
+                      to inspect.
+                    </p>
+                  ) : null}
+                </article>
+              );
+            })}
+
+            <h3>Final Payload</h3>
+            {detail.final_payload ? (
+              <pre className="json-block">{JSON.stringify(detail.final_payload, null, 2)}</pre>
+            ) : (
+              <p className="muted">Final payload not available.</p>
+            )}
           </section>
 
           <section className="panel">
