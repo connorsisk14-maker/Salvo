@@ -9,6 +9,7 @@ import {
   getResearchHealth,
   listRuns,
   listTasks,
+  streamUrl,
   type ApiDaemonHealth,
   type ApiRestartTarget,
   type ApiRun,
@@ -63,10 +64,18 @@ export function ControlCenterPage() {
 
   useEffect(() => {
     void refresh();
-    const timer = setInterval(() => {
+
+    const eventSource = new EventSource(streamUrl("/stream/overview"));
+    eventSource.onmessage = () => {
       void refresh();
-    }, 2000);
-    return () => clearInterval(timer);
+    };
+    eventSource.onerror = () => {
+      // rely on EventSource internal retry behavior
+    };
+
+    return () => {
+      eventSource.close();
+    };
   }, []);
 
   async function onSubmit(event: FormEvent) {

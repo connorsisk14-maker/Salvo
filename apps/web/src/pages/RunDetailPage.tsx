@@ -3,6 +3,7 @@ import { Link, useParams } from "react-router-dom";
 import {
   getRunDetail,
   getRunEvents,
+  streamUrl,
   type ApiRunDetail,
   type ApiRunEvent
 } from "../api/control-plane";
@@ -35,11 +36,17 @@ export function RunDetailPage() {
     }
 
     void refresh();
-    const timer = setInterval(() => {
+    const eventSource = new EventSource(streamUrl(`/stream/runs/${runId}`));
+    eventSource.onmessage = () => {
       void refresh();
-    }, 2000);
+    };
+    eventSource.onerror = () => {
+      // rely on EventSource internal retry behavior
+    };
 
-    return () => clearInterval(timer);
+    return () => {
+      eventSource.close();
+    };
   }, [runId]);
 
   if (!runId) {
@@ -51,9 +58,15 @@ export function RunDetailPage() {
       <header className="content-header">
         <h1>Run Detail</h1>
         <p className="muted mono">{runId}</p>
-        <Link to="/" className="button-link">
-          Back to control center
-        </Link>
+        <div>
+          <Link to="/" className="button-link">
+            Back to control center
+          </Link>
+          {" "}
+          <Link to="/board" className="button-link">
+            Open board
+          </Link>
+        </div>
       </header>
 
       {error ? <p className="error-banner">{error}</p> : null}

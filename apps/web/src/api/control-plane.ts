@@ -14,7 +14,12 @@ export type ApiRun = {
   contract_id: string;
   status: string;
   attempt_no: number;
+  exit_reason?: string | null;
+  outcome_summary?: string | null;
   score: number | null;
+  evaluation_outcome?: "passed" | "failed" | "hard_failed" | null;
+  hard_fail_reason?: string | null;
+  findings_json?: string[] | null;
   created_at: string;
 };
 
@@ -50,6 +55,33 @@ export type ApiRestartResponse = {
   }>;
 };
 
+export type ApiActionResponse = {
+  ok: boolean;
+  error?: string;
+};
+
+export type ApiResearchDoc = {
+  id: string;
+  workspace_id: string;
+  title: string;
+  topic: string;
+  confidence: number;
+  review_status: "unreviewed" | "accepted" | "rejected";
+  source_run_ids: string[];
+  created_at: string;
+};
+
+export type ApiMemory = {
+  id: string;
+  workspace_id: string;
+  memory_type: string;
+  title: string;
+  confidence: number;
+  review_status: "unreviewed" | "accepted" | "rejected";
+  source_run_ids: string[];
+  created_at: string;
+};
+
 export type ApiRunDetail = {
   run: ApiRun;
   task: ApiTask;
@@ -76,6 +108,7 @@ export type ApiRunDetail = {
 };
 
 const baseUrl = import.meta.env.VITE_SALVO_API_URL ?? "http://localhost:8787";
+export const controlPlaneBaseUrl = baseUrl;
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${baseUrl}${path}`, {
@@ -118,6 +151,12 @@ export function approveTask(taskId: string): Promise<ApiTask> {
   });
 }
 
+export function rejectTask(taskId: string): Promise<ApiTask> {
+  return request<ApiTask>(`/tasks/${taskId}/reject`, {
+    method: "POST"
+  });
+}
+
 export function cancelTask(taskId: string): Promise<ApiTask> {
   return request<ApiTask>(`/tasks/${taskId}/cancel`, {
     method: "POST"
@@ -151,4 +190,54 @@ export function forceRestartDaemon(
     method: "POST",
     body: JSON.stringify({ target })
   });
+}
+
+export function retryRun(runId: string): Promise<ApiActionResponse> {
+  return request<ApiActionResponse>(`/runs/${runId}/retry`, {
+    method: "POST"
+  });
+}
+
+export function cancelRun(runId: string): Promise<ApiActionResponse> {
+  return request<ApiActionResponse>(`/runs/${runId}/cancel`, {
+    method: "POST"
+  });
+}
+
+export function listResearch(
+  status?: "unreviewed" | "accepted" | "rejected"
+): Promise<ApiResearchDoc[]> {
+  const query = status ? `?status=${status}` : "";
+  return request<ApiResearchDoc[]>(`/research${query}`);
+}
+
+export function reviewResearch(
+  id: string,
+  status: "unreviewed" | "accepted" | "rejected"
+): Promise<ApiActionResponse> {
+  return request<ApiActionResponse>(`/research/${id}/review`, {
+    method: "POST",
+    body: JSON.stringify({ status })
+  });
+}
+
+export function listMemories(
+  status?: "unreviewed" | "accepted" | "rejected"
+): Promise<ApiMemory[]> {
+  const query = status ? `?status=${status}` : "";
+  return request<ApiMemory[]>(`/memories${query}`);
+}
+
+export function reviewMemory(
+  id: string,
+  status: "unreviewed" | "accepted" | "rejected"
+): Promise<ApiActionResponse> {
+  return request<ApiActionResponse>(`/memories/${id}/review`, {
+    method: "POST",
+    body: JSON.stringify({ status })
+  });
+}
+
+export function streamUrl(path: string): string {
+  return `${baseUrl}${path}`;
 }

@@ -47,6 +47,29 @@ strong {
   padding: 1.25rem;
 }
 
+.top-nav {
+  display: flex;
+  gap: 0.6rem;
+  margin-bottom: 0.8rem;
+  flex-wrap: wrap;
+}
+
+.top-nav-link {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0.35rem 0.7rem;
+  text-decoration: none;
+  color: inherit;
+  background: #f7f1e2;
+  font-family: "IBM Plex Mono", "Menlo", monospace;
+  font-size: 0.85rem;
+}
+
+.top-nav-link-active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
 .clip-card {
   position: relative;
   border: 2px solid var(--line);
@@ -168,6 +191,12 @@ strong {
   margin-top: 0.6rem;
   font-family: "IBM Plex Mono", "Menlo", monospace;
   font-size: 0.84rem;
+}
+
+.board-filter-row {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 0.5rem;
 }
 
 .form-grid {
