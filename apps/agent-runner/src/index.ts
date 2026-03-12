@@ -8,6 +8,19 @@ import {
   type ToolPolicy
 } from "@salvo/tools";
 
+const MODEL_BY_PROFILE = {
+  builder: "gpt-5-mini",
+  researcher: "gpt-5",
+  debugger: "gpt-5-mini",
+  documenter: "gpt-5-nano"
+} as const;
+
+const MODEL_PRICING_USD_PER_1K = {
+  "gpt-5": { input: 0.005, output: 0.015 },
+  "gpt-5-mini": { input: 0.0015, output: 0.006 },
+  "gpt-5-nano": { input: 0.0005, output: 0.002 }
+} as const;
+
 function parseArg(flag: string): string | undefined {
   const idx = process.argv.indexOf(flag);
   if (idx === -1) {
@@ -225,6 +238,22 @@ async function main(): Promise<void> {
         });
       }
     }
+
+    const model = MODEL_BY_PROFILE[run.agent_profile] ?? "gpt-5-mini";
+    const pricing = MODEL_PRICING_USD_PER_1K[model] ?? MODEL_PRICING_USD_PER_1K["gpt-5-mini"];
+    const inputTokens = Math.max(1, Math.ceil(task.original_request.length / 4));
+    const outputTokens = Math.max(1, Math.ceil((task.title.length + 120) / 4));
+    const estimatedCostUsd =
+      (inputTokens / 1000) * pricing.input + (outputTokens / 1000) * pricing.output;
+
+    await repo.appendRunEvent(run.id, "usage.reported", "info", {
+      model,
+      input_tokens: inputTokens,
+      output_tokens: outputTokens,
+      cost_usd: Number(estimatedCostUsd.toFixed(6)),
+      pricing_unit: "usd_per_1k_tokens",
+      estimated: true
+    });
 
     await repo.appendRunEvent(run.id, "run.final_payload", "info", {
       status: "completed",

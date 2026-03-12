@@ -1,31 +1,46 @@
 import { randomUUID } from "node:crypto";
-import { createDbPool, SalvoRepository } from "@salvo/db";
+import { createDbPool, ResearchRepository } from "@salvo/db";
+import { ResearchAnalysisService } from "./service";
 
 const daemonId = `research-${randomUUID().slice(0, 8)}`;
+const synthesisIntervalMs = 15_000;
+const heartbeatIntervalMs = 10_000;
+const configuredSampleSize = Number(process.env.SALVO_RESEARCH_MIN_SAMPLE_SIZE ?? 15);
+const minSampleSize =
+  Number.isFinite(configuredSampleSize) && configuredSampleSize >= 1
+    ? Math.floor(configuredSampleSize)
+    : 15;
 
 class ResearchDaemon {
-  private readonly repo: SalvoRepository;
+  private readonly repo: ResearchRepository;
+  private readonly service: ResearchAnalysisService;
   private timer?: NodeJS.Timeout;
   private heartbeatTimer?: NodeJS.Timeout;
   private processing = false;
   private stopped = false;
+  private lastCycleStats = {
+    ingested: 0,
+    experiments: 0,
+    published: 0
+  };
 
-  constructor(repo: SalvoRepository) {
+  constructor(repo: ResearchRepository) {
     this.repo = repo;
+    this.service = new ResearchAnalysisService(repo, minSampleSize);
   }
 
   async start(): Promise<void> {
     await this.publishHeartbeat();
 
     this.timer = setInterval(() => {
-      void this.synthesisLoop();
-    }, 15_000);
+      void this.analysisLoop();
+    }, synthesisIntervalMs);
 
     this.heartbeatTimer = setInterval(() => {
       void this.publishHeartbeat();
-    }, 10_000);
+    }, heartbeatIntervalMs);
 
-    await this.synthesisLoop();
+    await this.analysisLoop();
   }
 
   async stop(): Promise<void> {
@@ -45,13 +60,15 @@ class ResearchDaemon {
   }
 
   private async publishHeartbeat(extra?: Record<string, unknown>): Promise<void> {
-    await this.repo.upsertDaemonHeartbeat("research", daemonId, {
+    await this.repo.upsertDaemonHeartbeat(daemonId, {
       processing: this.processing,
+      min_sample_size: minSampleSize,
+      cycle_stats: this.lastCycleStats,
       ...extra
     });
   }
 
-  private async synthesisLoop(): Promise<void> {
+  private async analysisLoop(): Promise<void> {
     if (this.processing) {
       return;
     }
@@ -59,71 +76,7 @@ class ResearchDaemon {
     this.processing = true;
     try {
       await this.publishHeartbeat({ processing: true });
-      const runs = await this.repo.listUnsynthesizedRuns(10);
-      for (const run of runs) {
-        const detail = await this.repo.getRunDetail(run.id);
-        if (!detail) {
-          continue;
-        }
-
-        const finalPayload = await this.repo.getRunFinalPayload(run.id);
-        const payload = (finalPayload ?? {}) as {
-          summary?: string;
-          learnings?: Array<{ title?: string; body?: string }>;
-          roadblocks?: Array<{ description?: string }>;
-        };
-
-        const confidence = Math.max(0, Math.min(1, (detail.run.score ?? 0) / 100));
-
-        const markdown = [
-          `# Run Synthesis: ${detail.task.title}`,
-          "",
-          `- Run ID: ${run.id}`,
-          `- Task ID: ${detail.task.id}`,
-          `- Status: ${detail.run.status}`,
-          `- Score: ${detail.run.score ?? 0}`,
-          `- Confidence: ${confidence.toFixed(2)}`,
-          "",
-          "## Summary",
-          payload.summary ?? detail.run.outcome_summary ?? "No summary provided.",
-          "",
-          "## Learnings",
-          ...(payload.learnings && payload.learnings.length > 0
-            ? payload.learnings.map(
-                (learning) => `- ${learning.title ?? "Learning"}: ${learning.body ?? "(no body)"}`
-              )
-            : ["- No learnings captured."]),
-          "",
-          "## Roadblocks",
-          ...(payload.roadblocks && payload.roadblocks.length > 0
-            ? payload.roadblocks.map((roadblock) => `- ${roadblock.description ?? "(no description)"}`)
-            : ["- No roadblocks captured."])
-        ].join("\n");
-
-        await this.repo.createResearchDocument({
-          workspaceId: detail.task.workspace_id,
-          title: `Synthesis for ${detail.task.title}`,
-          topic: "run-postmortem",
-          bodyMarkdown: markdown,
-          sourceRunIds: [run.id],
-          confidence,
-          reviewStatus: "unreviewed"
-        });
-
-        await this.repo.createMemory({
-          workspaceId: detail.task.workspace_id,
-          sourceRunIds: [run.id],
-          memoryType: "best_practice",
-          title: `Heuristic from run ${run.id}`,
-          summary: payload.summary ?? "Operational synthesis summary",
-          bodyMarkdown: markdown,
-          tags: ["synthesis", detail.run.status],
-          confidence,
-          reviewStatus: "unreviewed"
-        });
-
-        await this.repo.markRunSynthesized(run.id);
-      }
+      this.lastCycleStats = await this.service.runCycle();
     } finally {
       this.processing = false;
       await this.publishHeartbeat({ processing: false });
@@ -132,7 +85,7 @@ class ResearchDaemon {
 }
 
 async function main(): Promise<void> {
-  const repo = new SalvoRepository(createDbPool());
+  const repo = new ResearchRepository(createDbPool());
   const daemon = new ResearchDaemon(repo);
   await daemon.start();
 

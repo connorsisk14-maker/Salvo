@@ -59,7 +59,6 @@ export type DbRun = {
   exit_reason: RunExitReason | null;
   outcome_summary: string | null;
   score: number | null;
-  synthesized_at: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -68,6 +67,9 @@ export type DbRunSummary = DbRun & {
   evaluation_outcome: "passed" | "failed" | "hard_failed" | null;
   hard_fail_reason: string | null;
   findings_json: string[] | null;
+  contract_family_key: string;
+  contract_category: string;
+  contract_subcategory: string | null;
 };
 
 export type DbRunEvent = {
@@ -78,6 +80,16 @@ export type DbRunEvent = {
   level: RunEventLevel;
   payload_json: Record<string, unknown>;
   schema_version: number;
+  created_at: string;
+};
+
+export type DbArtifact = {
+  id: string;
+  run_id: string;
+  task_id: string;
+  artifact_type: string;
+  path: string;
+  metadata_json: Record<string, unknown>;
   created_at: string;
 };
 
@@ -101,6 +113,66 @@ export type DbDaemonHeartbeat = {
   heartbeat_at: string;
   metadata_json: Record<string, unknown>;
   updated_at: string;
+};
+
+export type DbIntegrationKey = "supabase" | "llm_api" | "process" | "http";
+
+export type DbIntegrationConfig = {
+  integration_key: DbIntegrationKey;
+  config_json: Record<string, unknown>;
+  updated_at: string;
+};
+
+export type DbResearchReviewStatus = "unreviewed" | "accepted" | "rejected";
+
+export type DbResearchIngestion = {
+  run_id: string;
+  workspace_id: string;
+  task_id: string;
+  contract_id: string;
+  contract_family_key: string;
+  contract_category: string;
+  contract_subcategory: string | null;
+  run_status: "completed" | "failed";
+  evaluation_outcome: "passed" | "failed" | "hard_failed";
+  score: number;
+  policy_denial_count: number;
+  event_count: number;
+  source_event_types: string[];
+  source_json: Record<string, unknown>;
+  experiment_id: string | null;
+  ingested_at: string;
+};
+
+export type DbResearchExperiment = {
+  id: string;
+  workspace_id: string;
+  contract_family_key: string;
+  contract_category: string;
+  contract_subcategory: string | null;
+  sample_size: number;
+  source_digest: string;
+  source_run_ids: string[];
+  metrics_json: Record<string, unknown>;
+  body_markdown: string;
+  confidence: number;
+  review_status: DbResearchReviewStatus;
+  published_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type DbResearchFinding = {
+  id: string;
+  experiment_id: string;
+  workspace_id: string;
+  finding_type: string;
+  title: string;
+  body_markdown: string;
+  confidence: number;
+  metadata_json: Record<string, unknown>;
+  published_memory_id: string | null;
+  created_at: string;
 };
 
 export type CreateTaskInput = {
@@ -147,6 +219,7 @@ export type CreateResearchInput = {
 export type CreateMemoryInput = {
   workspaceId: string;
   sourceRunIds: string[];
+  contractFamilyKey?: string;
   memoryType: string;
   title: string;
   summary: string;
@@ -154,4 +227,21 @@ export type CreateMemoryInput = {
   tags: string[];
   confidence: number;
   reviewStatus: "unreviewed" | "accepted" | "rejected";
+};
+
+export type ResearchIngestionCandidate = {
+  run_id: string;
+  workspace_id: string;
+  task_id: string;
+  contract_id: string;
+  run_status: "completed" | "failed";
+  evaluation_outcome: "passed" | "failed" | "hard_failed";
+  evaluation_score: number;
+  policy_denial_count: number;
+  event_count: number;
+  source_event_types: string[];
+  contract_family_key: string;
+  contract_category: string;
+  contract_subcategory: string | null;
+  source_summary: Record<string, unknown>;
 };

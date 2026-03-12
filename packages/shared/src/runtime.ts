@@ -21,6 +21,18 @@ export const CONTRACT_STATUSES = [
 
 export type ContractStatus = (typeof CONTRACT_STATUSES)[number];
 
+export const CONTRACT_CATEGORIES = [
+  "general",
+  "integration",
+  "migration",
+  "debug",
+  "quality",
+  "documentation",
+  "operations"
+] as const;
+
+export type ContractCategory = (typeof CONTRACT_CATEGORIES)[number];
+
 export const RUN_STATUSES = [
   "created",
   "provisioning",
@@ -95,6 +107,7 @@ export const RUN_EVENT_TYPES = [
   "plan.generated",
   "tool.called",
   "tool.result",
+  "usage.reported",
   "policy.denied",
   "artifact.created",
   "roadblock.detected",

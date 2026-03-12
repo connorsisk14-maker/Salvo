@@ -1,8 +1,11 @@
+import { createHash } from "node:crypto";
 import { z } from "zod";
 import {
   AGENT_PROFILES,
+  CONTRACT_CATEGORIES,
   assertContractTransition,
   type AgentProfile,
+  type ContractCategory,
   type ContractStatus,
   type WorkspaceId
 } from "@salvo/shared";
@@ -15,6 +18,8 @@ export const APPROVAL_REQUIRED_BY_RISK: Record<RiskLevel, boolean> = {
   medium: false,
   high: true
 };
+
+export const DEFAULT_CONTRACT_CATEGORIES = [...CONTRACT_CATEGORIES];
 
 export const ContractCapabilitiesSchema = z.object({
   filesystem_read: z.boolean(),
@@ -70,6 +75,9 @@ export const ContractV1Schema = z.object({
     required: z.boolean().default(true)
   }),
   risk: z.enum(RISK_LEVELS),
+  category: z.enum(CONTRACT_CATEGORIES),
+  subcategory: z.string().trim().min(1).optional(),
+  family_key: z.string().min(1),
   agent_profile: z.enum(AGENT_PROFILES)
 });
 
@@ -103,9 +111,104 @@ function classifyRisk(request: string): RiskLevel {
   return "low";
 }
 
+function classifyContract(request: string): {
+  category: ContractCategory;
+  subcategory?: string;
+} {
+  const lowered = request.toLowerCase();
+
+  if (lowered.includes("migration") || lowered.includes("schema") || lowered.includes("database")) {
+    return {
+      category: "migration",
+      subcategory: "database"
+    };
+  }
+
+  if (
+    lowered.includes("integrat") ||
+    lowered.includes("connector") ||
+    lowered.includes("api key") ||
+    lowered.includes("webhook")
+  ) {
+    return {
+      category: "integration",
+      subcategory: "external-api"
+    };
+  }
+
+  if (lowered.includes("test") || lowered.includes("coverage") || lowered.includes("qa")) {
+    return {
+      category: "quality",
+      subcategory: "testing"
+    };
+  }
+
+  if (lowered.includes("doc") || lowered.includes("readme")) {
+    return {
+      category: "documentation",
+      subcategory: "knowledge"
+    };
+  }
+
+  if (
+    lowered.includes("incident") ||
+    lowered.includes("ops") ||
+    lowered.includes("deploy") ||
+    lowered.includes("rollback")
+  ) {
+    return {
+      category: "operations",
+      subcategory: "runtime"
+    };
+  }
+
+  if (lowered.includes("bug") || lowered.includes("fix") || lowered.includes("debug")) {
+    return {
+      category: "debug",
+      subcategory: "bugfix"
+    };
+  }
+
+  return {
+    category: "general"
+  };
+}
+
+function normalizedFamilyComponent(input: string): string {
+  return input.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function buildContractFamilyKey(input: {
+  request: string;
+  risk: RiskLevel;
+  category: ContractCategory;
+  subcategory?: string;
+  agentProfile: AgentProfile;
+}): string {
+  const seed = [
+    normalizedFamilyComponent(input.category),
+    normalizedFamilyComponent(input.subcategory ?? "none"),
+    normalizedFamilyComponent(input.risk),
+    normalizedFamilyComponent(input.agentProfile),
+    normalizedFamilyComponent(input.request)
+  ].join("|");
+
+  const digest = createHash("sha256").update(seed).digest("hex").slice(0, 16);
+  return `family_${digest}`;
+}
+
 export function buildContractV1(input: BuildContractInput): ContractV1 {
   const risk = classifyRisk(input.request);
+  const classification = classifyContract(input.request);
+  const agentProfile = input.preferredProfile ?? "builder";
   const approvalRequired = APPROVAL_REQUIRED_BY_RISK[risk];
+  const familyKey = buildContractFamilyKey({
+    request: input.request,
+    risk,
+    category: classification.category,
+    subcategory: classification.subcategory,
+    agentProfile
+  });
 
   return ContractV1Schema.parse({
     schema_version: 1,
@@ -164,7 +267,10 @@ export function buildContractV1(input: BuildContractInput): ContractV1 {
       required: true
     },
     risk,
-    agent_profile: input.preferredProfile ?? "builder"
+    category: classification.category,
+    subcategory: classification.subcategory,
+    family_key: familyKey,
+    agent_profile: agentProfile
   });
 }
 

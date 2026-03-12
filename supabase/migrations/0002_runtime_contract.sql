@@ -118,6 +118,9 @@ create table if not exists public.salvo_memories (
   created_at timestamptz not null default now()
 );
 
+alter table public.salvo_runs
+  add column if not exists synthesized_at timestamptz;
+
 create index if not exists idx_salvo_tasks_claim
   on public.salvo_tasks (status, requires_approval, approved_at, created_at)
   where status = 'queued';

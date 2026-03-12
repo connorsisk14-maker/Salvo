@@ -23,7 +23,10 @@ if (!databaseUrl) {
       "0001_bootstrap.sql",
       "0002_runtime_contract.sql",
       "0003_daemon_heartbeats.sql",
-      "0004_run_cancellation.sql"
+      "0004_run_cancellation.sql",
+      "0005_integration_configs.sql",
+      "0006_llm_api_integration_cutover.sql",
+      "0007_research_analysis_pipeline.sql"
     ]) {
       const sql = await readFile(path.join(migrationDir, fileName), "utf8");
       await pool.query(sql);
@@ -34,6 +37,9 @@ if (!databaseUrl) {
     await pool.query(`
       truncate table
         public.salvo_memories,
+        public.salvo_research_findings,
+        public.salvo_research_experiments,
+        public.salvo_research_ingestions,
         public.salvo_research_documents,
         public.salvo_evaluations,
         public.salvo_artifacts,
@@ -41,6 +47,7 @@ if (!databaseUrl) {
         public.salvo_runs,
         public.salvo_contracts,
         public.salvo_tasks,
+        public.salvo_integration_configs,
         public.salvo_daemon_heartbeats,
         public.salvo_workspaces
       restart identity cascade
@@ -277,5 +284,263 @@ if (!databaseUrl) {
 
     assert.equal(memory.length, 1);
     assert.equal(memory[0].review_status, "accepted");
+  });
+
+  test("research ingestion candidates include only completed/failed runs with evaluations", async () => {
+    const completed = await createBasicRun();
+    await repo.transitionRunStatus(completed.run.id, "starting");
+    await repo.transitionRunStatus(completed.run.id, "running");
+    await repo.transitionRunStatus(completed.run.id, "completed");
+    await repo.recordEvaluation({
+      runId: completed.run.id,
+      contractId: completed.contract.id,
+      passed: true,
+      score: 92,
+      outcome: "passed",
+      findings: []
+    });
+
+    const failed = await createBasicRun();
+    await repo.transitionRunStatus(failed.run.id, "starting");
+    await repo.transitionRunStatus(failed.run.id, "running");
+    await repo.transitionRunStatus(failed.run.id, "failed");
+    await repo.recordEvaluation({
+      runId: failed.run.id,
+      contractId: failed.contract.id,
+      passed: false,
+      score: 34,
+      outcome: "failed",
+      findings: ["failing assertion"]
+    });
+
+    const blocked = await createBasicRun();
+    await repo.transitionRunStatus(blocked.run.id, "starting");
+    await repo.transitionRunStatus(blocked.run.id, "running");
+    await repo.transitionRunStatus(blocked.run.id, "blocked");
+    await repo.recordEvaluation({
+      runId: blocked.run.id,
+      contractId: blocked.contract.id,
+      passed: false,
+      score: 10,
+      outcome: "hard_failed",
+      hardFailReason: "policy",
+      findings: ["policy denial"]
+    });
+
+    const candidates = await repo.listResearchIngestionCandidates(20);
+    const candidateRunIds = new Set(candidates.map((entry) => entry.run_id));
+    assert.equal(candidateRunIds.has(completed.run.id), true);
+    assert.equal(candidateRunIds.has(failed.run.id), true);
+    assert.equal(candidateRunIds.has(blocked.run.id), false);
+
+    const completedCandidate = candidates.find((entry) => entry.run_id === completed.run.id);
+    assert.ok(completedCandidate);
+    await repo.recordResearchIngestion(completedCandidate);
+
+    const afterIngest = await repo.listResearchIngestionCandidates(20);
+    assert.equal(afterIngest.some((entry) => entry.run_id === completed.run.id), false);
+  });
+
+  test("contract memory context returns accepted memories for matching family only", async () => {
+    const workspace = await repo.ensureWorkspace(`family-${randomUUID()}`, process.cwd());
+
+    await repo.createMemory({
+      workspaceId: workspace.id,
+      sourceRunIds: [randomUUID()],
+      contractFamilyKey: "family-alpha",
+      memoryType: "research_experiment",
+      title: "accepted alpha",
+      summary: "summary",
+      bodyMarkdown: "markdown",
+      tags: [],
+      confidence: 0.8,
+      reviewStatus: "accepted"
+    });
+
+    await repo.createMemory({
+      workspaceId: workspace.id,
+      sourceRunIds: [randomUUID()],
+      contractFamilyKey: "family-alpha",
+      memoryType: "research_experiment",
+      title: "unreviewed alpha",
+      summary: "summary",
+      bodyMarkdown: "markdown",
+      tags: [],
+      confidence: 0.9,
+      reviewStatus: "unreviewed"
+    });
+
+    await repo.createMemory({
+      workspaceId: workspace.id,
+      sourceRunIds: [randomUUID()],
+      contractFamilyKey: "family-beta",
+      memoryType: "research_experiment",
+      title: "accepted beta",
+      summary: "summary",
+      bodyMarkdown: "markdown",
+      tags: [],
+      confidence: 0.95,
+      reviewStatus: "accepted"
+    });
+
+    const familyAlpha = await repo.listContractMemoryContext(workspace.id, "family-alpha", 10);
+    assert.equal(familyAlpha.length, 1);
+    assert.equal(familyAlpha[0].review_status, "accepted");
+  });
+
+  test("pending experiment families respect minimum sample size of 15", async () => {
+    const workspace = await repo.ensureWorkspace(`threshold-${randomUUID()}`, process.cwd());
+
+    const seedRun = async (index: number) => {
+      const task = await repo.createTask({
+        workspaceId: workspace.id,
+        title: `threshold-${index}`,
+        request: "threshold test request",
+        requiresApproval: false
+      });
+      const contract = await repo.createContract({
+        taskId: task.id,
+        risk: "low",
+        status: "active",
+        contractJson: {
+          schema_version: 1,
+          family_key: "family-threshold",
+          category: "general"
+        }
+      });
+      const run = await repo.createRun({
+        taskId: task.id,
+        contractId: contract.id,
+        agentProfile: "builder",
+        workerId: "worker-threshold"
+      });
+      await repo.transitionRunStatus(run.id, "starting");
+      await repo.transitionRunStatus(run.id, "running");
+      await repo.transitionRunStatus(run.id, index % 2 === 0 ? "completed" : "failed");
+      await repo.recordEvaluation({
+        runId: run.id,
+        contractId: contract.id,
+        passed: index % 2 === 0,
+        score: index % 2 === 0 ? 90 : 45,
+        outcome: index % 2 === 0 ? "passed" : "failed",
+        findings: []
+      });
+    };
+
+    for (let i = 0; i < 14; i += 1) {
+      await seedRun(i);
+    }
+
+    const firstBatch = await repo.listResearchIngestionCandidates(100);
+    for (const candidate of firstBatch) {
+      await repo.recordResearchIngestion(candidate);
+    }
+
+    const belowThreshold = await repo.listPendingExperimentFamilies(15, 10);
+    assert.equal(
+      belowThreshold.some((entry) => entry.contract_family_key === "family-threshold"),
+      false
+    );
+
+    await seedRun(14);
+    const secondBatch = await repo.listResearchIngestionCandidates(100);
+    for (const candidate of secondBatch) {
+      await repo.recordResearchIngestion(candidate);
+    }
+
+    const atThreshold = await repo.listPendingExperimentFamilies(15, 10);
+    assert.equal(
+      atThreshold.some((entry) => entry.contract_family_key === "family-threshold"),
+      true
+    );
+  });
+
+  test("integration config can be upserted and listed", async () => {
+    const saved = await repo.upsertIntegrationConfig("process", {
+      command: "pnpm test"
+    });
+    assert.equal(saved.integration_key, "process");
+
+    const rows = await repo.listIntegrationConfigs();
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].integration_key, "process");
+    assert.equal(rows[0].config_json.command, "pnpm test");
+  });
+
+  test("0006 migration converts legacy claude_local config into llm_api", async () => {
+    const migrationDir = path.resolve(rootDir, "supabase/migrations");
+    const migration0005 = await readFile(path.join(migrationDir, "0005_integration_configs.sql"), "utf8");
+    const migration0006 = await readFile(path.join(migrationDir, "0006_llm_api_integration_cutover.sql"), "utf8");
+
+    await pool.query(`drop table if exists public.salvo_integration_configs cascade`);
+    await pool.query(migration0005);
+    await pool.query(
+      `insert into public.salvo_integration_configs (integration_key, config_json)
+       values ('claude_local', '{"authToken":"legacy-key","defaultModel":"claude-3-7-sonnet"}'::jsonb)`
+    );
+
+    await pool.query(migration0006);
+
+    const rows = await pool.query<{
+      integration_key: string;
+      config_json: Record<string, unknown>;
+    }>(`select integration_key, config_json from public.salvo_integration_configs order by integration_key asc`);
+
+    assert.equal(rows.rows.length, 1);
+    assert.equal(rows.rows[0].integration_key, "llm_api");
+    assert.equal(rows.rows[0].config_json.provider, "anthropic");
+    assert.equal(rows.rows[0].config_json.apiKey, "legacy-key");
+    assert.equal(rows.rows[0].config_json.defaultModel, "claude-3-7-sonnet");
+  });
+
+  test("0006 migration merges existing llm_api with claude_local and keeps llm_api precedence", async () => {
+    const migrationDir = path.resolve(rootDir, "supabase/migrations");
+    const migration0005 = await readFile(path.join(migrationDir, "0005_integration_configs.sql"), "utf8");
+    const migration0006 = await readFile(path.join(migrationDir, "0006_llm_api_integration_cutover.sql"), "utf8");
+
+    await pool.query(`drop table if exists public.salvo_integration_configs cascade`);
+    await pool.query(migration0005);
+    await pool.query(`
+      do $$
+      declare
+        c text;
+      begin
+        select conname into c
+        from pg_constraint
+        where conrelid = 'public.salvo_integration_configs'::regclass
+          and contype = 'c'
+        limit 1;
+        if c is not null then
+          execute format('alter table public.salvo_integration_configs drop constraint %I', c);
+        end if;
+      end
+      $$;
+    `);
+    await pool.query(`
+      alter table public.salvo_integration_configs
+        add constraint salvo_integration_configs_integration_key_check
+        check (integration_key in ('supabase','llm_api','claude_local','process','http'))
+    `);
+
+    await pool.query(
+      `insert into public.salvo_integration_configs (integration_key, config_json)
+       values
+       ('claude_local', '{"authToken":"legacy-key","baseUrl":"https://legacy.example/v1"}'::jsonb),
+       ('llm_api', '{"provider":"openai","apiKey":"new-key","defaultModel":"gpt-5"}'::jsonb)`
+    );
+
+    await pool.query(migration0006);
+
+    const rows = await pool.query<{
+      integration_key: string;
+      config_json: Record<string, unknown>;
+    }>(`select integration_key, config_json from public.salvo_integration_configs order by integration_key asc`);
+
+    assert.equal(rows.rows.length, 1);
+    assert.equal(rows.rows[0].integration_key, "llm_api");
+    assert.equal(rows.rows[0].config_json.provider, "openai");
+    assert.equal(rows.rows[0].config_json.apiKey, "new-key");
+    assert.equal(rows.rows[0].config_json.defaultModel, "gpt-5");
+    assert.equal(rows.rows[0].config_json.baseUrl, "https://legacy.example/v1");
   });
 }

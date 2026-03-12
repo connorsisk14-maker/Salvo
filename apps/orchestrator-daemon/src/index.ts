@@ -80,11 +80,6 @@ class OrchestratorDaemon {
       return;
     }
 
-    const [memoryContext, researchContext] = await Promise.all([
-      this.repo.listMemoryContext(task.workspace_id, 5),
-      this.repo.listResearchContext(task.workspace_id, 5)
-    ]);
-
     const contract = buildContractV1({
       contractId: randomUUID(),
       taskId: task.id,
@@ -93,10 +88,14 @@ class OrchestratorDaemon {
       taskTitle: task.title,
       preferredProfile: "builder"
     });
-    contract.context.memory_excerpt_ids = memoryContext.map((entry) => entry.id);
-    contract.context.recent_runs = researchContext.flatMap(
-      (entry) => entry.source_run_ids
+
+    const memoryContext = await this.repo.listContractMemoryContext(
+      task.workspace_id,
+      contract.family_key,
+      5
     );
+    contract.context.memory_excerpt_ids = memoryContext.map((entry) => entry.id);
+    contract.context.recent_runs = [...new Set(memoryContext.flatMap((entry) => entry.source_run_ids))];
 
     const requiresManualReview = contract.risk === "high" && !task.approved_at;
 
