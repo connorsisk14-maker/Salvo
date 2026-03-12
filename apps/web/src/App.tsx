@@ -3,6 +3,7 @@ import { ControlCenterPage } from "./pages/ControlCenterPage";
 import { BoardPage } from "./pages/BoardPage";
 import { ResearchReviewPage } from "./pages/ResearchReviewPage";
 import { RunDetailPage } from "./pages/RunDetailPage";
+import { IntegrationsPage } from "./pages/IntegrationsPage";
 
 export function AppShell() {
   return (
@@ -28,11 +29,18 @@ export function AppShell() {
           >
             Research Review
           </NavLink>
+          <NavLink
+            to="/integrations"
+            className={({ isActive }) => `top-nav-link ${isActive ? "top-nav-link-active" : ""}`}
+          >
+            Integrations
+          </NavLink>
         </nav>
         <Routes>
           <Route path="/" element={<ControlCenterPage />} />
           <Route path="/board" element={<BoardPage />} />
           <Route path="/research" element={<ResearchReviewPage />} />
+          <Route path="/integrations" element={<IntegrationsPage />} />
           <Route path="/runs/:runId" element={<RunDetailPage />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

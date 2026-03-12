@@ -1,6 +1,7 @@
 import { after, before, beforeEach, test } from "node:test";
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
@@ -24,7 +25,10 @@ if (!databaseUrl) {
       "0001_bootstrap.sql",
       "0002_runtime_contract.sql",
       "0003_daemon_heartbeats.sql",
-      "0004_run_cancellation.sql"
+      "0004_run_cancellation.sql",
+      "0005_integration_configs.sql",
+      "0006_llm_api_integration_cutover.sql",
+      "0007_research_analysis_pipeline.sql"
     ]) {
       const sql = await readFile(path.join(migrationDir, fileName), "utf8");
       await pool.query(sql);
@@ -35,6 +39,9 @@ if (!databaseUrl) {
     await pool.query(`
       truncate table
         public.salvo_memories,
+        public.salvo_research_findings,
+        public.salvo_research_experiments,
+        public.salvo_research_ingestions,
         public.salvo_research_documents,
         public.salvo_evaluations,
         public.salvo_artifacts,
@@ -42,6 +49,7 @@ if (!databaseUrl) {
         public.salvo_runs,
         public.salvo_contracts,
         public.salvo_tasks,
+        public.salvo_integration_configs,
         public.salvo_daemon_heartbeats,
         public.salvo_workspaces
       restart identity cascade
@@ -97,6 +105,13 @@ if (!databaseUrl) {
     }
 
     return { run, task };
+  }
+
+  async function createTempArtifactPath(fileName: string, content: string): Promise<string> {
+    const dir = await mkdtemp(path.join(tmpdir(), "salvo-artifact-"));
+    const target = path.join(dir, fileName);
+    await writeFile(target, content, "utf8");
+    return target;
   }
 
   test("control-plane task creation does not create a run", async () => {
@@ -291,5 +306,248 @@ if (!databaseUrl) {
     assert.equal(acceptedResearch.some((item) => item.id === researchId), true);
     const rejectedMemories = await repo.listMemories(10, "rejected");
     assert.equal(rejectedMemories.some((item) => item.id === memoryId), true);
+  });
+
+  test("research experiment endpoints list and review experiments", async () => {
+    const workspace = await repo.ensureWorkspace(`exp-${randomUUID()}`, process.cwd());
+    const experiment = await repo.createResearchExperiment({
+      workspaceId: workspace.id,
+      familyKey: "family-seed",
+      category: "general",
+      subcategory: null,
+      sampleSize: 15,
+      sourceDigest: "seed-digest",
+      sourceRunIds: [randomUUID()],
+      metricsJson: {
+        pass_rate: 0.5
+      },
+      bodyMarkdown: "# experiment",
+      confidence: 0.6,
+      reviewStatus: "unreviewed"
+    });
+
+    const listResponse = await app.inject({
+      method: "GET",
+      url: "/research/experiments?status=unreviewed"
+    });
+    assert.equal(listResponse.statusCode, 200);
+    const rows = listResponse.json();
+    assert.equal(rows.some((item: { id: string }) => item.id === experiment.experiment.id), true);
+
+    const reviewResponse = await app.inject({
+      method: "POST",
+      url: `/research/experiments/${experiment.experiment.id}/review`,
+      payload: {
+        status: "accepted"
+      }
+    });
+    assert.equal(reviewResponse.statusCode, 200);
+
+    const accepted = await app.inject({
+      method: "GET",
+      url: "/research/experiments?status=accepted"
+    });
+    assert.equal(accepted.statusCode, 200);
+    assert.equal(
+      accepted.json().some((item: { id: string }) => item.id === experiment.experiment.id),
+      true
+    );
+  });
+
+  test("run detail returns artifacts and final payload proof fields", async () => {
+    const seeded = await seedRun("running");
+    const artifactPath = await createTempArtifactPath("run-summary.md", "# Summary");
+
+    await repo.createArtifact({
+      runId: seeded.run.id,
+      taskId: seeded.task.id,
+      artifactType: "markdown",
+      path: artifactPath,
+      metadataJson: {
+        label: "run summary"
+      }
+    });
+    await repo.appendRunEvent(seeded.run.id, "run.final_payload", "info", {
+      status: "completed",
+      deliverables: ["run-summary.md"]
+    });
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/runs/${seeded.run.id}`
+    });
+
+    assert.equal(response.statusCode, 200);
+    const body = response.json();
+    assert.equal(Array.isArray(body.artifacts), true);
+    assert.equal(body.artifacts.length, 1);
+    assert.equal(body.artifacts[0].path, artifactPath);
+    assert.equal(body.final_payload.deliverables[0], "run-summary.md");
+  });
+
+  test("artifact preview endpoint returns text and content endpoints", async () => {
+    const seeded = await seedRun("running");
+    const artifactPath = await createTempArtifactPath("proof.md", "hello proof preview");
+
+    await repo.createArtifact({
+      runId: seeded.run.id,
+      taskId: seeded.task.id,
+      artifactType: "markdown",
+      path: artifactPath,
+      metadataJson: {
+        label: "proof"
+      }
+    });
+
+    const detail = await app.inject({
+      method: "GET",
+      url: `/runs/${seeded.run.id}`
+    });
+    const artifactId = detail.json().artifacts[0].id as string;
+
+    const preview = await app.inject({
+      method: "GET",
+      url: `/artifacts/${artifactId}/preview`
+    });
+    assert.equal(preview.statusCode, 200);
+    const previewBody = preview.json();
+    assert.equal(previewBody.kind, "text");
+    assert.ok((previewBody.content as string).includes("hello proof preview"));
+
+    const content = await app.inject({
+      method: "GET",
+      url: `/artifacts/${artifactId}/content`
+    });
+    assert.equal(content.statusCode, 200);
+    assert.ok(content.body.includes("hello proof preview"));
+  });
+
+  test("integrations and cost metrics endpoints return realtime payloads", async () => {
+    const seeded = await seedRun("running");
+    await repo.appendRunEvent(seeded.run.id, "usage.reported", "info", {
+      model: "gpt-5-mini",
+      input_tokens: 120,
+      output_tokens: 40,
+      cost_usd: 0.0012,
+      estimated: true
+    });
+
+    const integrations = await app.inject({
+      method: "GET",
+      url: "/integrations"
+    });
+    assert.equal(integrations.statusCode, 200);
+    assert.ok(Array.isArray(integrations.json()));
+    assert.ok(integrations.json().length >= 4);
+
+    const costs = await app.inject({
+      method: "GET",
+      url: "/metrics/costs"
+    });
+    assert.equal(costs.statusCode, 200);
+    const costBody = costs.json();
+    assert.equal(typeof costBody.totals.cost_usd, "number");
+    assert.equal(Array.isArray(costBody.by_model), true);
+    assert.ok(costBody.by_model.some((entry: { model: string }) => entry.model === "gpt-5-mini"));
+
+    const llmRow = integrations
+      .json()
+      .find((item: { key: string }) => item.key === "llm_api");
+    assert.ok(llmRow);
+  });
+
+  test("integration config update endpoint persists llm_api settings", async () => {
+    const update = await app.inject({
+      method: "POST",
+      url: "/integrations/llm_api/config",
+      payload: {
+        provider: "openai",
+        apiKey: "test-key",
+        baseUrl: "https://api.example.com/v1",
+        defaultModel: "gpt-5"
+      }
+    });
+
+    assert.equal(update.statusCode, 200);
+    assert.equal(update.json().ok, true);
+
+    const integrations = await app.inject({
+      method: "GET",
+      url: "/integrations"
+    });
+    assert.equal(integrations.statusCode, 200);
+
+    const llmRow = integrations
+      .json()
+      .find((item: { key: string }) => item.key === "llm_api");
+    assert.equal(llmRow.config.provider, "openai");
+    assert.equal(llmRow.config.base_url, "https://api.example.com/v1");
+    assert.equal(llmRow.config.default_model, "gpt-5");
+    assert.equal(llmRow.config.api_key_configured, true);
+  });
+
+  test("integrations endpoint uses env fallback SALVO_LLM_API_KEY then legacy SALVO_CLAUDE_AUTH_TOKEN", async () => {
+    const priorLlmKey = process.env.SALVO_LLM_API_KEY;
+    const priorClaudeKey = process.env.SALVO_CLAUDE_AUTH_TOKEN;
+    const priorProvider = process.env.SALVO_LLM_PROVIDER;
+
+    try {
+      process.env.SALVO_LLM_PROVIDER = "anthropic";
+      process.env.SALVO_LLM_API_KEY = "llm-fallback-key";
+      delete process.env.SALVO_CLAUDE_AUTH_TOKEN;
+
+      const withLlmKey = await app.inject({
+        method: "GET",
+        url: "/integrations"
+      });
+      const llmWithPrimary = withLlmKey
+        .json()
+        .find((item: { key: string }) => item.key === "llm_api");
+      assert.equal(llmWithPrimary.status, "ready");
+      assert.equal(llmWithPrimary.config.api_key_configured, true);
+
+      delete process.env.SALVO_LLM_API_KEY;
+      process.env.SALVO_CLAUDE_AUTH_TOKEN = "legacy-fallback-key";
+
+      const withLegacyKey = await app.inject({
+        method: "GET",
+        url: "/integrations"
+      });
+      const llmWithLegacy = withLegacyKey
+        .json()
+        .find((item: { key: string }) => item.key === "llm_api");
+      assert.equal(llmWithLegacy.status, "ready");
+      assert.equal(llmWithLegacy.config.api_key_configured, true);
+    } finally {
+      if (priorLlmKey === undefined) {
+        delete process.env.SALVO_LLM_API_KEY;
+      } else {
+        process.env.SALVO_LLM_API_KEY = priorLlmKey;
+      }
+
+      if (priorClaudeKey === undefined) {
+        delete process.env.SALVO_CLAUDE_AUTH_TOKEN;
+      } else {
+        process.env.SALVO_CLAUDE_AUTH_TOKEN = priorClaudeKey;
+      }
+
+      if (priorProvider === undefined) {
+        delete process.env.SALVO_LLM_PROVIDER;
+      } else {
+        process.env.SALVO_LLM_PROVIDER = priorProvider;
+      }
+    }
+  });
+
+  test("legacy claude_local integration key is rejected by config update endpoint", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/integrations/claude_local/config",
+      payload: {
+        authToken: "legacy"
+      }
+    });
+
+    assert.equal(response.statusCode, 400);
   });
 }

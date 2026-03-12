@@ -1,6 +1,9 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import { spawn } from "node:child_process";
+import { createReadStream } from "node:fs";
+import { readFile, stat } from "node:fs/promises";
+import path from "node:path";
 import { createDbPool, SalvoRepository } from "@salvo/db";
 
 const apiPort = Number(process.env.SALVO_API_PORT ?? 8787);
@@ -18,6 +21,53 @@ function daemonHealthStatus(heartbeatAt: string, thresholdSeconds: number): "hea
 
 type RestartTarget = "orchestrator" | "research";
 type ReviewStatus = "unreviewed" | "accepted" | "rejected";
+type IntegrationStatus =
+  | "ready"
+  | "not_configured"
+  | "needs_auth"
+  | "error"
+  | "healthy"
+  | "stale"
+  | "offline";
+type EditableIntegrationKey = "supabase" | "llm_api" | "process" | "http";
+type LlmProvider = "anthropic" | "openai" | "custom";
+
+type IntegrationConfigMap = {
+  supabase: {
+    url: string;
+    anonKey: string;
+  };
+  llm_api: {
+    provider: LlmProvider;
+    apiKey: string;
+    baseUrl: string;
+    defaultModel: string;
+  };
+  process: {
+    command: string;
+  };
+  http: {
+    baseUrl: string;
+    token: string;
+  };
+};
+
+const IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"]);
+const TEXT_EXTENSIONS = new Set([
+  ".md",
+  ".txt",
+  ".json",
+  ".log",
+  ".yaml",
+  ".yml",
+  ".ts",
+  ".tsx",
+  ".js",
+  ".jsx",
+  ".css",
+  ".html"
+]);
+const MAX_TEXT_PREVIEW_BYTES = 64_000;
 
 type RestartResult = {
   daemon: RestartTarget;
@@ -126,6 +176,138 @@ function startSseStream(
   reply.raw.on?.("close", cleanup);
 }
 
+function contentTypeForArtifact(filePath: string): string {
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext === ".md" || ext === ".txt" || ext === ".log") {
+    return "text/plain; charset=utf-8";
+  }
+  if (ext === ".json") {
+    return "application/json; charset=utf-8";
+  }
+  if (ext === ".png") {
+    return "image/png";
+  }
+  if (ext === ".jpg" || ext === ".jpeg") {
+    return "image/jpeg";
+  }
+  if (ext === ".gif") {
+    return "image/gif";
+  }
+  if (ext === ".webp") {
+    return "image/webp";
+  }
+  if (ext === ".svg") {
+    return "image/svg+xml";
+  }
+  return "application/octet-stream";
+}
+
+function isPreviewableText(filePath: string): boolean {
+  return TEXT_EXTENSIONS.has(path.extname(filePath).toLowerCase());
+}
+
+function isPreviewableImage(filePath: string): boolean {
+  return IMAGE_EXTENSIONS.has(path.extname(filePath).toLowerCase());
+}
+
+function hasValue(input: string | undefined): boolean {
+  return Boolean(input && input.trim().length > 0);
+}
+
+function isValidHttpUrl(input: string): boolean {
+  try {
+    const url = new URL(input);
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function normalizeProvider(input: string | undefined): LlmProvider {
+  if (input === "openai" || input === "custom" || input === "anthropic") {
+    return input;
+  }
+  return "anthropic";
+}
+
+function readString(
+  config: Record<string, unknown>,
+  key: string,
+  fallback = ""
+): string {
+  const value = config[key];
+  return typeof value === "string" ? value : fallback;
+}
+
+function createDefaultConfigMap(): IntegrationConfigMap {
+  return {
+    supabase: {
+      url: process.env.SALVO_SUPABASE_URL ?? "",
+      anonKey: process.env.SALVO_SUPABASE_ANON_KEY ?? ""
+    },
+    llm_api: {
+      provider: normalizeProvider(process.env.SALVO_LLM_PROVIDER),
+      apiKey: process.env.SALVO_LLM_API_KEY ?? process.env.SALVO_CLAUDE_AUTH_TOKEN ?? "",
+      baseUrl: process.env.SALVO_LLM_BASE_URL ?? "",
+      defaultModel: process.env.SALVO_LLM_DEFAULT_MODEL ?? ""
+    },
+    process: {
+      command:
+        process.env.SALVO_PROCESS_COMMAND ??
+        "pnpm --filter @salvo/agent-runner runner -- --run-id <id>"
+    },
+    http: {
+      baseUrl: process.env.SALVO_HTTP_BASE_URL ?? "",
+      token: process.env.SALVO_HTTP_TOKEN ?? ""
+    }
+  };
+}
+
+function applyStoredConfig(
+  defaults: IntegrationConfigMap,
+  rows: Array<{ integration_key: string; config_json: Record<string, unknown> }>
+): IntegrationConfigMap {
+  const next = structuredClone(defaults);
+  for (const row of rows) {
+    const config = row.config_json ?? {};
+    if (row.integration_key === "supabase") {
+      next.supabase.url = readString(config, "url", next.supabase.url);
+      next.supabase.anonKey = readString(config, "anonKey", next.supabase.anonKey);
+      continue;
+    }
+
+    if (row.integration_key === "llm_api" || row.integration_key === "claude_local") {
+      next.llm_api.provider = normalizeProvider(
+        readString(config, "provider", next.llm_api.provider)
+      );
+      next.llm_api.apiKey = readString(
+        config,
+        "apiKey",
+        readString(config, "authToken", next.llm_api.apiKey)
+      );
+      next.llm_api.baseUrl = readString(config, "baseUrl", next.llm_api.baseUrl);
+      next.llm_api.defaultModel = readString(
+        config,
+        "defaultModel",
+        next.llm_api.defaultModel
+      );
+      continue;
+    }
+
+    if (row.integration_key === "process") {
+      next.process.command = readString(config, "command", next.process.command);
+      continue;
+    }
+
+    if (row.integration_key === "http") {
+      next.http.baseUrl = readString(config, "baseUrl", next.http.baseUrl);
+      next.http.token = readString(config, "token", next.http.token);
+    }
+  }
+
+  return next;
+}
+
 export async function buildServer() {
   const pool = createDbPool();
   const repo = new SalvoRepository(pool);
@@ -172,6 +354,231 @@ export async function buildServer() {
       age_seconds: Number(ageSeconds.toFixed(1)),
       threshold_seconds: researchThresholdSeconds,
       metadata: heartbeat.metadata_json
+    };
+  });
+
+  app.get("/integrations", async () => {
+    const [orchestratorHeartbeat, researchHeartbeat, configs] = await Promise.all([
+      repo.getDaemonHeartbeat("orchestrator"),
+      repo.getDaemonHeartbeat("research"),
+      repo.listIntegrationConfigs()
+    ]);
+
+    const now = new Date().toISOString();
+    const defaultConfig = createDefaultConfigMap();
+    const config = applyStoredConfig(defaultConfig, configs);
+    const configUpdatedByKey = new Map<string, string>(
+      configs.map((item) => [item.integration_key, item.updated_at])
+    );
+
+    return [
+      {
+        key: "supabase",
+        label: "Supabase",
+        status: hasValue(config.supabase.url) && hasValue(config.supabase.anonKey) ? "ready" : "not_configured",
+        detail: hasValue(config.supabase.url) && hasValue(config.supabase.anonKey)
+          ? "Supabase URL and anon key configured."
+          : "Set Supabase URL and anon key.",
+        updated_at: configUpdatedByKey.get("supabase") ?? now,
+        editable: true,
+        config: {
+          url: config.supabase.url,
+          anon_key_configured: hasValue(config.supabase.anonKey)
+        }
+      },
+      {
+        key: "llm_api",
+        label: "LLM API",
+        status: !hasValue(config.llm_api.apiKey)
+          ? "needs_auth"
+          : hasValue(config.llm_api.baseUrl) && !isValidHttpUrl(config.llm_api.baseUrl)
+          ? "error"
+          : "ready",
+        detail: !hasValue(config.llm_api.apiKey)
+          ? "Set LLM API key."
+          : hasValue(config.llm_api.baseUrl) && !isValidHttpUrl(config.llm_api.baseUrl)
+          ? "LLM base URL must be a valid http/https URL."
+          : "LLM provider configuration is ready.",
+        updated_at:
+          configUpdatedByKey.get("llm_api") ??
+          configUpdatedByKey.get("claude_local") ??
+          now,
+        editable: true,
+        config: {
+          provider: config.llm_api.provider,
+          base_url: config.llm_api.baseUrl,
+          default_model: config.llm_api.defaultModel,
+          api_key_configured: hasValue(config.llm_api.apiKey)
+        }
+      },
+      {
+        key: "process",
+        label: "Process Adapter",
+        status: hasValue(config.process.command) ? "ready" : "not_configured",
+        detail: `Command: ${config.process.command || "(not set)"}`,
+        updated_at: configUpdatedByKey.get("process") ?? now,
+        editable: true,
+        config: {
+          command: config.process.command
+        }
+      },
+      {
+        key: "http",
+        label: "HTTP Adapter",
+        status: hasValue(config.http.baseUrl) && hasValue(config.http.token) ? "ready" : "not_configured",
+        detail: hasValue(config.http.baseUrl) && hasValue(config.http.token)
+          ? "HTTP base URL and token configured."
+          : "Set HTTP base URL and token.",
+        updated_at: configUpdatedByKey.get("http") ?? now,
+        editable: true,
+        config: {
+          base_url: config.http.baseUrl,
+          token_configured: hasValue(config.http.token)
+        }
+      },
+      {
+        key: "orchestrator_daemon",
+        label: "Orchestrator Daemon",
+        status: orchestratorHeartbeat
+          ? daemonHealthStatus(orchestratorHeartbeat.heartbeat_at, orchestratorThresholdSeconds)
+          : "offline",
+        detail: orchestratorHeartbeat
+          ? `Heartbeat at ${orchestratorHeartbeat.heartbeat_at}`
+          : "No heartbeat yet.",
+        updated_at: orchestratorHeartbeat?.heartbeat_at ?? now,
+        editable: false
+      },
+      {
+        key: "research_daemon",
+        label: "Research Daemon",
+        status: researchHeartbeat
+          ? daemonHealthStatus(researchHeartbeat.heartbeat_at, researchThresholdSeconds)
+          : "offline",
+        detail: researchHeartbeat
+          ? `Heartbeat at ${researchHeartbeat.heartbeat_at}`
+          : "No heartbeat yet.",
+        updated_at: researchHeartbeat?.heartbeat_at ?? now,
+        editable: false
+      }
+    ];
+  });
+
+  app.post<{
+    Params: { key: EditableIntegrationKey };
+    Body: Record<string, unknown>;
+  }>("/integrations/:key/config", async (req, reply) => {
+    const key = req.params.key;
+    if (!["supabase", "llm_api", "process", "http"].includes(key)) {
+      return reply.status(400).send({ ok: false, error: "Invalid integration key." });
+    }
+
+    const rows = await repo.listIntegrationConfigs();
+    const existingRow = rows.find((row) => row.integration_key === key);
+    const existing = (existingRow?.config_json ?? {}) as Record<string, unknown>;
+    const body = req.body ?? {};
+
+    let nextConfig: Record<string, unknown> = { ...existing };
+    if (key === "supabase") {
+      if (typeof body.url === "string") {
+        nextConfig.url = body.url.trim();
+      }
+      if (typeof body.anonKey === "string" && body.anonKey.trim().length > 0) {
+        nextConfig.anonKey = body.anonKey.trim();
+      }
+    } else if (key === "llm_api") {
+      if (typeof body.provider === "string") {
+        nextConfig.provider = normalizeProvider(body.provider);
+      }
+      if (typeof body.apiKey === "string" && body.apiKey.trim().length > 0) {
+        nextConfig.apiKey = body.apiKey.trim();
+      }
+      if (typeof body.baseUrl === "string") {
+        nextConfig.baseUrl = body.baseUrl.trim();
+      }
+      if (typeof body.defaultModel === "string") {
+        nextConfig.defaultModel = body.defaultModel.trim();
+      }
+    } else if (key === "process") {
+      if (typeof body.command === "string") {
+        nextConfig.command = body.command.trim();
+      }
+    } else if (key === "http") {
+      if (typeof body.baseUrl === "string") {
+        nextConfig.baseUrl = body.baseUrl.trim();
+      }
+      if (typeof body.token === "string" && body.token.trim().length > 0) {
+        nextConfig.token = body.token.trim();
+      }
+    }
+
+    await repo.upsertIntegrationConfig(key, nextConfig);
+    return { ok: true };
+  });
+
+  app.get("/metrics/costs", async () => {
+    const rows = await repo.listRunUsageCosts(500);
+
+    const byModel = new Map<string, { runs: number; cost_usd: number; input_tokens: number; output_tokens: number }>();
+    const byAgent = new Map<string, { runs: number; cost_usd: number; input_tokens: number; output_tokens: number }>();
+    let totalCost = 0;
+    let totalInputTokens = 0;
+    let totalOutputTokens = 0;
+
+    for (const row of rows) {
+      totalCost += row.cost_usd;
+      totalInputTokens += row.input_tokens;
+      totalOutputTokens += row.output_tokens;
+
+      const modelBucket = byModel.get(row.model) ?? {
+        runs: 0,
+        cost_usd: 0,
+        input_tokens: 0,
+        output_tokens: 0
+      };
+      modelBucket.runs += 1;
+      modelBucket.cost_usd += row.cost_usd;
+      modelBucket.input_tokens += row.input_tokens;
+      modelBucket.output_tokens += row.output_tokens;
+      byModel.set(row.model, modelBucket);
+
+      const agentBucket = byAgent.get(row.agent_profile) ?? {
+        runs: 0,
+        cost_usd: 0,
+        input_tokens: 0,
+        output_tokens: 0
+      };
+      agentBucket.runs += 1;
+      agentBucket.cost_usd += row.cost_usd;
+      agentBucket.input_tokens += row.input_tokens;
+      agentBucket.output_tokens += row.output_tokens;
+      byAgent.set(row.agent_profile, agentBucket);
+    }
+
+    const serialize = (
+      entries: Iterable<[string, { runs: number; cost_usd: number; input_tokens: number; output_tokens: number }]>,
+      keyLabel: "model" | "agent_profile"
+    ) =>
+      Array.from(entries)
+        .map(([key, value]) => ({
+          [keyLabel]: key,
+          runs: value.runs,
+          cost_usd: Number(value.cost_usd.toFixed(6)),
+          input_tokens: value.input_tokens,
+          output_tokens: value.output_tokens
+        }))
+        .sort((a, b) => (b.cost_usd as number) - (a.cost_usd as number));
+
+    return {
+      updated_at: new Date().toISOString(),
+      estimated: true,
+      totals: {
+        runs: rows.length,
+        cost_usd: Number(totalCost.toFixed(6)),
+        input_tokens: totalInputTokens,
+        output_tokens: totalOutputTokens
+      },
+      by_model: serialize(byModel.entries(), "model"),
+      by_agent_profile: serialize(byAgent.entries(), "agent_profile")
     };
   });
 
@@ -286,15 +693,87 @@ export async function buildServer() {
       return reply.status(404).send({ error: "Run not found" });
     }
 
-    const research = await repo.listResearchDocumentsForRun(req.params.id);
+    const [research, artifacts, finalPayload] = await Promise.all([
+      repo.listResearchDocumentsForRun(req.params.id),
+      repo.listArtifactsForRun(req.params.id),
+      repo.getRunFinalPayload(req.params.id)
+    ]);
     return {
       ...detail,
-      research
+      research,
+      artifacts,
+      final_payload: finalPayload
     };
   });
 
   app.get<{ Params: { id: string } }>("/runs/:id/events", async (req) => {
     return repo.listRunEvents(req.params.id);
+  });
+
+  app.get<{ Params: { id: string } }>("/artifacts/:id/preview", async (req, reply) => {
+    const artifact = await repo.getArtifact(req.params.id);
+    if (!artifact) {
+      return reply.status(404).send({ error: "Artifact not found" });
+    }
+
+    try {
+      const fileInfo = await stat(artifact.path);
+      if (!fileInfo.isFile()) {
+        return reply.status(400).send({ error: "Artifact path is not a file." });
+      }
+
+      if (isPreviewableImage(artifact.path)) {
+        return {
+          id: artifact.id,
+          kind: "image",
+          mime_type: contentTypeForArtifact(artifact.path),
+          content_url: `/artifacts/${artifact.id}/content`
+        };
+      }
+
+      if (isPreviewableText(artifact.path)) {
+        const maxBytes = Math.min(MAX_TEXT_PREVIEW_BYTES, fileInfo.size);
+        const content = await readFile(artifact.path, "utf8");
+        const trimmed = content.slice(0, maxBytes);
+
+        return {
+          id: artifact.id,
+          kind: "text",
+          mime_type: contentTypeForArtifact(artifact.path),
+          content: trimmed,
+          truncated: content.length > trimmed.length
+        };
+      }
+
+      return {
+        id: artifact.id,
+        kind: "binary",
+        mime_type: contentTypeForArtifact(artifact.path),
+        content_url: `/artifacts/${artifact.id}/content`
+      };
+    } catch (error) {
+      return reply.status(404).send({ error: (error as Error).message });
+    }
+  });
+
+  app.get<{ Params: { id: string } }>("/artifacts/:id/content", async (req, reply) => {
+    const artifact = await repo.getArtifact(req.params.id);
+    if (!artifact) {
+      return reply.status(404).send({ error: "Artifact not found" });
+    }
+
+    try {
+      const fileInfo = await stat(artifact.path);
+      if (!fileInfo.isFile()) {
+        return reply.status(400).send({ error: "Artifact path is not a file." });
+      }
+
+      reply.header("content-disposition", `inline; filename=\"${path.basename(artifact.path)}\"`);
+      reply.type(contentTypeForArtifact(artifact.path));
+      return reply.send(createReadStream(artifact.path));
+    } catch (error) {
+      return reply.status(404).send({ error: (error as Error).message });
+    }
   });
 
   app.get<{ Params: { id: string } }>("/contracts/:id", async (req, reply) => {
@@ -320,6 +799,24 @@ export async function buildServer() {
       return reply.status(400).send({ error: "Invalid review status." });
     }
     await repo.setResearchReviewStatus(req.params.id, status);
+    return { ok: true };
+  });
+
+  app.get<{
+    Querystring: { status?: ReviewStatus };
+  }>("/research/experiments", async (req) => {
+    return repo.listResearchExperiments(200, req.query.status);
+  });
+
+  app.post<{
+    Params: { id: string };
+    Body: { status: ReviewStatus };
+  }>("/research/experiments/:id/review", async (req, reply) => {
+    const status = req.body?.status;
+    if (!status || !["unreviewed", "accepted", "rejected"].includes(status)) {
+      return reply.status(400).send({ error: "Invalid review status." });
+    }
+    await repo.setResearchExperimentReviewStatus(req.params.id, status);
     return { ok: true };
   });
 

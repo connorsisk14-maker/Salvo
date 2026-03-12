@@ -20,6 +20,9 @@ export type ApiRun = {
   evaluation_outcome?: "passed" | "failed" | "hard_failed" | null;
   hard_fail_reason?: string | null;
   findings_json?: string[] | null;
+  contract_family_key: string;
+  contract_category: string;
+  contract_subcategory: string | null;
   created_at: string;
 };
 
@@ -82,6 +85,57 @@ export type ApiMemory = {
   created_at: string;
 };
 
+export type ApiResearchExperiment = {
+  id: string;
+  workspace_id: string;
+  contract_family_key: string;
+  contract_category: string;
+  contract_subcategory: string | null;
+  sample_size: number;
+  confidence: number;
+  review_status: "unreviewed" | "accepted" | "rejected";
+  source_run_ids: string[];
+  published_at: string | null;
+  created_at: string;
+  metrics_json: Record<string, unknown>;
+  body_markdown: string;
+};
+
+export type ApiIntegration = {
+  key: string;
+  label: string;
+  status: "ready" | "not_configured" | "needs_auth" | "error" | "healthy" | "stale" | "offline";
+  detail: string;
+  updated_at: string;
+  editable: boolean;
+  config?: Record<string, unknown>;
+};
+
+export type ApiCostMetrics = {
+  updated_at: string;
+  estimated: boolean;
+  totals: {
+    runs: number;
+    cost_usd: number;
+    input_tokens: number;
+    output_tokens: number;
+  };
+  by_model: Array<{
+    model: string;
+    runs: number;
+    cost_usd: number;
+    input_tokens: number;
+    output_tokens: number;
+  }>;
+  by_agent_profile: Array<{
+    agent_profile: string;
+    runs: number;
+    cost_usd: number;
+    input_tokens: number;
+    output_tokens: number;
+  }>;
+};
+
 export type ApiRunDetail = {
   run: ApiRun;
   task: ApiTask;
@@ -105,7 +159,36 @@ export type ApiRunDetail = {
     review_status: string;
     created_at: string;
   }>;
+  artifacts: Array<{
+    id: string;
+    artifact_type: string;
+    path: string;
+    metadata_json: Record<string, unknown>;
+    created_at: string;
+  }>;
+  final_payload: Record<string, unknown> | null;
 };
+
+export type ApiArtifactPreview =
+  | {
+      id: string;
+      kind: "image";
+      mime_type: string;
+      content_url: string;
+    }
+  | {
+      id: string;
+      kind: "text";
+      mime_type: string;
+      content: string;
+      truncated: boolean;
+    }
+  | {
+      id: string;
+      kind: "binary";
+      mime_type: string;
+      content_url: string;
+    };
 
 const baseUrl = import.meta.env.VITE_SALVO_API_URL ?? "http://localhost:8787";
 export const controlPlaneBaseUrl = baseUrl;
@@ -183,6 +266,24 @@ export function getResearchHealth(): Promise<ApiDaemonHealth> {
   return request<ApiDaemonHealth>("/health/research");
 }
 
+export function listIntegrations(): Promise<ApiIntegration[]> {
+  return request<ApiIntegration[]>("/integrations");
+}
+
+export function getCostMetrics(): Promise<ApiCostMetrics> {
+  return request<ApiCostMetrics>("/metrics/costs");
+}
+
+export function updateIntegrationConfig(
+  key: "supabase" | "llm_api" | "process" | "http",
+  input: Record<string, unknown>
+): Promise<ApiActionResponse> {
+  return request<ApiActionResponse>(`/integrations/${key}/config`, {
+    method: "POST",
+    body: JSON.stringify(input)
+  });
+}
+
 export function forceRestartDaemon(
   target: ApiRestartTarget
 ): Promise<ApiRestartResponse> {
@@ -221,6 +322,23 @@ export function reviewResearch(
   });
 }
 
+export function listResearchExperiments(
+  status?: "unreviewed" | "accepted" | "rejected"
+): Promise<ApiResearchExperiment[]> {
+  const query = status ? `?status=${status}` : "";
+  return request<ApiResearchExperiment[]>(`/research/experiments${query}`);
+}
+
+export function reviewResearchExperiment(
+  id: string,
+  status: "unreviewed" | "accepted" | "rejected"
+): Promise<ApiActionResponse> {
+  return request<ApiActionResponse>(`/research/experiments/${id}/review`, {
+    method: "POST",
+    body: JSON.stringify({ status })
+  });
+}
+
 export function listMemories(
   status?: "unreviewed" | "accepted" | "rejected"
 ): Promise<ApiMemory[]> {
@@ -240,4 +358,12 @@ export function reviewMemory(
 
 export function streamUrl(path: string): string {
   return `${baseUrl}${path}`;
+}
+
+export function getArtifactPreview(artifactId: string): Promise<ApiArtifactPreview> {
+  return request<ApiArtifactPreview>(`/artifacts/${artifactId}/preview`);
+}
+
+export function artifactContentUrl(artifactId: string): string {
+  return `${baseUrl}/artifacts/${artifactId}/content`;
 }

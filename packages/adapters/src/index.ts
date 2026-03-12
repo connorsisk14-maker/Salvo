@@ -1,4 +1,4 @@
 export * from "./types";
-export * from "./claude-local";
+export * from "./llm-api";
 export * from "./process";
 export * from "./http";

@@ -22,7 +22,7 @@ export type SectionKey = (typeof SECTIONS)[number];
 
 export const INTEGRATION_KEYS = [
   "supabase",
-  "claude_local",
+  "llm_api",
   "process",
   "http"
 ] as const;
@@ -48,8 +48,11 @@ export type IntegrationConfigMap = {
     url: string;
     anonKey: string;
   };
-  claude_local: {
-    authToken: string;
+  llm_api: {
+    provider: "anthropic" | "openai" | "custom";
+    apiKey: string;
+    baseUrl: string;
+    defaultModel: string;
   };
   process: {
     command: string;
@@ -90,10 +93,10 @@ export const INTEGRATIONS: IntegrationDefinition[] = [
       "Primary relational store for runs, policy snapshots, and audit events."
   },
   {
-    key: "claude_local",
-    label: "Claude Local Adapter",
+    key: "llm_api",
+    label: "LLM API Adapter",
     description:
-      "Adapter scaffold for local Claude execution handshake and auth flow."
+      "Adapter scaffold for provider-agnostic hosted LLM execution."
   },
   {
     key: "process",
@@ -110,17 +113,17 @@ export const INTEGRATIONS: IntegrationDefinition[] = [
 
 export const SECTION_REQUIREMENTS: Record<SectionKey, IntegrationKey[]> = {
   dashboard: [],
-  contracts: ["supabase", "claude_local"],
+  contracts: ["supabase", "llm_api"],
   fleet: ["supabase"],
   runs: ["process", "supabase"],
-  reviews: ["claude_local"],
+  reviews: ["llm_api"],
   policy: ["supabase"],
   audit: ["supabase"],
   integrations: []
 };
 
 const WORKFLOW_REQUIREMENTS: Record<WorkflowKey, IntegrationKey[]> = {
-  lead_gen: ["supabase", "http", "claude_local"]
+  lead_gen: ["supabase", "http", "llm_api"]
 };
 
 const DEFAULT_CONFIG: IntegrationConfigMap = {
@@ -128,8 +131,11 @@ const DEFAULT_CONFIG: IntegrationConfigMap = {
     url: "",
     anonKey: ""
   },
-  claude_local: {
-    authToken: ""
+  llm_api: {
+    provider: "anthropic",
+    apiKey: "",
+    baseUrl: "",
+    defaultModel: ""
   },
   process: {
     command: ""
@@ -171,19 +177,26 @@ export function validateIntegrationConfig(
     };
   }
 
-  if (key === "claude_local") {
-    const details = config as IntegrationConfigMap["claude_local"];
+  if (key === "llm_api") {
+    const details = config as IntegrationConfigMap["llm_api"];
 
-    if (!details.authToken) {
+    if (!details.apiKey) {
       return {
         status: "needs_auth",
-        detail: "Set a local Claude auth token."
+        detail: "Set an LLM API key."
+      };
+    }
+
+    if (details.baseUrl && !isValidUrl(details.baseUrl)) {
+      return {
+        status: "error",
+        detail: "LLM API base URL must be a valid http/https URL."
       };
     }
 
     return {
       status: "ready",
-      detail: "Claude local adapter token is configured."
+      detail: "LLM API configuration is complete."
     };
   }
 
@@ -242,8 +255,8 @@ export function toIntegrationStates(
       ...validateIntegrationConfig("supabase", config.supabase),
       updatedAt: now
     },
-    claude_local: {
-      ...validateIntegrationConfig("claude_local", config.claude_local),
+    llm_api: {
+      ...validateIntegrationConfig("llm_api", config.llm_api),
       updatedAt: now
     },
     process: {
@@ -265,9 +278,9 @@ export function createInitialSetupState(
       ...DEFAULT_CONFIG.supabase,
       ...(seed?.supabase ?? {})
     },
-    claude_local: {
-      ...DEFAULT_CONFIG.claude_local,
-      ...(seed?.claude_local ?? {})
+    llm_api: {
+      ...DEFAULT_CONFIG.llm_api,
+      ...(seed?.llm_api ?? {})
     },
     process: {
       ...DEFAULT_CONFIG.process,
