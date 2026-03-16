@@ -1,28 +1,20 @@
 import path from "node:path";
 import { mkdir } from "node:fs/promises";
 import { createDbPool, SalvoRepository } from "@salvo/db";
-import {
-  buildToolPolicy,
-  CommandAdapter,
-  FilesystemAdapter,
-  type ToolPolicy
-} from "@salvo/tools";
+import { CommandAdapter, FilesystemAdapter } from "@salvo/tools";
 import { createLogger, initializeSecrets } from "@salvo/shared";
+import {
+  buildRunnerPrompts,
+  collectPromptContext,
+  commandEvidence,
+  normalizeArtifacts,
+  parseContractPolicy,
+  resolveRunnerLlmConfig,
+  runLlmGeneration,
+  validateRunnerContract
+} from "./runtime";
 
 await initializeSecrets();
-
-const MODEL_BY_PROFILE = {
-  builder: "gpt-5-mini",
-  researcher: "gpt-5",
-  debugger: "gpt-5-mini",
-  documenter: "gpt-5-nano"
-} as const;
-
-const MODEL_PRICING_USD_PER_1K = {
-  "gpt-5": { input: 0.005, output: 0.015 },
-  "gpt-5-mini": { input: 0.0015, output: 0.006 },
-  "gpt-5-nano": { input: 0.0005, output: 0.002 }
-} as const;
 
 function parseArg(flag: string): string | undefined {
   const idx = process.argv.indexOf(flag);
@@ -30,43 +22,6 @@ function parseArg(flag: string): string | undefined {
     return undefined;
   }
   return process.argv[idx + 1];
-}
-
-function parseContractPolicy(
-  workspaceRoot: string,
-  contractJson: Record<string, unknown>
-): ToolPolicy {
-  const scope =
-    (contractJson.scope as
-      | { read_paths?: string[]; write_paths?: string[]; forbidden_paths?: string[] }
-      | undefined) ?? {};
-
-  const capabilities =
-    (contractJson.capabilities as { run_tests?: boolean } | undefined) ?? {};
-
-  const allowedCommands = capabilities.run_tests
-    ? ["echo", "ls", "cat", "pnpm", "npm", "node"]
-    : ["echo", "ls", "cat"];
-
-  return buildToolPolicy(workspaceRoot, {
-    allowedReadPaths: scope.read_paths ?? ["."],
-    allowedWritePaths: scope.write_paths ?? ["."],
-    forbiddenPaths: scope.forbidden_paths ?? [".git", "node_modules"],
-    allowedCommandCwds: ["."],
-    allowedCommands,
-    commandTimeoutMs: 20_000
-  });
-}
-
-function splitCommand(commandLine: string): { command: string; args: string[] } {
-  const parts = commandLine.trim().split(/\s+/).filter(Boolean);
-  if (parts.length === 0) {
-    return { command: "echo", args: [] };
-  }
-  return {
-    command: parts[0],
-    args: parts.slice(1)
-  };
 }
 
 async function main(): Promise<void> {
@@ -89,6 +44,13 @@ async function main(): Promise<void> {
   }
 
   const { run, task, contract } = context;
+  const contractJson = validateRunnerContract(contract.contract_json);
+  const integrationConfigs = await repo.listIntegrationConfigs();
+  const llmConfig = resolveRunnerLlmConfig({
+    integrationConfigs,
+    env: process.env,
+    agentProfile: run.agent_profile
+  });
   const workspaceRoot = path.resolve(
     process.env.SALVO_WORKSPACE_ROOT ?? process.cwd(),
     "runs",
@@ -97,13 +59,20 @@ async function main(): Promise<void> {
 
   await mkdir(workspaceRoot, { recursive: true });
 
-  const policy = parseContractPolicy(workspaceRoot, contract.contract_json);
+  const policy = parseContractPolicy(workspaceRoot, contractJson);
   const filesystem = new FilesystemAdapter(workspaceRoot, policy);
   const command = new CommandAdapter(policy);
-  const contractJson = contract.contract_json as {
-    success_criteria?: { required_test_commands?: string[] };
-  };
-  const requiredTestCommands = contractJson.success_criteria?.required_test_commands ?? [];
+  const promptContext = await collectPromptContext({
+    relevantFiles: contractJson.context.relevant_files,
+    listDirectory: (targetPath) => filesystem.listDirectory(targetPath),
+    readFile: (targetPath) => filesystem.readFile(targetPath)
+  });
+  const prompts = buildRunnerPrompts({
+    task,
+    run,
+    contract: contractJson,
+    context: promptContext
+  });
 
   await repo.transitionRunStatus(run.id, "running", {
     runnerPid: process.pid,
@@ -115,12 +84,16 @@ async function main(): Promise<void> {
     run_id: run.id,
     task_id: task.id,
     workspace: workspaceRoot,
-    agent_profile: run.agent_profile
+    agent_profile: run.agent_profile,
+    model: llmConfig.model,
+    provider: llmConfig.provider
   });
   logger.info("run started", {
     task_id: task.id,
     agent_profile: run.agent_profile,
-    workspace: workspaceRoot
+    workspace: workspaceRoot,
+    model: llmConfig.model,
+    provider: llmConfig.provider
   });
 
   const heartbeatTimer = setInterval(async () => {
@@ -128,197 +101,165 @@ async function main(): Promise<void> {
     await repo.appendRunEvent(run.id, "run.heartbeat", "debug", {
       at: new Date().toISOString()
     });
-    logger.debug("heartbeat recorded");
   }, 10_000);
 
   try {
-    await repo.appendRunEvent(run.id, "plan.generated", "info", {
-      steps: [
-        "Create run summary deliverable",
-        "Emit evidence command output",
-        "Finalize payload"
-      ]
-    });
-
-    const writeResult = await filesystem.writeFile(
-      "run-summary.md",
-      `# Run Summary\n\nTask: ${task.title}\n\nRequest: ${task.original_request}\n`
-    );
-
-    if (!writeResult.ok) {
-      logger.warn("write blocked by policy", {
-        task_id: task.id,
-        reason: writeResult.decision.reason
-      });
-      await repo.appendRunEvent(run.id, "policy.denied", "warn", {
-        reason: writeResult.decision.reason,
-        message: writeResult.decision.message,
-        target: "run-summary.md"
-      });
-
-      await repo.appendRunEvent(run.id, "run.final_payload", "error", {
-        status: "blocked",
-        summary: "Run blocked by file policy",
-        deliverables: [],
-        evidence: {
-          tests_run: [],
-          command_results: []
-        },
-        roadblocks: [
-          {
-            type: "policy_denied",
-            description: writeResult.decision.message
-          }
-        ],
-        learnings: [
-          {
-            type: "failure_pattern",
-            title: "Policy denied write",
-            body: writeResult.decision.message
-          }
-        ]
-      });
-
-      await repo.appendRunEvent(run.id, "run.failed", "error", {
-        reason: "policy_denied"
-      });
-      process.exitCode = 1;
-      return;
-    }
-
-    await repo.createArtifact({
-      runId: run.id,
-      taskId: task.id,
-      artifactType: "markdown",
-      path: writeResult.absolutePath,
-      metadataJson: {
-        label: "run summary"
-      }
-    });
-
-    await repo.appendRunEvent(run.id, "artifact.created", "info", {
-      path: writeResult.absolutePath,
-      artifact_type: "markdown"
-    });
-
     await repo.appendRunEvent(run.id, "tool.called", "info", {
-      tool: "command",
-      command: "echo",
-      args: ["runner evidence"]
+      tool: "llm",
+      provider: llmConfig.provider,
+      model: llmConfig.model
     });
 
-    const commandResult = await command.run("echo", ["runner evidence"], workspaceRoot);
+    const llmResult = await runLlmGeneration({
+      config: llmConfig,
+      systemPrompt: prompts.systemPrompt,
+      userPrompt: prompts.userPrompt
+    });
 
-    if (!commandResult.ok) {
-      logger.warn("command blocked by policy", {
-        command: "echo",
-        reason: commandResult.decision.reason
+    await repo.appendRunEvent(run.id, "tool.result", "info", {
+      tool: "llm",
+      provider: llmConfig.provider,
+      model: llmConfig.model,
+      plan_steps: llmResult.output.plan_steps.length,
+      artifact_count: llmResult.output.artifacts.length,
+      learning_count: llmResult.output.learnings.length
+    });
+    await repo.appendRunEvent(run.id, "plan.generated", "info", {
+      steps: llmResult.output.plan_steps
+    });
+
+    await repo.appendRunEvent(run.id, "usage.reported", "info", llmResult.usage);
+    logger.info("usage reported", llmResult.usage);
+
+    const artifacts = normalizeArtifacts(llmResult.output, contractJson);
+    const createdArtifacts: string[] = [];
+
+    for (const artifact of artifacts) {
+      await repo.appendRunEvent(run.id, "tool.called", "info", {
+        tool: "filesystem.write",
+        path: artifact.path
       });
-      await repo.appendRunEvent(run.id, "policy.denied", "warn", {
-        reason: commandResult.decision.reason,
-        message: commandResult.decision.message,
-        command: "echo"
+
+      const writeResult = await filesystem.writeFile(artifact.path, artifact.content);
+      if (!writeResult.ok) {
+        logger.warn("artifact write blocked by policy", {
+          task_id: task.id,
+          path: artifact.path,
+          reason: writeResult.decision.reason
+        });
+        await repo.appendRunEvent(run.id, "policy.denied", "warn", {
+          reason: writeResult.decision.reason,
+          message: writeResult.decision.message,
+          target: artifact.path
+        });
+
+        if (contractJson.failure_handling.stop_on_policy_denial) {
+          await repo.appendRunEvent(run.id, "run.final_payload", "error", {
+            status: "blocked",
+            summary: llmResult.output.summary,
+            deliverables: createdArtifacts,
+            evidence: {
+              tests_run: [],
+              command_results: [],
+              files_changed: createdArtifacts.length
+            },
+            roadblocks: [
+              {
+                type: "policy_denied",
+                description: writeResult.decision.message
+              }
+            ],
+            learnings: llmResult.output.learnings
+          });
+          await repo.appendRunEvent(run.id, "run.failed", "error", {
+            reason: "policy_denied"
+          });
+          process.exitCode = 1;
+          return;
+        }
+
+        continue;
+      }
+
+      await repo.createArtifact({
+        runId: run.id,
+        taskId: task.id,
+        artifactType: artifact.artifact_type ?? "markdown",
+        path: writeResult.absolutePath,
+        metadataJson: {
+          label: artifact.label ?? artifact.path
+        }
       });
-    } else {
-      await repo.appendRunEvent(run.id, "tool.result", "info", {
-        command: "echo",
-        exit_code: commandResult.exitCode,
-        stdout: commandResult.stdout.trim()
+      await repo.appendRunEvent(run.id, "artifact.created", "info", {
+        path: writeResult.absolutePath,
+        artifact_type: artifact.artifact_type ?? "markdown"
       });
+      createdArtifacts.push(artifact.path);
     }
 
     const testsRun: Array<{ command: string; exit_code?: number; denied?: boolean }> = [];
-    for (const testCommand of requiredTestCommands) {
-      const parsed = splitCommand(testCommand);
+    const commandResults: Record<string, unknown>[] = [];
+    for (const testCommand of contractJson.success_criteria.required_test_commands) {
+      const parts = testCommand.trim().split(/\s+/).filter(Boolean);
+      const commandName = parts[0] ?? "echo";
+      const args = parts.slice(1);
+
       await repo.appendRunEvent(run.id, "tool.called", "info", {
         tool: "command",
-        command: parsed.command,
-        args: parsed.args,
+        command: commandName,
+        args,
         purpose: "required_test_command"
       });
 
-      const testResult = await command.run(parsed.command, parsed.args, workspaceRoot);
-      if (!testResult.ok) {
+      const result = await command.run(commandName, args, workspaceRoot);
+      commandResults.push(commandEvidence(testCommand, result));
+
+      if (!result.ok) {
         await repo.appendRunEvent(run.id, "policy.denied", "warn", {
-          reason: testResult.decision.reason,
-          message: testResult.decision.message,
+          reason: result.decision.reason,
+          message: result.decision.message,
           command: testCommand
         });
         testsRun.push({
           command: testCommand,
           denied: true
         });
-      } else {
-        await repo.appendRunEvent(run.id, "tool.result", "info", {
-          command: testCommand,
-          exit_code: testResult.exitCode,
-          stdout: testResult.stdout.trim()
-        });
-        testsRun.push({
-          command: testCommand,
-          exit_code: testResult.exitCode
-        });
+        continue;
       }
+
+      await repo.appendRunEvent(run.id, "tool.result", "info", {
+        command: testCommand,
+        exit_code: result.exitCode,
+        stdout: result.stdout.trim(),
+        stderr: result.stderr.trim(),
+        duration_ms: result.durationMs
+      });
+      testsRun.push({
+        command: testCommand,
+        exit_code: result.exitCode
+      });
     }
-
-    const model = MODEL_BY_PROFILE[run.agent_profile] ?? "gpt-5-mini";
-    const pricing = MODEL_PRICING_USD_PER_1K[model] ?? MODEL_PRICING_USD_PER_1K["gpt-5-mini"];
-    const inputTokens = Math.max(1, Math.ceil(task.original_request.length / 4));
-    const outputTokens = Math.max(1, Math.ceil((task.title.length + 120) / 4));
-    const estimatedCostUsd =
-      (inputTokens / 1000) * pricing.input + (outputTokens / 1000) * pricing.output;
-
-    await repo.appendRunEvent(run.id, "usage.reported", "info", {
-      model,
-      input_tokens: inputTokens,
-      output_tokens: outputTokens,
-      cost_usd: Number(estimatedCostUsd.toFixed(6)),
-      pricing_unit: "usd_per_1k_tokens",
-      estimated: true
-    });
-    logger.info("usage reported", {
-      model,
-      cost_usd: Number(estimatedCostUsd.toFixed(6)),
-      input_tokens: inputTokens,
-      output_tokens: outputTokens
-    });
 
     await repo.appendRunEvent(run.id, "run.final_payload", "info", {
       status: "completed",
-      summary: `Generated run summary for task ${task.id}`,
-      deliverables: ["run-summary.md"],
+      summary: llmResult.output.summary,
+      deliverables: createdArtifacts,
       evidence: {
         tests_run: testsRun,
-        command_results: [
-          commandResult.ok
-            ? {
-                command: "echo",
-                exit_code: commandResult.exitCode
-              }
-            : {
-                command: "echo",
-                denied: true,
-                reason: commandResult.decision.reason
-              }
-        ],
-        files_changed: 1
+        command_results: commandResults,
+        files_changed: createdArtifacts.length
       },
       roadblocks: [],
-      learnings: [
-        {
-          type: "best_practice",
-          title: "Adapter-only execution",
-          body: "Runner used only policy-enforced adapters for file and command operations."
-        }
-      ]
+      learnings: llmResult.output.learnings
     });
 
     await repo.appendRunEvent(run.id, "run.completed", "info", {
-      summary: "Runner completed payload emission"
+      summary: llmResult.output.summary,
+      deliverables: createdArtifacts
     });
     logger.info("run completed", {
       task_id: task.id,
-      deliverables: ["run-summary.md"]
+      deliverables: createdArtifacts
     });
   } catch (error) {
     logger.error("run failed", {
