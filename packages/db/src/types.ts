@@ -93,6 +93,15 @@ export type DbArtifact = {
   created_at: string;
 };
 
+export type DbAuditEvent = {
+  id: number;
+  created_at: string;
+  actor: string;
+  action: string;
+  target: string | null;
+  metadata: Record<string, unknown>;
+};
+
 export type DbEvaluation = {
   id: string;
   run_id: string;
@@ -180,6 +189,13 @@ export type CreateTaskInput = {
   title: string;
   request: string;
   requiresApproval?: boolean;
+};
+
+export type CreateAuditEventInput = {
+  actor: string;
+  action: string;
+  target?: string | null;
+  metadata?: Record<string, unknown>;
 };
 
 export type CreateContractInput = {

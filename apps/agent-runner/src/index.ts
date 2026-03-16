@@ -7,6 +7,7 @@ import {
   FilesystemAdapter,
   type ToolPolicy
 } from "@salvo/tools";
+import { createLogger } from "@salvo/shared";
 
 const MODEL_BY_PROFILE = {
   builder: "gpt-5-mini",
@@ -72,6 +73,11 @@ async function main(): Promise<void> {
     throw new Error("Missing --run-id");
   }
 
+  const logger = createLogger({
+    component: "agent-runner",
+    run_id: runId
+  });
+
   const pool = createDbPool();
   const repo = new SalvoRepository(pool);
 
@@ -109,12 +115,18 @@ async function main(): Promise<void> {
     workspace: workspaceRoot,
     agent_profile: run.agent_profile
   });
+  logger.info("run started", {
+    task_id: task.id,
+    agent_profile: run.agent_profile,
+    workspace: workspaceRoot
+  });
 
   const heartbeatTimer = setInterval(async () => {
     await repo.recordHeartbeat(run.id);
     await repo.appendRunEvent(run.id, "run.heartbeat", "debug", {
       at: new Date().toISOString()
     });
+    logger.debug("heartbeat recorded");
   }, 10_000);
 
   try {
@@ -132,6 +144,10 @@ async function main(): Promise<void> {
     );
 
     if (!writeResult.ok) {
+      logger.warn("write blocked by policy", {
+        task_id: task.id,
+        reason: writeResult.decision.reason
+      });
       await repo.appendRunEvent(run.id, "policy.denied", "warn", {
         reason: writeResult.decision.reason,
         message: writeResult.decision.message,
@@ -192,6 +208,10 @@ async function main(): Promise<void> {
     const commandResult = await command.run("echo", ["runner evidence"], workspaceRoot);
 
     if (!commandResult.ok) {
+      logger.warn("command blocked by policy", {
+        command: "echo",
+        reason: commandResult.decision.reason
+      });
       await repo.appendRunEvent(run.id, "policy.denied", "warn", {
         reason: commandResult.decision.reason,
         message: commandResult.decision.message,
@@ -254,6 +274,12 @@ async function main(): Promise<void> {
       pricing_unit: "usd_per_1k_tokens",
       estimated: true
     });
+    logger.info("usage reported", {
+      model,
+      cost_usd: Number(estimatedCostUsd.toFixed(6)),
+      input_tokens: inputTokens,
+      output_tokens: outputTokens
+    });
 
     await repo.appendRunEvent(run.id, "run.final_payload", "info", {
       status: "completed",
@@ -288,7 +314,15 @@ async function main(): Promise<void> {
     await repo.appendRunEvent(run.id, "run.completed", "info", {
       summary: "Runner completed payload emission"
     });
+    logger.info("run completed", {
+      task_id: task.id,
+      deliverables: ["run-summary.md"]
+    });
   } catch (error) {
+    logger.error("run failed", {
+      task_id: task.id,
+      error
+    });
     await repo.appendRunEvent(run.id, "run.failed", "error", {
       error: (error as Error).message
     });
@@ -299,4 +333,9 @@ async function main(): Promise<void> {
   }
 }
 
-await main();
+try {
+  await main();
+} catch (error) {
+  createLogger({ component: "agent-runner" }).error("runner crashed", { error });
+  process.exit(1);
+}

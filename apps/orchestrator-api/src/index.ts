@@ -5,6 +5,7 @@ import { createReadStream } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { createDbPool, SalvoRepository } from "@salvo/db";
+import { z } from "zod";
 
 const apiPort = Number(process.env.SALVO_API_PORT ?? 8787);
 const orchestratorThresholdSeconds = Number(
@@ -13,10 +14,55 @@ const orchestratorThresholdSeconds = Number(
 const researchThresholdSeconds = Number(
   process.env.SALVO_HEALTH_RESEARCH_STALE_SECONDS ?? 45
 );
+const apiBodyLimitBytes = readPositiveIntegerEnv("SALVO_API_BODY_LIMIT_BYTES", 1_048_576);
+const rateLimitMaxRequests = readPositiveIntegerEnv("SALVO_API_RATE_LIMIT_PER_MINUTE", 60);
+const rateLimitWindowMs = readPositiveIntegerEnv("SALVO_API_RATE_LIMIT_WINDOW_MS", 60_000);
+const taskTitleMaxLength = readPositiveIntegerEnv("SALVO_API_TASK_TITLE_MAX_LENGTH", 160);
+const taskRequestMaxLength = readPositiveIntegerEnv("SALVO_API_TASK_REQUEST_MAX_LENGTH", 20_000);
+
+const reviewStatusSchema = z.object({
+  status: z.enum(["unreviewed", "accepted", "rejected"])
+}).strict();
+
+const restartBodySchema = z.object({
+  target: z.enum(["orchestrator", "research", "all"])
+}).strict();
+
+const taskCreateSchema = z.object({
+  title: z.string().trim().min(1, "Title is required.").max(taskTitleMaxLength, `Title must be ${taskTitleMaxLength} characters or fewer.`),
+  request: z.string().trim().min(1, "Request is required.").max(taskRequestMaxLength, `Request must be ${taskRequestMaxLength} characters or fewer.`),
+  workspaceId: z.string().uuid("workspaceId must be a valid UUID.").optional(),
+  requiresApproval: z.boolean().optional()
+}).strict();
+
+const integrationConfigSchemas = {
+  supabase: z.object({
+    url: z.string().trim().max(2048, "url must be 2048 characters or fewer.").optional(),
+    anonKey: z.string().trim().max(4096, "anonKey must be 4096 characters or fewer.").optional()
+  }).strict(),
+  llm_api: z.object({
+    provider: z.enum(["anthropic", "openai", "custom"]).optional(),
+    apiKey: z.string().trim().max(4096, "apiKey must be 4096 characters or fewer.").optional(),
+    baseUrl: z.string().trim().max(2048, "baseUrl must be 2048 characters or fewer.").optional(),
+    defaultModel: z.string().trim().max(256, "defaultModel must be 256 characters or fewer.").optional()
+  }).strict(),
+  process: z.object({
+    command: z.string().trim().max(2048, "command must be 2048 characters or fewer.").optional()
+  }).strict(),
+  http: z.object({
+    baseUrl: z.string().trim().max(2048, "baseUrl must be 2048 characters or fewer.").optional(),
+    token: z.string().trim().max(4096, "token must be 4096 characters or fewer.").optional()
+  }).strict()
+} as const;
 
 function daemonHealthStatus(heartbeatAt: string, thresholdSeconds: number): "healthy" | "stale" {
   const ageSeconds = (Date.now() - new Date(heartbeatAt).getTime()) / 1000;
   return ageSeconds <= thresholdSeconds ? "healthy" : "stale";
+}
+
+function readPositiveIntegerEnv(name: string, fallback: number): number {
+  const value = Number(process.env[name] ?? fallback);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
 }
 
 type RestartTarget = "orchestrator" | "research";
@@ -50,6 +96,16 @@ type IntegrationConfigMap = {
     baseUrl: string;
     token: string;
   };
+};
+
+type RateLimitEntry = {
+  count: number;
+  resetAt: number;
+};
+
+type ValidationIssue = {
+  path: string;
+  message: string;
 };
 
 const IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"]);
@@ -308,13 +364,152 @@ function applyStoredConfig(
   return next;
 }
 
+function formatZodIssues(error: z.ZodError): ValidationIssue[] {
+  return error.issues.map((issue: z.ZodIssue) => ({
+    path: issue.path.join(".") || "body",
+    message: issue.message
+  }));
+}
+
+function parseRequestBody<TSchema extends z.ZodTypeAny>(
+  schema: TSchema,
+  body: unknown
+): { ok: true; value: z.infer<TSchema> } | { ok: false; issues: ValidationIssue[] } {
+  const result = schema.safeParse(body);
+  if (!result.success) {
+    return {
+      ok: false,
+      issues: formatZodIssues(result.error)
+    };
+  }
+
+  return {
+    ok: true,
+    value: result.data
+  };
+}
+
+function hasConfigChanges(input: Record<string, unknown>): boolean {
+  return Object.keys(input).length > 0;
+}
+
+function getConfiguredApiToken(): string | null {
+  const token = process.env.SALVO_API_TOKEN?.trim() ?? "";
+  return token.length > 0 ? token : null;
+}
+
+function isPublicRoute(method: string, routeUrl: string): boolean {
+  return method === "GET" && routeUrl === "/health";
+}
+
+function readBearerToken(authorizationHeader: string | undefined): string | null {
+  if (!authorizationHeader) {
+    return null;
+  }
+
+  const [scheme, ...rest] = authorizationHeader.trim().split(" ");
+  if (scheme !== "Bearer") {
+    return null;
+  }
+
+  const token = rest.join(" ").trim();
+  return token.length > 0 ? token : null;
+}
+
+function auditActor(request: {
+  ip: string;
+  headers: { authorization?: string };
+}): string {
+  return request.headers.authorization ? `api_token:${request.ip}` : `anonymous:${request.ip}`;
+}
+
 export async function buildServer() {
   const pool = createDbPool();
   const repo = new SalvoRepository(pool);
   await repo.ensureWorkspace("default", process.env.SALVO_WORKSPACE_ROOT ?? process.cwd());
 
-  const app = Fastify({ logger: true });
+  const rateLimitState = new Map<string, RateLimitEntry>();
+  const app = Fastify({
+    logger: {
+      level: process.env.SALVO_LOG_LEVEL ?? "info"
+    },
+    bodyLimit: apiBodyLimitBytes
+  });
   await app.register(cors, { origin: true });
+
+  app.setErrorHandler((error, _request, reply) => {
+    if ((error as { code?: string }).code === "FST_ERR_CTP_BODY_TOO_LARGE") {
+      return reply.status(413).send({
+        error: "Request body too large.",
+        limit_bytes: apiBodyLimitBytes
+      });
+    }
+
+    return reply.send(error);
+  });
+
+  app.addHook("onRequest", async (request, reply) => {
+    if (request.method === "OPTIONS") {
+      return;
+    }
+
+    const routeUrl = request.routeOptions.url || request.url.split("?")[0];
+    if (isPublicRoute(request.method, routeUrl)) {
+      return;
+    }
+
+    const configuredToken = getConfiguredApiToken();
+    if (!configuredToken) {
+      return reply.status(503).send({
+        error: "SALVO_API_TOKEN is not configured on the server."
+      });
+    }
+
+    const providedToken = readBearerToken(request.headers.authorization);
+    if (!providedToken) {
+      return reply.status(401).send({
+        error: "Missing Authorization header. Expected Bearer token."
+      });
+    }
+
+    if (providedToken !== configuredToken) {
+      return reply.status(401).send({
+        error: "Invalid bearer token."
+      });
+    }
+  });
+
+  app.addHook("onRequest", async (request, reply) => {
+    if (request.method === "OPTIONS") {
+      return;
+    }
+
+    const endpoint = request.routeOptions.url || request.url.split("?")[0];
+    const key = `${request.ip}:${request.method}:${endpoint}`;
+    const now = Date.now();
+    const current = rateLimitState.get(key);
+
+    if (!current || now >= current.resetAt) {
+      rateLimitState.set(key, {
+        count: 1,
+        resetAt: now + rateLimitWindowMs
+      });
+      return;
+    }
+
+    if (current.count >= rateLimitMaxRequests) {
+      const retryAfterSeconds = Math.max(1, Math.ceil((current.resetAt - now) / 1000));
+      reply.header("Retry-After", String(retryAfterSeconds));
+      return reply.status(429).send({
+        error: "Rate limit exceeded.",
+        retry_after_seconds: retryAfterSeconds,
+        limit: rateLimitMaxRequests,
+        window_ms: rateLimitWindowMs
+      });
+    }
+
+    current.count += 1;
+  });
 
   app.get("/health", async () => ({ status: "ok" }));
   app.get("/health/orchestrator", async () => {
@@ -475,10 +670,24 @@ export async function buildServer() {
     const rows = await repo.listIntegrationConfigs();
     const existingRow = rows.find((row) => row.integration_key === key);
     const existing = (existingRow?.config_json ?? {}) as Record<string, unknown>;
-    const body = req.body ?? {};
+    const rawBody = req.body ?? {};
 
     let nextConfig: Record<string, unknown> = { ...existing };
     if (key === "supabase") {
+      const parsedBody = parseRequestBody(integrationConfigSchemas.supabase, rawBody);
+      if (!parsedBody.ok) {
+        return reply.status(400).send({
+          error: "Invalid request body.",
+          issues: parsedBody.issues
+        });
+      }
+      if (!hasConfigChanges(parsedBody.value)) {
+        return reply.status(400).send({
+          error: "Invalid request body.",
+          issues: [{ path: "body", message: "At least one config field is required." }]
+        });
+      }
+      const body = parsedBody.value;
       if (typeof body.url === "string") {
         nextConfig.url = body.url.trim();
       }
@@ -486,6 +695,20 @@ export async function buildServer() {
         nextConfig.anonKey = body.anonKey.trim();
       }
     } else if (key === "llm_api") {
+      const parsedBody = parseRequestBody(integrationConfigSchemas.llm_api, rawBody);
+      if (!parsedBody.ok) {
+        return reply.status(400).send({
+          error: "Invalid request body.",
+          issues: parsedBody.issues
+        });
+      }
+      if (!hasConfigChanges(parsedBody.value)) {
+        return reply.status(400).send({
+          error: "Invalid request body.",
+          issues: [{ path: "body", message: "At least one config field is required." }]
+        });
+      }
+      const body = parsedBody.value;
       if (typeof body.provider === "string") {
         nextConfig.provider = normalizeProvider(body.provider);
       }
@@ -499,10 +722,38 @@ export async function buildServer() {
         nextConfig.defaultModel = body.defaultModel.trim();
       }
     } else if (key === "process") {
+      const parsedBody = parseRequestBody(integrationConfigSchemas.process, rawBody);
+      if (!parsedBody.ok) {
+        return reply.status(400).send({
+          error: "Invalid request body.",
+          issues: parsedBody.issues
+        });
+      }
+      if (!hasConfigChanges(parsedBody.value)) {
+        return reply.status(400).send({
+          error: "Invalid request body.",
+          issues: [{ path: "body", message: "At least one config field is required." }]
+        });
+      }
+      const body = parsedBody.value;
       if (typeof body.command === "string") {
         nextConfig.command = body.command.trim();
       }
     } else if (key === "http") {
+      const parsedBody = parseRequestBody(integrationConfigSchemas.http, rawBody);
+      if (!parsedBody.ok) {
+        return reply.status(400).send({
+          error: "Invalid request body.",
+          issues: parsedBody.issues
+        });
+      }
+      if (!hasConfigChanges(parsedBody.value)) {
+        return reply.status(400).send({
+          error: "Invalid request body.",
+          issues: [{ path: "body", message: "At least one config field is required." }]
+        });
+      }
+      const body = parsedBody.value;
       if (typeof body.baseUrl === "string") {
         nextConfig.baseUrl = body.baseUrl.trim();
       }
@@ -512,6 +763,14 @@ export async function buildServer() {
     }
 
     await repo.upsertIntegrationConfig(key, nextConfig);
+    await repo.createAuditEvent({
+      actor: auditActor(req),
+      action: "integration.config.updated",
+      target: key,
+      metadata: {
+        changed_fields: Object.keys(rawBody)
+      }
+    });
     return { ok: true };
   });
 
@@ -590,16 +849,29 @@ export async function buildServer() {
       requiresApproval?: boolean;
     };
   }>("/tasks", async (req, reply) => {
-    const body = req.body;
-    if (!body || !body.title || !body.request) {
-      return reply.status(400).send({ error: "title and request are required" });
+    const parsedBody = parseRequestBody(taskCreateSchema, req.body ?? {});
+    if (!parsedBody.ok) {
+      return reply.status(400).send({
+        error: "Invalid request body.",
+        issues: parsedBody.issues
+      });
     }
+    const body = parsedBody.value;
 
     const task = await repo.createTask({
       title: body.title,
       request: body.request,
       workspaceId: body.workspaceId,
       requiresApproval: body.requiresApproval
+    });
+    await repo.createAuditEvent({
+      actor: auditActor(req),
+      action: "task.created",
+      target: task.id,
+      metadata: {
+        workspace_id: task.workspace_id,
+        requires_approval: task.requires_approval
+      }
     });
 
     return reply.status(201).send(task);
@@ -620,6 +892,14 @@ export async function buildServer() {
   app.post<{ Params: { id: string } }>("/tasks/:id/approve", async (req, reply) => {
     try {
       const task = await repo.approveTask(req.params.id);
+      await repo.createAuditEvent({
+        actor: auditActor(req),
+        action: "task.approved",
+        target: task.id,
+        metadata: {
+          status: task.status
+        }
+      });
       return task;
     } catch (error) {
       return reply.status(404).send({ error: (error as Error).message });
@@ -629,6 +909,14 @@ export async function buildServer() {
   app.post<{ Params: { id: string } }>("/tasks/:id/reject", async (req, reply) => {
     try {
       const task = await repo.rejectTask(req.params.id);
+      await repo.createAuditEvent({
+        actor: auditActor(req),
+        action: "task.rejected",
+        target: task.id,
+        metadata: {
+          status: task.status
+        }
+      });
       return task;
     } catch (error) {
       return reply.status(400).send({ error: (error as Error).message });
@@ -638,6 +926,14 @@ export async function buildServer() {
   app.post<{ Params: { id: string } }>("/tasks/:id/cancel", async (req, reply) => {
     try {
       const task = await repo.cancelTask(req.params.id);
+      await repo.createAuditEvent({
+        actor: auditActor(req),
+        action: "task.cancelled",
+        target: task.id,
+        metadata: {
+          status: task.status
+        }
+      });
       return task;
     } catch (error) {
       return reply.status(400).send({ error: (error as Error).message });
@@ -649,6 +945,14 @@ export async function buildServer() {
   app.post<{ Params: { id: string } }>("/runs/:id/retry", async (req, reply) => {
     try {
       const result = await repo.requestRetryForRun(req.params.id);
+      await repo.createAuditEvent({
+        actor: auditActor(req),
+        action: "run.retry_requested",
+        target: result.sourceRun.id,
+        metadata: {
+          task_id: result.task.id
+        }
+      });
       return {
         ok: true,
         source_run_id: result.sourceRun.id,
@@ -669,6 +973,14 @@ export async function buildServer() {
       const activeStatuses = ["created", "provisioning", "starting", "running", "evaluating"];
       if (activeStatuses.includes(run.status)) {
         const requested = await repo.requestRunCancellation(req.params.id);
+        await repo.createAuditEvent({
+          actor: auditActor(req),
+          action: "run.cancellation_requested",
+          target: requested.id,
+          metadata: {
+            task_id: requested.task_id
+          }
+        });
         return {
           ok: true,
           requested: true,
@@ -677,6 +989,14 @@ export async function buildServer() {
       }
 
       const result = await repo.cancelRun(req.params.id);
+      await repo.createAuditEvent({
+        actor: auditActor(req),
+        action: "run.cancelled",
+        target: result.run.id,
+        metadata: {
+          task_id: result.task.id
+        }
+      });
       return {
         ok: true,
         run: result.run,
@@ -794,11 +1114,22 @@ export async function buildServer() {
     Params: { id: string };
     Body: { status: ReviewStatus };
   }>("/research/:id/review", async (req, reply) => {
-    const status = req.body?.status;
-    if (!status || !["unreviewed", "accepted", "rejected"].includes(status)) {
-      return reply.status(400).send({ error: "Invalid review status." });
+    const parsedBody = parseRequestBody(reviewStatusSchema, req.body ?? {});
+    if (!parsedBody.ok) {
+      return reply.status(400).send({
+        error: "Invalid request body.",
+        issues: parsedBody.issues
+      });
     }
-    await repo.setResearchReviewStatus(req.params.id, status);
+    await repo.setResearchReviewStatus(req.params.id, parsedBody.value.status);
+    await repo.createAuditEvent({
+      actor: auditActor(req),
+      action: "research.reviewed",
+      target: req.params.id,
+      metadata: {
+        status: parsedBody.value.status
+      }
+    });
     return { ok: true };
   });
 
@@ -812,11 +1143,22 @@ export async function buildServer() {
     Params: { id: string };
     Body: { status: ReviewStatus };
   }>("/research/experiments/:id/review", async (req, reply) => {
-    const status = req.body?.status;
-    if (!status || !["unreviewed", "accepted", "rejected"].includes(status)) {
-      return reply.status(400).send({ error: "Invalid review status." });
+    const parsedBody = parseRequestBody(reviewStatusSchema, req.body ?? {});
+    if (!parsedBody.ok) {
+      return reply.status(400).send({
+        error: "Invalid request body.",
+        issues: parsedBody.issues
+      });
     }
-    await repo.setResearchExperimentReviewStatus(req.params.id, status);
+    await repo.setResearchExperimentReviewStatus(req.params.id, parsedBody.value.status);
+    await repo.createAuditEvent({
+      actor: auditActor(req),
+      action: "research.experiment.reviewed",
+      target: req.params.id,
+      metadata: {
+        status: parsedBody.value.status
+      }
+    });
     return { ok: true };
   });
 
@@ -830,11 +1172,22 @@ export async function buildServer() {
     Params: { id: string };
     Body: { status: ReviewStatus };
   }>("/memories/:id/review", async (req, reply) => {
-    const status = req.body?.status;
-    if (!status || !["unreviewed", "accepted", "rejected"].includes(status)) {
-      return reply.status(400).send({ error: "Invalid review status." });
+    const parsedBody = parseRequestBody(reviewStatusSchema, req.body ?? {});
+    if (!parsedBody.ok) {
+      return reply.status(400).send({
+        error: "Invalid request body.",
+        issues: parsedBody.issues
+      });
     }
-    await repo.setMemoryReviewStatus(req.params.id, status);
+    await repo.setMemoryReviewStatus(req.params.id, parsedBody.value.status);
+    await repo.createAuditEvent({
+      actor: auditActor(req),
+      action: "memory.reviewed",
+      target: req.params.id,
+      metadata: {
+        status: parsedBody.value.status
+      }
+    });
     return { ok: true };
   });
 
@@ -876,12 +1229,14 @@ export async function buildServer() {
   app.post<{ Body: { target: RestartTarget | "all" } }>(
     "/control/restart",
     async (req, reply) => {
-      const target = req.body?.target;
-      if (!target || !["orchestrator", "research", "all"].includes(target)) {
+      const parsedBody = parseRequestBody(restartBodySchema, req.body ?? {});
+      if (!parsedBody.ok) {
         return reply.status(400).send({
-          error: "target must be one of: orchestrator, research, all"
+          error: "Invalid request body.",
+          issues: parsedBody.issues
         });
       }
+      const { target } = parsedBody.value;
 
       try {
         if (target === "all") {
@@ -889,6 +1244,14 @@ export async function buildServer() {
             forceRestartDaemon("orchestrator"),
             forceRestartDaemon("research")
           ]);
+          await repo.createAuditEvent({
+            actor: auditActor(req),
+            action: "daemon.restarted",
+            target: "all",
+            metadata: {
+              daemons: ["orchestrator", "research"]
+            }
+          });
           return {
             ok: true,
             results: [orchestrator, research]
@@ -896,6 +1259,14 @@ export async function buildServer() {
         }
 
         const result = await forceRestartDaemon(target);
+        await repo.createAuditEvent({
+          actor: auditActor(req),
+          action: "daemon.restarted",
+          target,
+          metadata: {
+            daemon: target
+          }
+        });
         return {
           ok: true,
           results: [result]

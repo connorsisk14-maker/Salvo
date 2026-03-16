@@ -1,11 +1,11 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
-  artifactContentUrl,
   getArtifactPreview,
+  getArtifactContentObjectUrl,
   getRunDetail,
   getRunEvents,
-  streamUrl,
+  openArtifactContent,
   type ApiArtifactPreview,
   type ApiRunDetail,
   type ApiRunEvent
@@ -18,8 +18,22 @@ export function RunDetailPage() {
   const [detail, setDetail] = useState<ApiRunDetail | null>(null);
   const [events, setEvents] = useState<ApiRunEvent[]>([]);
   const [artifactPreviews, setArtifactPreviews] = useState<Record<string, ApiArtifactPreview>>({});
+  const [artifactContentUrls, setArtifactContentUrls] = useState<Record<string, string>>({});
   const [previewBusy, setPreviewBusy] = useState<Record<string, boolean>>({});
   const [error, setError] = useState<string | null>(null);
+  const artifactContentUrlsRef = useRef<Record<string, string>>({});
+
+  useEffect(() => {
+    artifactContentUrlsRef.current = artifactContentUrls;
+  }, [artifactContentUrls]);
+
+  useEffect(() => {
+    return () => {
+      for (const url of Object.values(artifactContentUrlsRef.current)) {
+        URL.revokeObjectURL(url);
+      }
+    };
+  }, []);
 
   async function loadArtifactPreview(artifactId: string) {
     if (artifactPreviews[artifactId]) {
@@ -32,6 +46,19 @@ export function RunDetailPage() {
     }));
     try {
       const preview = await getArtifactPreview(artifactId);
+      if (preview.kind === "image" && !artifactContentUrlsRef.current[artifactId]) {
+        const objectUrl = await getArtifactContentObjectUrl(artifactId);
+        setArtifactContentUrls((current) => {
+          if (current[artifactId]) {
+            URL.revokeObjectURL(objectUrl);
+            return current;
+          }
+          return {
+            ...current,
+            [artifactId]: objectUrl
+          };
+        });
+      }
       setArtifactPreviews((current) => ({
         ...current,
         [artifactId]: preview
@@ -48,6 +75,7 @@ export function RunDetailPage() {
 
   useEffect(() => {
     setArtifactPreviews({});
+    setArtifactContentUrls({});
     setPreviewBusy({});
 
     async function refresh() {
@@ -69,18 +97,23 @@ export function RunDetailPage() {
     }
 
     void refresh();
-    const eventSource = new EventSource(streamUrl(`/stream/runs/${runId}`));
-    eventSource.onmessage = () => {
+    const intervalId = window.setInterval(() => {
       void refresh();
-    };
-    eventSource.onerror = () => {
-      // rely on EventSource internal retry behavior
-    };
+    }, 1000);
 
     return () => {
-      eventSource.close();
+      window.clearInterval(intervalId);
     };
   }, [runId]);
+
+  async function onOpenArtifact(artifactId: string) {
+    try {
+      await openArtifactContent(artifactId);
+      setError(null);
+    } catch (artifactError) {
+      setError((artifactError as Error).message);
+    }
+  }
 
   if (!runId) {
     return <p className="error-banner">Missing run ID.</p>;
@@ -208,6 +241,16 @@ export function RunDetailPage() {
                         <button
                           type="button"
                           className="button-link"
+                          onClick={() => {
+                            void onOpenArtifact(artifact.id);
+                          }}
+                        >
+                          Open file
+                        </button>
+                        {" "}
+                        <button
+                          type="button"
+                          className="button-link"
                           disabled={previewBusy[artifact.id] === true}
                           onClick={() => {
                             void loadArtifactPreview(artifact.id);
@@ -215,15 +258,6 @@ export function RunDetailPage() {
                         >
                           {previewBusy[artifact.id] ? "Loading..." : "Preview"}
                         </button>
-                        {" "}
-                        <a
-                          href={artifactContentUrl(artifact.id)}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="button-link"
-                        >
-                          Open file
-                        </a>
                       </td>
                     </tr>
                   ))}
@@ -250,18 +284,14 @@ export function RunDetailPage() {
                   ) : null}
                   {preview.kind === "image" ? (
                     <img
-                      src={artifactContentUrl(artifact.id)}
+                      src={artifactContentUrls[artifact.id]}
                       alt={`Artifact ${artifact.id}`}
                       className="proof-preview-image"
                     />
                   ) : null}
                   {preview.kind === "binary" ? (
                     <p className="muted">
-                      Binary artifact. Use{" "}
-                      <a href={artifactContentUrl(artifact.id)} target="_blank" rel="noreferrer">
-                        Open file
-                      </a>{" "}
-                      to inspect.
+                      Binary artifact. Use Open file to inspect.
                     </p>
                   ) : null}
                 </article>

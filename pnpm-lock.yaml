@@ -13,6 +13,9 @@ importers:
       '@salvo/db':
         specifier: workspace:*
         version: link:../../packages/db
+      '@salvo/shared':
+        specifier: workspace:*
+        version: link:../../packages/shared
       '@salvo/tools':
         specifier: workspace:*
         version: link:../../packages/tools
@@ -38,6 +41,9 @@ importers:
       fastify:
         specifier: ^5.2.1
         version: 5.8.2
+      zod:
+        specifier: ^3.24.2
+        version: 3.25.76
     devDependencies:
       '@types/node':
         specifier: ^22.15.2
@@ -79,6 +85,9 @@ importers:
       '@salvo/db':
         specifier: workspace:*
         version: link:../../packages/db
+      '@salvo/shared':
+        specifier: workspace:*
+        version: link:../../packages/shared
     devDependencies:
       '@types/node':
         specifier: ^22.15.2

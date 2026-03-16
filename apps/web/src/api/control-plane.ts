@@ -1,3 +1,5 @@
+import { clearStoredApiToken, getStoredApiToken } from "./auth";
+
 export type ApiTask = {
   id: string;
   title: string;
@@ -193,20 +195,83 @@ export type ApiArtifactPreview =
 const baseUrl = import.meta.env.VITE_SALVO_API_URL ?? "http://localhost:8787";
 export const controlPlaneBaseUrl = baseUrl;
 
+function buildHeaders(init: RequestInit | undefined): Headers {
+  const headers = new Headers(init?.headers ?? {});
+  if (init?.body && !headers.has("content-type")) {
+    headers.set("content-type", "application/json");
+  }
+
+  const token = getStoredApiToken();
+  if (token) {
+    headers.set("Authorization", `Bearer ${token}`);
+  }
+
+  return headers;
+}
+
+async function readErrorMessage(response: Response, path: string): Promise<string> {
+  const fallback = `API request failed (${response.status}) ${path}`;
+
+  try {
+    const payload = (await response.clone().json()) as {
+      error?: string;
+      issues?: Array<{ path?: string; message?: string }>;
+    };
+
+    if (Array.isArray(payload.issues) && payload.issues.length > 0) {
+      const issueSummary = payload.issues
+        .map((issue) => `${issue.path ?? "body"}: ${issue.message ?? "invalid value"}`)
+        .join("; ");
+      return payload.error ? `${payload.error} ${issueSummary}` : issueSummary;
+    }
+
+    if (typeof payload.error === "string" && payload.error.length > 0) {
+      return payload.error;
+    }
+  } catch {
+    const text = await response.text();
+    if (text.trim().length > 0) {
+      return text.trim();
+    }
+  }
+
+  return fallback;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${baseUrl}${path}`, {
     ...init,
-    headers: {
-      "content-type": "application/json",
-      ...(init?.headers ?? {})
-    }
+    headers: buildHeaders(init)
   });
 
   if (!response.ok) {
-    throw new Error(`API request failed (${response.status}) ${path}`);
+    const message = await readErrorMessage(response, path);
+    if (response.status === 401) {
+      clearStoredApiToken();
+      throw new Error(`API authorization failed. ${message}`);
+    }
+    throw new Error(message);
   }
 
   return (await response.json()) as T;
+}
+
+async function requestBlob(path: string, init?: RequestInit): Promise<Blob> {
+  const response = await fetch(`${baseUrl}${path}`, {
+    ...init,
+    headers: buildHeaders(init)
+  });
+
+  if (!response.ok) {
+    const message = await readErrorMessage(response, path);
+    if (response.status === 401) {
+      clearStoredApiToken();
+      throw new Error(`API authorization failed. ${message}`);
+    }
+    throw new Error(message);
+  }
+
+  return response.blob();
 }
 
 export function createTask(input: {
@@ -366,4 +431,22 @@ export function getArtifactPreview(artifactId: string): Promise<ApiArtifactPrevi
 
 export function artifactContentUrl(artifactId: string): string {
   return `${baseUrl}/artifacts/${artifactId}/content`;
+}
+
+export async function getArtifactContentObjectUrl(artifactId: string): Promise<string> {
+  const blob = await requestBlob(`/artifacts/${artifactId}/content`);
+  return URL.createObjectURL(blob);
+}
+
+export async function openArtifactContent(artifactId: string): Promise<void> {
+  const objectUrl = await getArtifactContentObjectUrl(artifactId);
+  const opened = window.open(objectUrl, "_blank", "noopener,noreferrer");
+  if (!opened) {
+    URL.revokeObjectURL(objectUrl);
+    throw new Error("Unable to open artifact file. Check popup permissions.");
+  }
+
+  window.setTimeout(() => {
+    URL.revokeObjectURL(objectUrl);
+  }, 60_000);
 }

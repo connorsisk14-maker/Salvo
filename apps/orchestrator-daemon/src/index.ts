@@ -3,9 +3,13 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { buildContractV1 } from "@salvo/contracts";
 import { createDbPool, SalvoRepository, type DbRun, type DbRunEvent } from "@salvo/db";
 import { evaluateRun } from "@salvo/evaluation";
-import { isTerminalRunStatus } from "@salvo/shared";
+import { createLogger, isTerminalRunStatus } from "@salvo/shared";
 
 const workerId = `orchestrator-${randomUUID().slice(0, 8)}`;
+const logger = createLogger({
+  component: "orchestrator-daemon",
+  daemon_id: workerId
+});
 
 class OrchestratorDaemon {
   private readonly repo: SalvoRepository;
@@ -23,6 +27,9 @@ class OrchestratorDaemon {
   async start(): Promise<void> {
     await this.repo.ensureWorkspace("default", process.env.SALVO_WORKSPACE_ROOT ?? process.cwd());
     await this.publishHeartbeat();
+    logger.info("daemon started", {
+      workspace_root: process.env.SALVO_WORKSPACE_ROOT ?? process.cwd()
+    });
 
     this.claimTimer = setInterval(() => {
       void this.claimLoop();
@@ -64,6 +71,9 @@ class OrchestratorDaemon {
       clearInterval(this.heartbeatTimer);
     }
     await this.publishHeartbeat({ state: "stopping" });
+    logger.info("daemon stopping", {
+      active_runs: this.activeRuns.size
+    });
     await this.repo.close();
   }
 
@@ -79,6 +89,10 @@ class OrchestratorDaemon {
     if (!task) {
       return;
     }
+    logger.info("task claimed", {
+      task_id: task.id,
+      workspace_id: task.workspace_id
+    });
 
     const contract = buildContractV1({
       contractId: randomUUID(),
@@ -108,6 +122,11 @@ class OrchestratorDaemon {
 
     if (requiresManualReview) {
       await this.repo.transitionTaskStatus(task.id, "needs_review");
+      logger.warn("task moved to manual review", {
+        task_id: task.id,
+        contract_id: contractRecord.id,
+        risk: contract.risk
+      });
       return;
     }
 
@@ -120,6 +139,11 @@ class OrchestratorDaemon {
 
     await this.repo.transitionRunStatus(run.id, "starting", {
       workerId
+    });
+    logger.info("run created", {
+      run_id: run.id,
+      task_id: run.task_id,
+      contract_id: run.contract_id
     });
 
     await this.launchRun(run);
@@ -134,6 +158,11 @@ class OrchestratorDaemon {
       }
 
       const retry = await this.repo.scheduleRetryFromStaleRun(staleRun.id, workerId, 2);
+      logger.warn("stale run detected", {
+        run_id: staleRun.id,
+        task_id: staleRun.task_id,
+        retry_disposition: retry.disposition
+      });
       await this.repo.appendRunEvent(staleRun.id, "run.failed", "error", {
         reason: "stale_runner",
         retry_disposition: retry.disposition
@@ -158,6 +187,11 @@ class OrchestratorDaemon {
   }
 
   private async forceCancelRun(run: DbRun): Promise<void> {
+    logger.warn("cancellation requested run cleanup", {
+      run_id: run.id,
+      task_id: run.task_id,
+      runner_pid: run.runner_pid
+    });
     const child = this.activeRuns.get(run.id);
     if (child && !child.killed) {
       child.kill("SIGTERM");
@@ -196,21 +230,23 @@ class OrchestratorDaemon {
           SALVO_WORKSPACE_ROOT:
             process.env.SALVO_WORKSPACE_ROOT ?? process.cwd()
         },
-        stdio: ["ignore", "pipe", "pipe"]
+        stdio: ["ignore", "inherit", "inherit"]
       }
     );
     this.activeRuns.set(run.id, child);
-
-    child.stdout.on("data", (chunk) => {
-      process.stdout.write(`[runner:${run.id}] ${chunk}`);
-    });
-
-    child.stderr.on("data", (chunk) => {
-      process.stderr.write(`[runner:${run.id}] ${chunk}`);
+    logger.info("runner spawned", {
+      run_id: run.id,
+      task_id: run.task_id,
+      child_pid: child.pid
     });
 
     child.on("error", async (error) => {
       this.activeRuns.delete(run.id);
+      logger.error("runner process error", {
+        run_id: run.id,
+        task_id: run.task_id,
+        error
+      });
       await this.repo.appendRunEvent(run.id, "run.failed", "error", {
         reason: "runner_spawn_error",
         error: error.message
@@ -228,6 +264,10 @@ class OrchestratorDaemon {
 
     child.on("close", async () => {
       this.activeRuns.delete(run.id);
+      logger.info("runner process closed", {
+        run_id: run.id,
+        task_id: run.task_id
+      });
       await this.evaluateRun(run.id);
     });
   }
@@ -349,4 +389,9 @@ async function main(): Promise<void> {
   });
 }
 
-await main();
+try {
+  await main();
+} catch (error) {
+  logger.error("daemon crashed", { error });
+  process.exit(1);
+}

@@ -11,6 +11,7 @@ import {
   type TaskStatus
 } from "@salvo/shared";
 import type {
+  CreateAuditEventInput,
   DaemonType,
   CreateContractInput,
   CreateMemoryInput,
@@ -23,6 +24,7 @@ import type {
   DbResearchExperiment,
   DbResearchReviewStatus,
   DbArtifact,
+  DbAuditEvent,
   DbIntegrationConfig,
   DbIntegrationKey,
   DbRun,
@@ -123,6 +125,22 @@ export class SalvoRepository {
     );
 
     return this.singleOrThrow(result.rows, "Failed to create task.");
+  }
+
+  async createAuditEvent(input: CreateAuditEventInput): Promise<DbAuditEvent> {
+    const result = await this.pool.query<DbAuditEvent>(
+      `insert into public.audit_events (
+         actor,
+         action,
+         target,
+         metadata
+       )
+       values ($1, $2, $3, $4)
+       returning *`,
+      [input.actor, input.action, input.target ?? null, input.metadata ?? {}]
+    );
+
+    return this.singleOrThrow(result.rows, "Failed to create audit event.");
   }
 
   async listTasks(limit = 100): Promise<DbTask[]> {

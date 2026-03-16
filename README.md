@@ -25,6 +25,9 @@ Copy `.env.example` to `.env` and set:
 
 - `SALVO_DATABASE_URL`: Postgres connection string
 - `SALVO_WORKSPACE_ROOT`: local path used for run workspaces and artifacts
+- `SALVO_API_TOKEN`: bearer token required by the dashboard and protected API routes
+- `SALVO_LOG_LEVEL`: structured log threshold (`debug`, `info`, `warn`, `error`)
+- `SALVO_LOG_TARGET`: structured log output target (`stdout`, `stderr`, or `split`)
 - `VITE_SALVO_API_URL`: API URL for dashboard (default `http://localhost:8787`)
 
 ## Migrations

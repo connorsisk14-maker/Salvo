@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { createDbPool, ResearchRepository } from "@salvo/db";
+import { createLogger } from "@salvo/shared";
 import { ResearchAnalysisService } from "./service";
 
 const daemonId = `research-${randomUUID().slice(0, 8)}`;
@@ -10,6 +11,10 @@ const minSampleSize =
   Number.isFinite(configuredSampleSize) && configuredSampleSize >= 1
     ? Math.floor(configuredSampleSize)
     : 15;
+const logger = createLogger({
+  component: "research-daemon",
+  daemon_id: daemonId
+});
 
 class ResearchDaemon {
   private readonly repo: ResearchRepository;
@@ -31,6 +36,9 @@ class ResearchDaemon {
 
   async start(): Promise<void> {
     await this.publishHeartbeat();
+    logger.info("daemon started", {
+      min_sample_size: minSampleSize
+    });
 
     this.timer = setInterval(() => {
       void this.analysisLoop();
@@ -56,6 +64,9 @@ class ResearchDaemon {
       clearInterval(this.heartbeatTimer);
     }
     await this.publishHeartbeat({ state: "stopping" });
+    logger.info("daemon stopping", {
+      processing: this.processing
+    });
     await this.repo.close();
   }
 
@@ -75,8 +86,16 @@ class ResearchDaemon {
 
     this.processing = true;
     try {
+      logger.info("analysis cycle started", {
+        min_sample_size: minSampleSize
+      });
       await this.publishHeartbeat({ processing: true });
       this.lastCycleStats = await this.service.runCycle();
+      logger.info("analysis cycle completed", {
+        cycle_stats: this.lastCycleStats
+      });
+    } catch (error) {
+      logger.error("analysis cycle failed", { error });
     } finally {
       this.processing = false;
       await this.publishHeartbeat({ processing: false });
@@ -108,4 +127,9 @@ async function main(): Promise<void> {
   });
 }
 
-await main();
+try {
+  await main();
+} catch (error) {
+  logger.error("daemon crashed", { error });
+  process.exit(1);
+}

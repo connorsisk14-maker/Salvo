@@ -1,18 +1,18 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import {
   approveTask,
-  artifactContentUrl,
   cancelRun,
   cancelTask,
   getArtifactPreview,
+  getArtifactContentObjectUrl,
   getRunDetail,
   getRunEvents,
   listRuns,
   listTasks,
+  openArtifactContent,
   rejectTask,
   retryRun,
-  streamUrl,
   type ApiArtifactPreview,
   type ApiRun,
   type ApiRunDetail,
@@ -220,7 +220,9 @@ export function BoardPage() {
   const [detailBusyRunId, setDetailBusyRunId] = useState<string | null>(null);
 
   const [artifactPreviews, setArtifactPreviews] = useState<Record<string, ApiArtifactPreview>>({});
+  const [artifactContentUrls, setArtifactContentUrls] = useState<Record<string, string>>({});
   const [previewBusy, setPreviewBusy] = useState<Record<string, boolean>>({});
+  const artifactContentUrlsRef = useRef<Record<string, string>>({});
 
   const selectedTaskId = searchParams.get("taskId");
   const selectedRunIdParam = searchParams.get("runId");
@@ -284,6 +286,18 @@ export function BoardPage() {
   }, []);
 
   useEffect(() => {
+    artifactContentUrlsRef.current = artifactContentUrls;
+  }, [artifactContentUrls]);
+
+  useEffect(() => {
+    return () => {
+      for (const url of Object.values(artifactContentUrlsRef.current)) {
+        URL.revokeObjectURL(url);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
     if (!panelParam) {
       updateQuery({ panel: "contract" }, true);
     }
@@ -291,16 +305,12 @@ export function BoardPage() {
 
   useEffect(() => {
     void refresh();
-    const eventSource = new EventSource(streamUrl("/stream/overview"));
-    eventSource.onmessage = () => {
+    const intervalId = window.setInterval(() => {
       void refresh();
-    };
-    eventSource.onerror = () => {
-      // rely on EventSource internal retry behavior
-    };
+    }, 1500);
 
     return () => {
-      eventSource.close();
+      window.clearInterval(intervalId);
     };
   }, [refresh]);
 
@@ -532,6 +542,19 @@ export function BoardPage() {
 
       try {
         const preview = await getArtifactPreview(artifactId);
+        if (preview.kind === "image" && !artifactContentUrlsRef.current[artifactId]) {
+          const objectUrl = await getArtifactContentObjectUrl(artifactId);
+          setArtifactContentUrls((current) => {
+            if (current[artifactId]) {
+              URL.revokeObjectURL(objectUrl);
+              return current;
+            }
+            return {
+              ...current,
+              [artifactId]: objectUrl
+            };
+          });
+        }
         setArtifactPreviews((current) => ({
           ...current,
           [artifactId]: preview
@@ -548,6 +571,15 @@ export function BoardPage() {
     },
     [artifactPreviews]
   );
+
+  const handleOpenArtifact = useCallback(async (artifactId: string) => {
+    try {
+      await openArtifactContent(artifactId);
+      setError(null);
+    } catch (artifactError) {
+      setError((artifactError as Error).message);
+    }
+  }, []);
 
   const handleCopyFamilyKey = useCallback(async () => {
     const familyKey =
@@ -995,19 +1027,21 @@ export function BoardPage() {
                             className="button-link"
                             disabled={previewBusy[artifact.id] === true}
                             onClick={() => {
+                              void handleOpenArtifact(artifact.id);
+                            }}
+                          >
+                            Open file
+                          </button>
+                          <button
+                            type="button"
+                            className="button-link"
+                            disabled={previewBusy[artifact.id] === true}
+                            onClick={() => {
                               void loadArtifactPreview(artifact.id);
                             }}
                           >
                             {previewBusy[artifact.id] ? "Loading..." : "Preview"}
                           </button>
-                          <a
-                            href={artifactContentUrl(artifact.id)}
-                            className="button-link"
-                            target="_blank"
-                            rel="noreferrer"
-                          >
-                            Open file
-                          </a>
                         </div>
 
                         {preview ? (
@@ -1023,7 +1057,7 @@ export function BoardPage() {
 
                             {preview.kind === "image" ? (
                               <img
-                                src={artifactContentUrl(artifact.id)}
+                                src={artifactContentUrls[artifact.id]}
                                 alt={`Artifact ${artifact.id}`}
                                 className="proof-preview-image"
                               />

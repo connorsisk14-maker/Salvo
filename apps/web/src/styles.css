@@ -52,6 +52,7 @@ strong {
   gap: 0.6rem;
   margin-bottom: 0.8rem;
   flex-wrap: wrap;
+  align-items: center;
 }
 
 .top-nav-link {
@@ -68,6 +69,18 @@ strong {
 .top-nav-link-active {
   background: var(--accent-soft);
   border-color: var(--accent);
+}
+
+.top-nav-token {
+  margin-left: auto;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0.35rem 0.7rem;
+  background: #f7f1e2;
+  color: inherit;
+  font-family: "IBM Plex Mono", "Menlo", monospace;
+  font-size: 0.85rem;
+  cursor: pointer;
 }
 
 .clip-card {
@@ -93,6 +106,36 @@ strong {
 .content {
   background: var(--paper);
   padding: 1rem;
+}
+
+.auth-locked-state {
+  max-width: 720px;
+}
+
+.auth-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(23, 32, 52, 0.28);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+  z-index: 20;
+}
+
+.auth-modal {
+  width: min(100%, 560px);
+}
+
+.auth-modal-content {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.auth-modal-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
 }
 
 .content-header {

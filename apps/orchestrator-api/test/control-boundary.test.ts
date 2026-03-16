@@ -50,6 +50,7 @@ if (!databaseUrl) {
         public.salvo_contracts,
         public.salvo_tasks,
         public.salvo_integration_configs,
+        public.audit_events,
         public.salvo_daemon_heartbeats,
         public.salvo_workspaces
       restart identity cascade
@@ -155,6 +156,71 @@ if (!databaseUrl) {
     assert.equal(research.json().status, "offline");
   });
 
+  test("root health endpoint remains public when API token auth is configured", async () => {
+    const priorApiToken = process.env.SALVO_API_TOKEN;
+
+    try {
+      process.env.SALVO_API_TOKEN = "test-token";
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/health"
+      });
+
+      assert.equal(response.statusCode, 200);
+      assert.equal(response.json().status, "ok");
+    } finally {
+      if (priorApiToken === undefined) {
+        delete process.env.SALVO_API_TOKEN;
+      } else {
+        process.env.SALVO_API_TOKEN = priorApiToken;
+      }
+    }
+  });
+
+  test("protected endpoints require bearer auth when API token is configured", async () => {
+    const priorApiToken = process.env.SALVO_API_TOKEN;
+
+    try {
+      process.env.SALVO_API_TOKEN = "test-token";
+
+      const missingAuth = await app.inject({
+        method: "GET",
+        url: "/tasks"
+      });
+      assert.equal(missingAuth.statusCode, 401);
+      assert.equal(
+        missingAuth.json().error,
+        "Missing Authorization header. Expected Bearer token."
+      );
+
+      const invalidAuth = await app.inject({
+        method: "GET",
+        url: "/tasks",
+        headers: {
+          authorization: "Bearer wrong-token"
+        }
+      });
+      assert.equal(invalidAuth.statusCode, 401);
+      assert.equal(invalidAuth.json().error, "Invalid bearer token.");
+
+      const validAuth = await app.inject({
+        method: "GET",
+        url: "/tasks",
+        headers: {
+          authorization: "Bearer test-token"
+        }
+      });
+      assert.equal(validAuth.statusCode, 200);
+    } finally {
+      if (priorApiToken === undefined) {
+        delete process.env.SALVO_API_TOKEN;
+      } else {
+        process.env.SALVO_API_TOKEN = priorApiToken;
+      }
+    }
+  });
+
   test("restart endpoint validates target", async () => {
     const response = await app.inject({
       method: "POST",
@@ -238,6 +304,17 @@ if (!databaseUrl) {
     assert.equal(response.statusCode, 200);
     assert.equal(response.json().status, "queued");
     assert.notEqual(response.json().approved_at, null);
+
+    const auditEvents = await pool.query<{
+      action: string;
+      target: string;
+    }>(
+      `select action, target
+       from public.audit_events
+       where action = 'task.approved'`
+    );
+    assert.equal(auditEvents.rows.length, 1);
+    assert.equal(auditEvents.rows[0]?.target, task.id);
   });
 
   test("research and memory review endpoints update review status", async () => {
@@ -549,5 +626,63 @@ if (!databaseUrl) {
     });
 
     assert.equal(response.statusCode, 400);
+  });
+
+  test("task creation validates title length with field-specific errors", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/tasks",
+      payload: {
+        title: "x".repeat(161),
+        request: "create task only",
+        requiresApproval: false
+      }
+    });
+
+    assert.equal(response.statusCode, 400);
+    assert.equal(response.json().error, "Invalid request body.");
+    assert.deepEqual(response.json().issues, [
+      {
+        path: "title",
+        message: "Title must be 160 characters or fewer."
+      }
+    ]);
+  });
+
+  test("oversized request bodies are rejected", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/tasks",
+      payload: {
+        title: "oversized",
+        request: "x".repeat(1_100_000),
+        requiresApproval: false
+      }
+    });
+
+    assert.equal(response.statusCode, 413);
+    assert.equal(response.json().error, "Request body too large.");
+    assert.equal(response.json().limit_bytes, 1_048_576);
+  });
+
+  test("rate limiting returns 429 with retry-after", async () => {
+    let limitedResponse;
+    for (let index = 0; index <= 60; index += 1) {
+      const response = await app.inject({
+        method: "GET",
+        url: "/health"
+      });
+
+      if (index < 60) {
+        assert.equal(response.statusCode, 200);
+      } else {
+        limitedResponse = response;
+      }
+    }
+
+    assert.ok(limitedResponse);
+    assert.equal(limitedResponse.statusCode, 429);
+    assert.equal(limitedResponse.json().error, "Rate limit exceeded.");
+    assert.equal(typeof limitedResponse.headers["retry-after"], "string");
   });
 }
