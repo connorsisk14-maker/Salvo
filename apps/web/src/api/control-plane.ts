@@ -177,6 +177,29 @@ export type ApiCostMetrics = {
   }>;
 };
 
+export type ApiBudgetStatus = {
+  id: string;
+  workspace_id: string;
+  workspace_name: string;
+  contract_family_key: string | null;
+  scope: "workspace" | "family";
+  limit_usd: number;
+  spent_usd: number;
+  remaining_usd: number;
+  last_usage_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ApiBudgetOverview = {
+  updated_at: string;
+  workspaces: Array<{
+    id: string;
+    name: string;
+  }>;
+  budgets: ApiBudgetStatus[];
+};
+
 export type ApiRunDetail = {
   run: ApiRun;
   task: ApiTask;
@@ -380,6 +403,21 @@ export function listIntegrations(): Promise<ApiIntegration[]> {
 
 export function getCostMetrics(): Promise<ApiCostMetrics> {
   return request<ApiCostMetrics>("/metrics/costs");
+}
+
+export function getBudgetOverview(): Promise<ApiBudgetOverview> {
+  return request<ApiBudgetOverview>("/budgets");
+}
+
+export function saveBudgetLimit(input: {
+  workspaceId: string;
+  contractFamilyKey?: string;
+  limitUsd: number;
+}): Promise<ApiActionResponse & { budget?: ApiBudgetStatus }> {
+  return request<ApiActionResponse & { budget?: ApiBudgetStatus }>("/budgets", {
+    method: "POST",
+    body: JSON.stringify(input)
+  });
 }
 
 export function updateIntegrationConfig(

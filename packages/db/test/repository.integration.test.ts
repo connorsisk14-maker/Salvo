@@ -27,7 +27,8 @@ if (!databaseUrl) {
       "0005_integration_configs.sql",
       "0006_llm_api_integration_cutover.sql",
       "0007_research_analysis_pipeline.sql",
-      "0008_idempotency_recovery.sql"
+      "0008_idempotency_recovery.sql",
+      "0009_budget_caps.sql"
     ]) {
       const sql = await readFile(path.join(migrationDir, fileName), "utf8");
       await pool.query(sql);
@@ -49,6 +50,7 @@ if (!databaseUrl) {
         public.salvo_contracts,
         public.salvo_tasks,
         public.salvo_idempotency_keys,
+        public.salvo_budget_limits,
         public.salvo_integration_configs,
         public.salvo_daemon_heartbeats,
         public.salvo_workspaces
@@ -523,6 +525,78 @@ if (!databaseUrl) {
     assert.equal(rows.length, 1);
     assert.equal(rows[0].integration_key, "process");
     assert.equal(rows[0].config_json.command, "pnpm test");
+  });
+
+  test("budget status aggregates workspace and family spend from usage events", async () => {
+    const workspace = await repo.ensureWorkspace(`budget-${randomUUID()}`, process.cwd());
+    const task = await repo.createTask({
+      workspaceId: workspace.id,
+      title: "budget task",
+      request: "budget request",
+      requiresApproval: false
+    });
+    const contract = await repo.createContract({
+      taskId: task.id,
+      risk: "low",
+      status: "active",
+      contractJson: {
+        schema_version: 1,
+        family_key: "family-budget",
+        category: "general"
+      }
+    });
+    const run = await repo.createRun({
+      taskId: task.id,
+      contractId: contract.id,
+      agentProfile: "builder",
+      workerId: "budget-worker"
+    });
+
+    await repo.appendRunEvent(run.id, "usage.reported", "info", {
+      model: "gpt-5-mini",
+      input_tokens: 120,
+      output_tokens: 40,
+      cost_usd: 0.25,
+      estimated: false
+    });
+
+    await repo.upsertBudgetLimit({
+      workspaceId: workspace.id,
+      limitUsd: 5
+    });
+    await repo.upsertBudgetLimit({
+      workspaceId: workspace.id,
+      contractFamilyKey: "family-budget",
+      limitUsd: 1
+    });
+
+    const statuses = await repo.listBudgetStatuses();
+    assert.equal(statuses.length, 2);
+
+    const workspaceBudget = statuses.find((entry) => entry.scope === "workspace");
+    assert.ok(workspaceBudget);
+    assert.equal(workspaceBudget.workspace_id, workspace.id);
+    assert.equal(workspaceBudget.limit_usd, 5);
+    assert.equal(workspaceBudget.spent_usd, 0.25);
+    assert.equal(workspaceBudget.remaining_usd, 4.75);
+
+    const familyBudget = statuses.find((entry) => entry.scope === "family");
+    assert.ok(familyBudget);
+    assert.equal(familyBudget.contract_family_key, "family-budget");
+    assert.equal(familyBudget.limit_usd, 1);
+    assert.equal(familyBudget.spent_usd, 0.25);
+    assert.equal(familyBudget.remaining_usd, 0.75);
+
+    const applicable = await repo.listApplicableBudgetStatuses(workspace.id, "family-budget");
+    assert.equal(applicable.length, 2);
+    assert.equal(
+      applicable.some((entry) => entry.scope === "workspace" && entry.remaining_usd === 4.75),
+      true
+    );
+    assert.equal(
+      applicable.some((entry) => entry.scope === "family" && entry.remaining_usd === 0.75),
+      true
+    );
   });
 
   test("0006 migration converts legacy claude_local config into llm_api", async () => {

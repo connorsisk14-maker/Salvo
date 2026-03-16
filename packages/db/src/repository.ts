@@ -26,6 +26,8 @@ import type {
   DbResearchReviewStatus,
   DbArtifact,
   DbAuditEvent,
+  DbBudgetLimit,
+  DbBudgetStatus,
   DbIntegrationConfig,
   DbIntegrationKey,
   DbRun,
@@ -222,6 +224,16 @@ export class SalvoRepository {
     );
 
     return this.singleOrThrow(inserted.rows, "Failed to create workspace.");
+  }
+
+  async listWorkspaces(): Promise<DbWorkspace[]> {
+    const result = await this.pool.query<DbWorkspace>(
+      `select *
+       from public.salvo_workspaces
+       order by created_at asc`
+    );
+
+    return result.rows;
   }
 
   async createTask(input: CreateTaskInput): Promise<DbTask> {
@@ -717,6 +729,257 @@ export class SalvoRepository {
     );
 
     return result.rows;
+  }
+
+  async listBudgetLimits(): Promise<DbBudgetLimit[]> {
+    const result = await this.pool.query<DbBudgetLimit>(
+      `select
+         id,
+         workspace_id,
+         contract_family_key,
+         limit_usd::double precision as limit_usd,
+         created_at,
+         updated_at
+       from public.salvo_budget_limits
+       order by workspace_id asc, contract_family_key asc nulls first`
+    );
+
+    return result.rows;
+  }
+
+  async upsertBudgetLimit(input: {
+    workspaceId: string;
+    contractFamilyKey?: string | null;
+    limitUsd: number;
+  }): Promise<DbBudgetLimit> {
+    const contractFamilyKey = input.contractFamilyKey?.trim() ? input.contractFamilyKey.trim() : null;
+
+    const result = await this.pool.query<DbBudgetLimit>(
+      `with upserted as (
+         insert into public.salvo_budget_limits (
+           workspace_id,
+           contract_family_key,
+           limit_usd
+         )
+         select $1, $2, $3
+         where $2 is not null
+         on conflict (workspace_id, contract_family_key)
+         where contract_family_key is not null
+         do update set limit_usd = excluded.limit_usd
+         returning id, workspace_id, contract_family_key, limit_usd, created_at, updated_at
+       ), workspace_scope as (
+         insert into public.salvo_budget_limits (
+           workspace_id,
+           contract_family_key,
+           limit_usd
+         )
+         select $1, null, $3
+         where $2 is null
+         on conflict (workspace_id)
+         where contract_family_key is null
+         do update set limit_usd = excluded.limit_usd
+         returning id, workspace_id, contract_family_key, limit_usd, created_at, updated_at
+       )
+       select
+         id,
+         workspace_id,
+         contract_family_key,
+         limit_usd::double precision as limit_usd,
+         created_at,
+         updated_at
+       from (
+         select * from upserted
+         union all
+         select * from workspace_scope
+       ) rowset
+       limit 1`,
+      [input.workspaceId, contractFamilyKey, input.limitUsd]
+    );
+
+    return this.singleOrThrow(result.rows, "Failed to save budget limit.");
+  }
+
+  async listBudgetStatuses(): Promise<DbBudgetStatus[]> {
+    const result = await this.pool.query<DbBudgetStatus>(
+      `with usage_rows as (
+         select
+           t.workspace_id,
+           coalesce(
+             c.contract_json->>'family_key',
+             concat('legacy_', substring(r.contract_id::text, 1, 12))
+           ) as contract_family_key,
+           coalesce((e.payload_json->>'cost_usd')::double precision, 0) as cost_usd,
+           e.created_at
+         from public.salvo_runs r
+         join public.salvo_tasks t on t.id = r.task_id
+         left join public.salvo_contracts c on c.id = r.contract_id
+         join lateral (
+           select payload_json, created_at
+           from public.salvo_run_events
+           where run_id = r.id
+             and event_type = 'usage.reported'
+           order by sequence_no desc
+           limit 1
+         ) e on true
+       ), workspace_spend as (
+         select
+           workspace_id,
+           sum(cost_usd) as spent_usd,
+           max(created_at) as last_usage_at
+         from usage_rows
+         group by workspace_id
+       ), family_spend as (
+         select
+           workspace_id,
+           contract_family_key,
+           sum(cost_usd) as spent_usd,
+           max(created_at) as last_usage_at
+         from usage_rows
+         group by workspace_id, contract_family_key
+       )
+       select
+         bl.id,
+         bl.workspace_id,
+         w.name as workspace_name,
+         bl.contract_family_key,
+         bl.limit_usd::double precision as limit_usd,
+         case
+           when bl.contract_family_key is null then 'workspace'
+           else 'family'
+         end as scope,
+         coalesce(
+           case
+             when bl.contract_family_key is null then ws.spent_usd
+             else fs.spent_usd
+           end,
+           0
+         ) as spent_usd,
+         (
+           bl.limit_usd::double precision -
+           coalesce(
+             case
+               when bl.contract_family_key is null then ws.spent_usd
+               else fs.spent_usd
+             end,
+             0
+           )
+         ) as remaining_usd,
+         case
+           when bl.contract_family_key is null then ws.last_usage_at
+           else fs.last_usage_at
+         end as last_usage_at,
+         bl.created_at,
+         bl.updated_at
+       from public.salvo_budget_limits bl
+       join public.salvo_workspaces w on w.id = bl.workspace_id
+       left join workspace_spend ws on ws.workspace_id = bl.workspace_id
+       left join family_spend fs
+         on fs.workspace_id = bl.workspace_id
+        and fs.contract_family_key = bl.contract_family_key
+       order by w.name asc, bl.contract_family_key asc nulls first`
+    );
+
+    return result.rows.map((row) => ({
+      ...row,
+      spent_usd: Number(row.spent_usd.toFixed(6)),
+      remaining_usd: Number(row.remaining_usd.toFixed(6))
+    }));
+  }
+
+  async listApplicableBudgetStatuses(
+    workspaceId: string,
+    contractFamilyKey: string
+  ): Promise<DbBudgetStatus[]> {
+    const result = await this.pool.query<DbBudgetStatus>(
+      `with usage_rows as (
+         select
+           t.workspace_id,
+           coalesce(
+             c.contract_json->>'family_key',
+             concat('legacy_', substring(r.contract_id::text, 1, 12))
+           ) as contract_family_key,
+           coalesce((e.payload_json->>'cost_usd')::double precision, 0) as cost_usd,
+           e.created_at
+         from public.salvo_runs r
+         join public.salvo_tasks t on t.id = r.task_id
+         left join public.salvo_contracts c on c.id = r.contract_id
+         join lateral (
+           select payload_json, created_at
+           from public.salvo_run_events
+           where run_id = r.id
+             and event_type = 'usage.reported'
+           order by sequence_no desc
+           limit 1
+         ) e on true
+       ), workspace_spend as (
+         select
+           workspace_id,
+           sum(cost_usd) as spent_usd,
+           max(created_at) as last_usage_at
+         from usage_rows
+         group by workspace_id
+       ), family_spend as (
+         select
+           workspace_id,
+           contract_family_key,
+           sum(cost_usd) as spent_usd,
+           max(created_at) as last_usage_at
+         from usage_rows
+         group by workspace_id, contract_family_key
+       )
+       select
+         bl.id,
+         bl.workspace_id,
+         w.name as workspace_name,
+         bl.contract_family_key,
+         bl.limit_usd::double precision as limit_usd,
+         case
+           when bl.contract_family_key is null then 'workspace'
+           else 'family'
+         end as scope,
+         coalesce(
+           case
+             when bl.contract_family_key is null then ws.spent_usd
+             else fs.spent_usd
+           end,
+           0
+         ) as spent_usd,
+         (
+           bl.limit_usd::double precision -
+           coalesce(
+             case
+               when bl.contract_family_key is null then ws.spent_usd
+               else fs.spent_usd
+             end,
+             0
+           )
+         ) as remaining_usd,
+         case
+           when bl.contract_family_key is null then ws.last_usage_at
+           else fs.last_usage_at
+         end as last_usage_at,
+         bl.created_at,
+         bl.updated_at
+       from public.salvo_budget_limits bl
+       join public.salvo_workspaces w on w.id = bl.workspace_id
+       left join workspace_spend ws on ws.workspace_id = bl.workspace_id
+       left join family_spend fs
+         on fs.workspace_id = bl.workspace_id
+        and fs.contract_family_key = bl.contract_family_key
+       where bl.workspace_id = $1
+         and (
+           bl.contract_family_key is null
+           or bl.contract_family_key = $2
+         )
+       order by bl.contract_family_key asc nulls first`,
+      [workspaceId, contractFamilyKey]
+    );
+
+    return result.rows.map((row) => ({
+      ...row,
+      spent_usd: Number(row.spent_usd.toFixed(6)),
+      remaining_usd: Number(row.remaining_usd.toFixed(6))
+    }));
   }
 
   async createArtifact(params: {

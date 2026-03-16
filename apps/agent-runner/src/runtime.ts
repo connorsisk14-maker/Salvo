@@ -1,58 +1,13 @@
 import type { ContractV1 } from "@salvo/contracts";
 import { validateContractV1 } from "@salvo/contracts";
 import type { DbIntegrationConfig, DbRun, DbTask } from "@salvo/db";
+import {
+  resolveLlmProviderAndModel,
+  usageCostUsd,
+  type LlmProvider as SharedLlmProvider
+} from "@salvo/shared";
 import { buildToolPolicy, type CommandExecutionResult, type FileReadResult, type ToolPolicy } from "@salvo/tools";
-
-const MODEL_BY_PROVIDER_AND_PROFILE = {
-  openai: {
-    builder: "gpt-5-mini",
-    researcher: "gpt-5",
-    debugger: "gpt-5-mini",
-    documenter: "gpt-5-nano"
-  },
-  custom: {
-    builder: "gpt-5-mini",
-    researcher: "gpt-5",
-    debugger: "gpt-5-mini",
-    documenter: "gpt-5-nano"
-  },
-  anthropic: {
-    builder: "claude-3-5-sonnet-latest",
-    researcher: "claude-3-5-sonnet-latest",
-    debugger: "claude-3-5-sonnet-latest",
-    documenter: "claude-3-5-haiku-latest"
-  }
-} as const;
-
-const MODEL_PRICING_USD_PER_1M = [
-  {
-    matchers: ["gpt-5-mini"],
-    input: 0.3,
-    output: 1.2
-  },
-  {
-    matchers: ["gpt-5-nano"],
-    input: 0.05,
-    output: 0.2
-  },
-  {
-    matchers: ["gpt-5"],
-    input: 1.25,
-    output: 10
-  },
-  {
-    matchers: ["claude-3-5-haiku", "claude-3-haiku"],
-    input: 0.8,
-    output: 4
-  },
-  {
-    matchers: ["claude-3-5-sonnet", "claude-3-7-sonnet", "claude-sonnet-4"],
-    input: 3,
-    output: 15
-  }
-] as const;
-
-export type RunnerLlmProvider = "anthropic" | "openai" | "custom";
+export type RunnerLlmProvider = SharedLlmProvider;
 
 export type RunnerLlmConfig = {
   provider: RunnerLlmProvider;
@@ -111,13 +66,6 @@ type OpenAiMessage = {
   content: string;
 };
 
-function normalizeProvider(input: string | undefined): RunnerLlmProvider {
-  if (input === "openai" || input === "custom" || input === "anthropic") {
-    return input;
-  }
-  return "anthropic";
-}
-
 function readString(config: Record<string, unknown>, key: string, fallback = ""): string {
   const value = config[key];
   return typeof value === "string" ? value : fallback;
@@ -125,20 +73,6 @@ function readString(config: Record<string, unknown>, key: string, fallback = "")
 
 function normalizePath(pathValue: string): string {
   return pathValue.replace(/\\/g, "/");
-}
-
-function usageCostUsd(model: string, inputTokens: number, outputTokens: number): number {
-  const normalizedModel = model.toLowerCase();
-  const pricing = MODEL_PRICING_USD_PER_1M.find((entry) =>
-    entry.matchers.some((matcher) => normalizedModel.includes(matcher))
-  );
-  if (!pricing) {
-    return 0;
-  }
-
-  const inputCost = (inputTokens / 1_000_000) * pricing.input;
-  const outputCost = (outputTokens / 1_000_000) * pricing.output;
-  return Number((inputCost + outputCost).toFixed(6));
 }
 
 export function validateRunnerContract(contractJson: Record<string, unknown>): ContractV1 {
@@ -171,9 +105,11 @@ export function resolveRunnerLlmConfig(input: {
   const llmConfigRow = input.integrationConfigs.find((row) => row.integration_key === "llm_api");
   const llmConfig = (llmConfigRow?.config_json ?? {}) as Record<string, unknown>;
 
-  const provider = normalizeProvider(
-    readString(llmConfig, "provider", input.env.SALVO_LLM_PROVIDER)
-  );
+  const routing = resolveLlmProviderAndModel({
+    llmConfig,
+    env: input.env,
+    agentProfile: input.agentProfile
+  });
   const apiKey =
     readString(llmConfig, "apiKey") ||
     readString(llmConfig, "authToken") ||
@@ -183,10 +119,8 @@ export function resolveRunnerLlmConfig(input: {
   const configuredBaseUrl = readString(llmConfig, "baseUrl", input.env.SALVO_LLM_BASE_URL);
   const baseUrl =
     configuredBaseUrl ||
-    (provider === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com/v1");
-  const model =
-    readString(llmConfig, "defaultModel", input.env.SALVO_LLM_DEFAULT_MODEL) ||
-    MODEL_BY_PROVIDER_AND_PROFILE[provider][input.agentProfile];
+    (routing.provider === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com/v1");
+  const model = routing.model;
 
   if (!apiKey) {
     throw new Error("LLM API key is not configured for the agent runner.");
@@ -196,7 +130,7 @@ export function resolveRunnerLlmConfig(input: {
   }
 
   return {
-    provider,
+    provider: routing.provider,
     apiKey,
     model,
     baseUrl,

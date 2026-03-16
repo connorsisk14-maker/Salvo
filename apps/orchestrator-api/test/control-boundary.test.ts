@@ -29,7 +29,8 @@ if (!databaseUrl) {
       "0005_integration_configs.sql",
       "0006_llm_api_integration_cutover.sql",
       "0007_research_analysis_pipeline.sql",
-      "0008_idempotency_recovery.sql"
+      "0008_idempotency_recovery.sql",
+      "0009_budget_caps.sql"
     ]) {
       const sql = await readFile(path.join(migrationDir, fileName), "utf8");
       await pool.query(sql);
@@ -51,6 +52,7 @@ if (!databaseUrl) {
         public.salvo_contracts,
         public.salvo_tasks,
         public.salvo_idempotency_keys,
+        public.salvo_budget_limits,
         public.salvo_integration_configs,
         public.audit_events,
         public.salvo_daemon_heartbeats,
@@ -619,6 +621,7 @@ if (!databaseUrl) {
     });
     assert.equal(costs.statusCode, 200);
     const costBody = costs.json();
+    assert.equal(costBody.estimated, false);
     assert.equal(typeof costBody.totals.cost_usd, "number");
     assert.equal(Array.isArray(costBody.by_model), true);
     assert.ok(costBody.by_model.some((entry: { model: string }) => entry.model === "gpt-5-mini"));
@@ -627,6 +630,85 @@ if (!databaseUrl) {
       .json()
       .find((item: { key: string }) => item.key === "llm_api");
     assert.ok(llmRow);
+  });
+
+  test("budget endpoints persist limits and return spend state", async () => {
+    const workspace = await repo.ensureWorkspace(`budget-api-${randomUUID()}`, process.cwd());
+    const task = await repo.createTask({
+      workspaceId: workspace.id,
+      title: "budget task",
+      request: "budget request",
+      requiresApproval: false
+    });
+    const contract = await repo.createContract({
+      taskId: task.id,
+      risk: "low",
+      status: "active",
+      contractJson: {
+        schema_version: 1,
+        family_key: "family-budget-api",
+        category: "general"
+      }
+    });
+    const run = await repo.createRun({
+      taskId: task.id,
+      contractId: contract.id,
+      agentProfile: "builder",
+      workerId: "budget-worker"
+    });
+    await repo.appendRunEvent(run.id, "usage.reported", "info", {
+      model: "gpt-5-mini",
+      input_tokens: 120,
+      output_tokens: 40,
+      cost_usd: 0.5,
+      estimated: false
+    });
+
+    const workspaceLimit = await app.inject({
+      method: "POST",
+      url: "/budgets",
+      payload: {
+        workspaceId: workspace.id,
+        limitUsd: 10
+      }
+    });
+    assert.equal(workspaceLimit.statusCode, 200);
+    assert.equal(workspaceLimit.json().ok, true);
+
+    const familyLimit = await app.inject({
+      method: "POST",
+      url: "/budgets",
+      payload: {
+        workspaceId: workspace.id,
+        contractFamilyKey: "family-budget-api",
+        limitUsd: 1
+      }
+    });
+    assert.equal(familyLimit.statusCode, 200);
+    assert.equal(familyLimit.json().ok, true);
+
+    const overview = await app.inject({
+      method: "GET",
+      url: "/budgets"
+    });
+    assert.equal(overview.statusCode, 200);
+    const payload = overview.json();
+    assert.equal(payload.workspaces.some((entry: { id: string }) => entry.id === workspace.id), true);
+    assert.equal(payload.budgets.length, 2);
+    assert.equal(
+      payload.budgets.some(
+        (entry: { scope: string; spent_usd: number; remaining_usd: number }) =>
+          entry.scope === "workspace" && entry.spent_usd === 0.5 && entry.remaining_usd === 9.5
+      ),
+      true
+    );
+    assert.equal(
+      payload.budgets.some(
+        (entry: { contract_family_key: string | null; remaining_usd: number }) =>
+          entry.contract_family_key === "family-budget-api" && entry.remaining_usd === 0.5
+      ),
+      true
+    );
   });
 
   test("integration config update endpoint persists llm_api settings", async () => {

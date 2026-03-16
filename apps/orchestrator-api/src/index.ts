@@ -41,6 +41,12 @@ const taskCreateSchema = z.object({
   requiresApproval: z.boolean().optional()
 }).strict();
 
+const budgetLimitSchema = z.object({
+  workspaceId: z.string().uuid("workspaceId must be a valid UUID."),
+  contractFamilyKey: z.string().trim().min(1, "contractFamilyKey must not be empty.").max(200, "contractFamilyKey must be 200 characters or fewer.").optional(),
+  limitUsd: z.number().finite("limitUsd must be a number.").min(0, "limitUsd must be 0 or greater.").max(1_000_000, "limitUsd must be 1000000 or fewer.")
+}).strict();
+
 const integrationConfigSchemas = {
   supabase: z.object({
     url: z.string().trim().max(2048, "url must be 2048 characters or fewer.").optional(),
@@ -863,7 +869,7 @@ export async function buildServer() {
 
     return {
       updated_at: new Date().toISOString(),
-      estimated: true,
+      estimated: false,
       totals: {
         runs: rows.length,
         cost_usd: Number(totalCost.toFixed(6)),
@@ -872,6 +878,60 @@ export async function buildServer() {
       },
       by_model: serialize(byModel.entries(), "model"),
       by_agent_profile: serialize(byAgent.entries(), "agent_profile")
+    };
+  });
+
+  app.get("/budgets", async () => {
+    const [workspaces, budgets] = await Promise.all([
+      repo.listWorkspaces(),
+      repo.listBudgetStatuses()
+    ]);
+
+    return {
+      updated_at: new Date().toISOString(),
+      workspaces: workspaces.map((workspace) => ({
+        id: workspace.id,
+        name: workspace.name
+      })),
+      budgets
+    };
+  });
+
+  app.post<{
+    Body: {
+      workspaceId: string;
+      contractFamilyKey?: string;
+      limitUsd: number;
+    };
+  }>("/budgets", async (req, reply) => {
+    const parsedBody = parseRequestBody(budgetLimitSchema, req.body ?? {});
+    if (!parsedBody.ok) {
+      return reply.status(400).send({
+        error: "Invalid request body.",
+        issues: parsedBody.issues
+      });
+    }
+
+    const body = parsedBody.value;
+    const budget = await repo.upsertBudgetLimit({
+      workspaceId: body.workspaceId,
+      contractFamilyKey: body.contractFamilyKey,
+      limitUsd: body.limitUsd
+    });
+    await repo.createAuditEvent({
+      actor: auditActor(req),
+      action: "budget.limit_updated",
+      target: budget.id,
+      metadata: {
+        workspace_id: budget.workspace_id,
+        contract_family_key: budget.contract_family_key,
+        limit_usd: budget.limit_usd
+      }
+    });
+
+    return {
+      ok: true,
+      budget
     };
   });
 

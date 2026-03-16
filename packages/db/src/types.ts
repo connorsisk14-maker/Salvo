@@ -132,6 +132,23 @@ export type DbIntegrationConfig = {
   updated_at: string;
 };
 
+export type DbBudgetLimit = {
+  id: string;
+  workspace_id: string;
+  contract_family_key: string | null;
+  limit_usd: number;
+  created_at: string;
+  updated_at: string;
+};
+
+export type DbBudgetStatus = DbBudgetLimit & {
+  workspace_name: string;
+  scope: "workspace" | "family";
+  spent_usd: number;
+  remaining_usd: number;
+  last_usage_at: string | null;
+};
+
 export type DbIdempotencyKey = {
   scope: string;
   idempotency_key: string;

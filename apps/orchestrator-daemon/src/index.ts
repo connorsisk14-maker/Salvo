@@ -1,9 +1,17 @@
 import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
+import type { ContractV1 } from "@salvo/contracts";
 import { buildContractV1 } from "@salvo/contracts";
 import { createDbPool, SalvoRepository, type DbRun, type DbRunEvent } from "@salvo/db";
 import { evaluateRun } from "@salvo/evaluation";
-import { BackupManager, createLogger, initializeSecrets, isTerminalRunStatus } from "@salvo/shared";
+import {
+  BackupManager,
+  createLogger,
+  estimateRunCost,
+  initializeSecrets,
+  isTerminalRunStatus,
+  resolveLlmProviderAndModel
+} from "@salvo/shared";
 
 await initializeSecrets();
 
@@ -147,20 +155,54 @@ class OrchestratorDaemon {
     contract.context.recent_runs = [...new Set(memoryContext.flatMap((entry) => entry.source_run_ids))];
 
     const requiresManualReview = contract.risk === "high" && !task.approved_at;
+    const budgetCheck = await this.checkBudgetCap(task, contract);
+    const requiresBudgetReview = budgetCheck.blockingBudgets.length > 0;
 
     const contractRecord = await this.repo.createContract({
       taskId: task.id,
       risk: contract.risk,
-      status: requiresManualReview ? "draft" : "active",
+      status: requiresManualReview || requiresBudgetReview ? "draft" : "active",
       contractJson: contract
     });
 
-    if (requiresManualReview) {
+    if (requiresManualReview || requiresBudgetReview) {
       await this.repo.transitionTaskStatus(task.id, "needs_review");
+      if (requiresBudgetReview) {
+        await this.repo.createAuditEvent({
+          actor: `system:${workerId}`,
+          action: "budget.blocked",
+          target: task.id,
+          metadata: {
+            contract_id: contractRecord.id,
+            workspace_id: task.workspace_id,
+            contract_family_key: contract.family_key,
+            provider: budgetCheck.provider,
+            model: budgetCheck.model,
+            estimated_cost_usd: budgetCheck.estimate.cost_usd,
+            estimated_input_tokens: budgetCheck.estimate.input_tokens,
+            estimated_output_tokens: budgetCheck.estimate.output_tokens,
+            heuristic: budgetCheck.estimate.heuristic,
+            budgets: budgetCheck.blockingBudgets.map((entry) => ({
+              scope: entry.scope,
+              contract_family_key: entry.contract_family_key,
+              limit_usd: entry.limit_usd,
+              spent_usd: entry.spent_usd,
+              remaining_usd: entry.remaining_usd
+            }))
+          }
+        });
+      }
+
       logger.warn("task moved to manual review", {
         task_id: task.id,
         contract_id: contractRecord.id,
-        risk: contract.risk
+        risk: contract.risk,
+        review_reasons: [
+          ...(requiresManualReview ? ["risk"] : []),
+          ...(requiresBudgetReview ? ["budget"] : [])
+        ],
+        estimated_cost_usd: budgetCheck.estimate.cost_usd,
+        blocking_budget_scopes: budgetCheck.blockingBudgets.map((entry) => entry.scope)
       });
       return;
     }
@@ -182,6 +224,53 @@ class OrchestratorDaemon {
     });
 
     await this.launchRun(run);
+  }
+
+  private async checkBudgetCap(
+    task: {
+      id: string;
+      workspace_id: string;
+      title: string;
+      original_request: string;
+    },
+    contract: ContractV1
+  ): Promise<{
+    provider: string;
+    model: string;
+    estimate: ReturnType<typeof estimateRunCost>;
+    blockingBudgets: Awaited<ReturnType<SalvoRepository["listApplicableBudgetStatuses"]>>;
+  }> {
+    const integrationConfigs = await this.repo.listIntegrationConfigs();
+    const llmConfig =
+      integrationConfigs.find((row) => row.integration_key === "llm_api")?.config_json ?? {};
+    const routing = resolveLlmProviderAndModel({
+      llmConfig,
+      env: process.env,
+      agentProfile: contract.agent_profile
+    });
+    const estimate = estimateRunCost({
+      model: routing.model,
+      agentProfile: contract.agent_profile,
+      title: task.title,
+      request: task.original_request,
+      contractJson: contract,
+      relevantFileCount: contract.context.relevant_files.length,
+      recentRunCount: contract.context.recent_runs.length,
+      memoryExcerptCount: contract.context.memory_excerpt_ids.length
+    });
+    const budgets = await this.repo.listApplicableBudgetStatuses(
+      task.workspace_id,
+      contract.family_key
+    );
+
+    return {
+      provider: routing.provider,
+      model: routing.model,
+      estimate,
+      blockingBudgets: budgets.filter(
+        (entry) => estimate.cost_usd > 0 && estimate.cost_usd > entry.remaining_usd
+      )
+    };
   }
 
   private async staleLoop(): Promise<void> {

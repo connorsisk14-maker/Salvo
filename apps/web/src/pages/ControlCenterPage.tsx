@@ -6,12 +6,15 @@ import {
   createTask,
   forceRestartDaemon,
   getBackupStatus,
+  getBudgetOverview,
   getOrchestratorHealth,
   getResearchHealth,
   listRuns,
   listTasks,
+  saveBudgetLimit,
   triggerBackup,
   type ApiBackupStatus,
+  type ApiBudgetOverview,
   type ApiDaemonHealth,
   type ApiRestartTarget,
   type ApiRun,
@@ -32,6 +35,15 @@ function renderDateTime(value?: string | null): string {
   return new Date(value).toLocaleString();
 }
 
+function formatUsd(value: number): string {
+  return new Intl.NumberFormat(undefined, {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 4
+  }).format(value);
+}
+
 export function ControlCenterPage() {
   const [title, setTitle] = useState("Create run summary scaffolding");
   const [request, setRequest] = useState(
@@ -43,33 +55,62 @@ export function ControlCenterPage() {
   const [orchestratorHealth, setOrchestratorHealth] = useState<ApiDaemonHealth | null>(null);
   const [researchHealth, setResearchHealth] = useState<ApiDaemonHealth | null>(null);
   const [backupStatus, setBackupStatus] = useState<ApiBackupStatus | null>(null);
+  const [budgetOverview, setBudgetOverview] = useState<ApiBudgetOverview | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [backupSubmitting, setBackupSubmitting] = useState(false);
+  const [budgetSubmitting, setBudgetSubmitting] = useState(false);
   const [restartTarget, setRestartTarget] = useState<ApiRestartTarget | null>(null);
   const [restartMessage, setRestartMessage] = useState<string | null>(null);
   const [backupMessage, setBackupMessage] = useState<string | null>(null);
+  const [budgetMessage, setBudgetMessage] = useState<string | null>(null);
+  const [budgetWorkspaceId, setBudgetWorkspaceId] = useState("");
+  const [budgetFamilyKey, setBudgetFamilyKey] = useState("");
+  const [budgetLimitUsd, setBudgetLimitUsd] = useState("25");
   const [error, setError] = useState<string | null>(null);
 
   const sortedRuns = useMemo(
     () => [...runs].sort((a, b) => b.created_at.localeCompare(a.created_at)),
     [runs]
   );
+  const budgetState = useMemo(() => {
+    if (!budgetOverview || budgetOverview.budgets.length === 0) {
+      return "pending";
+    }
+    if (budgetOverview.budgets.some((entry) => entry.remaining_usd < 0)) {
+      return "error";
+    }
+    return "healthy";
+  }, [budgetOverview]);
 
   async function refresh() {
     try {
-      const [nextTasks, nextRuns, nextOrchestratorHealth, nextResearchHealth, nextBackupStatus] =
+      const [
+        nextTasks,
+        nextRuns,
+        nextOrchestratorHealth,
+        nextResearchHealth,
+        nextBackupStatus,
+        nextBudgetOverview
+      ] =
         await Promise.all([
           listTasks(),
           listRuns(),
           getOrchestratorHealth(),
           getResearchHealth(),
-          getBackupStatus()
+          getBackupStatus(),
+          getBudgetOverview()
         ]);
       setTasks(nextTasks);
       setRuns(nextRuns);
       setOrchestratorHealth(nextOrchestratorHealth);
       setResearchHealth(nextResearchHealth);
       setBackupStatus(nextBackupStatus);
+      setBudgetOverview(nextBudgetOverview);
+      setBudgetWorkspaceId((current) =>
+        nextBudgetOverview.workspaces.some((workspace) => workspace.id === current)
+          ? current
+          : (nextBudgetOverview.workspaces[0]?.id ?? "")
+      );
       setError(null);
     } catch (refreshError) {
       setError((refreshError as Error).message);
@@ -156,6 +197,28 @@ export function ControlCenterPage() {
       setBackupMessage(`Backup failed: ${(backupError as Error).message}`);
     } finally {
       setBackupSubmitting(false);
+    }
+  }
+
+  async function onSaveBudget(event: FormEvent) {
+    event.preventDefault();
+    setBudgetSubmitting(true);
+    try {
+      const parsedLimit = Number(budgetLimitUsd);
+      await saveBudgetLimit({
+        workspaceId: budgetWorkspaceId,
+        contractFamilyKey: budgetFamilyKey.trim() || undefined,
+        limitUsd: parsedLimit
+      });
+      setBudgetMessage(
+        `${budgetFamilyKey.trim() ? "Family" : "Workspace"} budget saved at ${formatUsd(parsedLimit)}.`
+      );
+      await refresh();
+      setError(null);
+    } catch (budgetError) {
+      setBudgetMessage(`Budget update failed: ${(budgetError as Error).message}`);
+    } finally {
+      setBudgetSubmitting(false);
     }
   }
 
@@ -325,6 +388,105 @@ export function ControlCenterPage() {
               <tr>
                 <td colSpan={4} className="muted">
                   No backups recorded yet.
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </section>
+
+      <section className="panel">
+        <div className="health-card-head">
+          <h2>Budgets</h2>
+          <span className={`status-pill status-${budgetState}`}>{budgetState}</span>
+        </div>
+        <div className="health-grid">
+          <article className="health-card">
+            <h3>Coverage</h3>
+            <p className="muted">Configured caps: {budgetOverview?.budgets.length ?? 0}</p>
+            <p className="muted">Workspaces: {budgetOverview?.workspaces.length ?? 0}</p>
+            <p className="muted">
+              Over limit:{" "}
+              {budgetOverview?.budgets.filter((entry) => entry.remaining_usd < 0).length ?? 0}
+            </p>
+          </article>
+
+          <article className="health-card">
+            <h3>Add Or Update Limit</h3>
+            <form className="form-grid" onSubmit={onSaveBudget}>
+              <label>
+                Workspace
+                <select
+                  value={budgetWorkspaceId}
+                  onChange={(event) => setBudgetWorkspaceId(event.target.value)}
+                  required
+                >
+                  {(budgetOverview?.workspaces ?? []).map((workspace) => (
+                    <option key={workspace.id} value={workspace.id}>
+                      {workspace.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Contract Family Key
+                <input
+                  placeholder="Leave blank for workspace-wide cap"
+                  value={budgetFamilyKey}
+                  onChange={(event) => setBudgetFamilyKey(event.target.value)}
+                />
+              </label>
+              <label>
+                Limit (USD)
+                <input
+                  min="0"
+                  onChange={(event) => setBudgetLimitUsd(event.target.value)}
+                  required
+                  step="0.01"
+                  type="number"
+                  value={budgetLimitUsd}
+                />
+              </label>
+              <button
+                className="button-link"
+                disabled={budgetSubmitting || budgetWorkspaceId.length === 0}
+                type="submit"
+              >
+                {budgetSubmitting ? "Saving..." : "Save budget limit"}
+              </button>
+            </form>
+            {budgetMessage ? <p className="muted restart-note">{budgetMessage}</p> : null}
+          </article>
+        </div>
+
+        <table className="grid-table">
+          <thead>
+            <tr>
+              <th>Scope</th>
+              <th>Workspace</th>
+              <th>Family</th>
+              <th>Limit</th>
+              <th>Spend</th>
+              <th>Remaining</th>
+              <th>Last Usage</th>
+            </tr>
+          </thead>
+          <tbody>
+            {(budgetOverview?.budgets ?? []).map((budget) => (
+              <tr key={budget.id}>
+                <td>{budget.scope}</td>
+                <td>{budget.workspace_name}</td>
+                <td className="mono">{budget.contract_family_key ?? "-"}</td>
+                <td className="mono">{formatUsd(budget.limit_usd)}</td>
+                <td className="mono">{formatUsd(budget.spent_usd)}</td>
+                <td className="mono">{formatUsd(budget.remaining_usd)}</td>
+                <td>{renderDateTime(budget.last_usage_at)}</td>
+              </tr>
+            ))}
+            {budgetOverview?.budgets.length ? null : (
+              <tr>
+                <td colSpan={7} className="muted">
+                  No budget caps configured yet.
                 </td>
               </tr>
             )}
