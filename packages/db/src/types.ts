@@ -1,5 +1,6 @@
 import type {
   AgentProfile,
+  AgentTrustTier,
   ContractStatus,
   RunExitReason,
   RunEventLevel,
@@ -140,6 +141,19 @@ export type DbIntegrationConfig = {
   integration_key: DbIntegrationKey;
   config_json: Record<string, unknown>;
   updated_at: string;
+};
+
+export type DbAgentTrustTier = {
+  workspace_id: string;
+  workspace_name: string;
+  agent_profile: AgentProfile;
+  trust_tier: AgentTrustTier;
+  successful_runs: number;
+  last_run_at: string | null;
+  promoted_at: string | null;
+  managed_by: "system" | "manual";
+  created_at: string | null;
+  updated_at: string | null;
 };
 
 export type DbBudgetLimit = {

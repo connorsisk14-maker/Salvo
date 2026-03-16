@@ -30,7 +30,8 @@ if (!databaseUrl) {
       "0006_llm_api_integration_cutover.sql",
       "0007_research_analysis_pipeline.sql",
       "0008_idempotency_recovery.sql",
-      "0009_budget_caps.sql"
+      "0009_budget_caps.sql",
+      "0010_agent_trust_tiers.sql"
     ]) {
       const sql = await readFile(path.join(migrationDir, fileName), "utf8");
       await pool.query(sql);
@@ -53,6 +54,7 @@ if (!databaseUrl) {
         public.salvo_tasks,
         public.salvo_idempotency_keys,
         public.salvo_budget_limits,
+        public.salvo_agent_trust_tiers,
         public.salvo_integration_configs,
         public.audit_events,
         public.salvo_daemon_heartbeats,
@@ -707,6 +709,67 @@ if (!databaseUrl) {
         (entry: { contract_family_key: string | null; remaining_usd: number }) =>
           entry.contract_family_key === "family-budget-api" && entry.remaining_usd === 0.5
       ),
+      true
+    );
+  });
+
+  test("trust tier endpoints expose defaults and persist manual overrides", async () => {
+    const workspace = await repo.ensureWorkspace(`trust-api-${randomUUID()}`, process.cwd());
+
+    const initial = await app.inject({
+      method: "GET",
+      url: "/trust-tiers"
+    });
+    assert.equal(initial.statusCode, 200);
+    const initialPayload = initial.json();
+    assert.equal(
+      initialPayload.tiers.some(
+        (entry: {
+          workspace_id: string;
+          agent_profile: string;
+          trust_tier: string;
+          managed_by: string;
+        }) =>
+          entry.workspace_id === workspace.id &&
+          entry.agent_profile === "builder" &&
+          entry.trust_tier === "standard" &&
+          entry.managed_by === "system"
+      ),
+      true
+    );
+
+    const saved = await app.inject({
+      method: "POST",
+      url: "/trust-tiers",
+      payload: {
+        workspaceId: workspace.id,
+        agentProfile: "builder",
+        trustTier: "probation"
+      }
+    });
+    assert.equal(saved.statusCode, 200);
+    assert.equal(saved.json().ok, true);
+
+    const afterSave = await app.inject({
+      method: "GET",
+      url: "/trust-tiers"
+    });
+    assert.equal(afterSave.statusCode, 200);
+    assert.equal(
+      afterSave
+        .json()
+        .tiers.some(
+          (entry: {
+            workspace_id: string;
+            agent_profile: string;
+            trust_tier: string;
+            managed_by: string;
+          }) =>
+            entry.workspace_id === workspace.id &&
+            entry.agent_profile === "builder" &&
+            entry.trust_tier === "probation" &&
+            entry.managed_by === "manual"
+        ),
       true
     );
   });

@@ -17,6 +17,7 @@ import {
   planContract,
   resolveContractPlannerConfig
 } from "./contract-planner";
+import { applyTrustTierPolicy } from "./trust-tier";
 
 await initializeSecrets();
 
@@ -175,7 +176,15 @@ class OrchestratorDaemon {
         env: process.env
       })
     });
-    const contract = plannedContract.contract;
+    const trustTierState = await this.repo.getAgentTrustTier(
+      task.workspace_id,
+      plannedContract.contract.agent_profile
+    );
+    const governedContract = applyTrustTierPolicy(
+      plannedContract.contract,
+      trustTierState.trust_tier
+    );
+    const contract = governedContract.contract;
 
     const memoryReferenceContext = await this.repo.listContractMemoryContext(
       task.workspace_id,
@@ -207,10 +216,13 @@ class OrchestratorDaemon {
       contract_source: plannedContract.source,
       family_key: contract.family_key,
       risk: contract.risk,
-      agent_profile: contract.agent_profile
+      agent_profile: contract.agent_profile,
+      trust_tier: trustTierState.trust_tier
     });
 
-    const requiresManualReview = contract.risk === "high" && !task.approved_at;
+    const requiresRiskReview = contract.risk === "high" && !task.approved_at;
+    const requiresTierReview = governedContract.requiresManualReview && !task.approved_at;
+    const requiresManualReview = requiresRiskReview || requiresTierReview;
     const budgetCheck = await this.checkBudgetCap(task, contract);
     const requiresBudgetReview = budgetCheck.blockingBudgets.length > 0;
 
@@ -232,6 +244,7 @@ class OrchestratorDaemon {
             contract_id: contractRecord.id,
             workspace_id: task.workspace_id,
             contract_family_key: contract.family_key,
+            trust_tier: trustTierState.trust_tier,
             provider: budgetCheck.provider,
             model: budgetCheck.model,
             estimated_cost_usd: budgetCheck.estimate.cost_usd,
@@ -253,8 +266,10 @@ class OrchestratorDaemon {
         task_id: task.id,
         contract_id: contractRecord.id,
         risk: contract.risk,
+        trust_tier: trustTierState.trust_tier,
         review_reasons: [
-          ...(requiresManualReview ? ["risk"] : []),
+          ...(requiresRiskReview ? ["risk"] : []),
+          ...(requiresTierReview ? ["trust_tier"] : []),
           ...(requiresBudgetReview ? ["budget"] : [])
         ],
         estimated_cost_usd: budgetCheck.estimate.cost_usd,
@@ -599,6 +614,34 @@ class OrchestratorDaemon {
     });
 
     await this.repo.transitionTaskStatus(detail.task.id, evaluation.passed ? "completed" : "failed");
+    const trustTierOutcome = await this.repo.recordAgentTrustTierOutcome(
+      detail.task.workspace_id,
+      detail.run.agent_profile,
+      evaluation.passed
+    );
+
+    if (trustTierOutcome.promoted) {
+      await this.repo.createAuditEvent({
+        actor: `system:${workerId}`,
+        action: "trust_tier.promoted",
+        target: detail.task.id,
+        metadata: {
+          workspace_id: detail.task.workspace_id,
+          agent_profile: detail.run.agent_profile,
+          from: trustTierOutcome.before.trust_tier,
+          to: trustTierOutcome.after.trust_tier,
+          successful_runs: trustTierOutcome.after.successful_runs,
+          run_id: runId
+        }
+      });
+      logger.info("agent trust tier promoted", {
+        run_id: runId,
+        workspace_id: detail.task.workspace_id,
+        agent_profile: detail.run.agent_profile,
+        from: trustTierOutcome.before.trust_tier,
+        to: trustTierOutcome.after.trust_tier
+      });
+    }
 
     await this.repo.appendRunEvent(runId, evaluation.passed ? "run.completed" : "run.failed", "info", {
       score: evaluation.score,

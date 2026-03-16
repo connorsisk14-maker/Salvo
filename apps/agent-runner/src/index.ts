@@ -9,6 +9,7 @@ import {
   commandEvidence,
   normalizeArtifacts,
   parseContractPolicy,
+  reserveToolCall,
   resolveRunnerLlmConfig,
   runLlmGeneration,
   validateRunnerContract
@@ -102,9 +103,31 @@ async function main(): Promise<void> {
       at: new Date().toISOString()
     });
   }, 10_000);
+  let toolCallsUsed = 0;
+
+  const trackToolCall = async (payload: Record<string, unknown>) => {
+    try {
+      toolCallsUsed = reserveToolCall(
+        toolCallsUsed,
+        contractJson.constraints.max_tool_calls,
+        String(payload.tool ?? "unknown")
+      );
+    } catch (error) {
+      await repo.appendRunEvent(run.id, "policy.denied", "warn", {
+        reason: "tool_call_limit",
+        message: (error as Error).message,
+        max_tool_calls: contractJson.constraints.max_tool_calls,
+        tool_calls_used: toolCallsUsed,
+        ...payload
+      });
+      throw error;
+    }
+
+    await repo.appendRunEvent(run.id, "tool.called", "info", payload);
+  };
 
   try {
-    await repo.appendRunEvent(run.id, "tool.called", "info", {
+    await trackToolCall({
       tool: "llm",
       provider: llmConfig.provider,
       model: llmConfig.model
@@ -135,7 +158,7 @@ async function main(): Promise<void> {
     const createdArtifacts: string[] = [];
 
     for (const artifact of artifacts) {
-      await repo.appendRunEvent(run.id, "tool.called", "info", {
+      await trackToolCall({
         tool: "filesystem.write",
         path: artifact.path
       });
@@ -204,7 +227,7 @@ async function main(): Promise<void> {
       const commandName = parts[0] ?? "echo";
       const args = parts.slice(1);
 
-      await repo.appendRunEvent(run.id, "tool.called", "info", {
+      await trackToolCall({
         tool: "command",
         command: commandName,
         args,

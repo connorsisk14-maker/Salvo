@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { Pool, PoolClient, QueryResultRow } from "pg";
 import {
+  AGENT_PROFILES,
+  DEFAULT_AGENT_TRUST_TIER_BY_PROFILE,
   assertRunTransition,
   assertTaskTransition,
   isTerminalRunStatus,
@@ -26,6 +28,7 @@ import type {
   DbResearchReviewStatus,
   DbArtifact,
   DbAuditEvent,
+  DbAgentTrustTier,
   DbBudgetLimit,
   DbBudgetStatus,
   DbContractMemoryPrompt,
@@ -247,6 +250,219 @@ export class SalvoRepository {
     );
 
     return result.rows[0] ?? null;
+  }
+
+  async listAgentTrustTiers(workspaceId?: string): Promise<DbAgentTrustTier[]> {
+    const [workspaces, storedResult] = await Promise.all([
+      workspaceId
+        ? this.pool.query<DbWorkspace>(
+            `select *
+             from public.salvo_workspaces
+             where id = $1
+             limit 1`,
+            [workspaceId]
+          )
+        : this.pool.query<DbWorkspace>(
+            `select *
+             from public.salvo_workspaces
+             order by name asc`
+          ),
+      this.pool.query<DbAgentTrustTier>(
+        `select
+           tiers.workspace_id,
+           workspaces.name as workspace_name,
+           tiers.agent_profile,
+           tiers.trust_tier,
+           tiers.successful_runs,
+           tiers.last_run_at,
+           tiers.promoted_at,
+           tiers.managed_by,
+           tiers.created_at,
+           tiers.updated_at
+         from public.salvo_agent_trust_tiers tiers
+         join public.salvo_workspaces workspaces on workspaces.id = tiers.workspace_id
+         where ($1::uuid is null or tiers.workspace_id = $1)
+         order by workspaces.name asc, tiers.agent_profile asc`,
+        [workspaceId ?? null]
+      )
+    ]);
+
+    const storedByKey = new Map(
+      storedResult.rows.map((row) => [`${row.workspace_id}:${row.agent_profile}`, row] as const)
+    );
+
+    return workspaces.rows.flatMap((workspace) =>
+      AGENT_PROFILES.map((agentProfile) => {
+        const stored = storedByKey.get(`${workspace.id}:${agentProfile}`);
+        return (
+          stored ?? {
+            workspace_id: workspace.id,
+            workspace_name: workspace.name,
+            agent_profile: agentProfile,
+            trust_tier: DEFAULT_AGENT_TRUST_TIER_BY_PROFILE[agentProfile],
+            successful_runs: 0,
+            last_run_at: null,
+            promoted_at: null,
+            managed_by: "system",
+            created_at: null,
+            updated_at: null
+          }
+        );
+      })
+    );
+  }
+
+  async getAgentTrustTier(workspaceId: string, agentProfile: DbAgentTrustTier["agent_profile"]): Promise<DbAgentTrustTier> {
+    const tiers = await this.listAgentTrustTiers(workspaceId);
+    const tier = tiers.find((entry) => entry.agent_profile === agentProfile);
+    if (!tier) {
+      throw new Error(`Workspace not found: ${workspaceId}`);
+    }
+    return tier;
+  }
+
+  async upsertAgentTrustTier(input: {
+    workspaceId: string;
+    agentProfile: DbAgentTrustTier["agent_profile"];
+    trustTier: DbAgentTrustTier["trust_tier"];
+    successfulRuns?: number;
+    lastRunAt?: string | null;
+    promotedAt?: string | null;
+    managedBy?: DbAgentTrustTier["managed_by"];
+  }): Promise<DbAgentTrustTier> {
+    await this.pool.query(
+      `insert into public.salvo_agent_trust_tiers (
+         workspace_id,
+         agent_profile,
+         trust_tier,
+         successful_runs,
+         last_run_at,
+         promoted_at,
+         managed_by
+       )
+       values ($1, $2, $3, $4, $5, $6, $7)
+       on conflict (workspace_id, agent_profile)
+       do update
+         set trust_tier = excluded.trust_tier,
+             successful_runs = excluded.successful_runs,
+             last_run_at = excluded.last_run_at,
+             promoted_at = excluded.promoted_at,
+             managed_by = excluded.managed_by`,
+      [
+        input.workspaceId,
+        input.agentProfile,
+        input.trustTier,
+        input.successfulRuns ?? 0,
+        input.lastRunAt ?? null,
+        input.promotedAt ?? null,
+        input.managedBy ?? "manual"
+      ]
+    );
+
+    return this.getAgentTrustTier(input.workspaceId, input.agentProfile);
+  }
+
+  async recordAgentTrustTierOutcome(
+    workspaceId: string,
+    agentProfile: DbAgentTrustTier["agent_profile"],
+    succeeded: boolean
+  ): Promise<{ before: DbAgentTrustTier; after: DbAgentTrustTier; promoted: boolean }> {
+    return this.withTransaction(async (client) => {
+      const workspaceResult = await client.query<DbWorkspace>(
+        `select *
+         from public.salvo_workspaces
+         where id = $1
+         limit 1`,
+        [workspaceId]
+      );
+      const workspace = this.singleOrThrow(workspaceResult.rows, `Workspace not found: ${workspaceId}`);
+
+      await client.query(
+        `insert into public.salvo_agent_trust_tiers (
+           workspace_id,
+           agent_profile,
+           trust_tier,
+           successful_runs,
+           managed_by
+         )
+         values ($1, $2, $3, 0, 'system')
+         on conflict (workspace_id, agent_profile)
+         do nothing`,
+        [workspaceId, agentProfile, DEFAULT_AGENT_TRUST_TIER_BY_PROFILE[agentProfile]]
+      );
+
+      const currentResult = await client.query<Omit<DbAgentTrustTier, "workspace_name">>(
+        `select
+           workspace_id,
+           agent_profile,
+           trust_tier,
+           successful_runs,
+           last_run_at,
+           promoted_at,
+           managed_by,
+           created_at,
+           updated_at
+         from public.salvo_agent_trust_tiers
+         where workspace_id = $1
+           and agent_profile = $2
+         for update`,
+        [workspaceId, agentProfile]
+      );
+      const current = this.singleOrThrow(currentResult.rows, "Agent trust tier row missing after upsert.");
+      const before: DbAgentTrustTier = {
+        ...current,
+        workspace_name: workspace.name
+      };
+
+      const nextSuccessfulRuns = succeeded ? before.successful_runs + 1 : 0;
+      const promoted =
+        succeeded &&
+        before.managed_by === "system" &&
+        before.trust_tier === "restricted" &&
+        nextSuccessfulRuns >= 3;
+      const lastRunAt = new Date().toISOString();
+      const promotedAt = promoted ? new Date().toISOString() : before.promoted_at;
+
+      const updatedResult = await client.query<Omit<DbAgentTrustTier, "workspace_name">>(
+        `update public.salvo_agent_trust_tiers
+         set trust_tier = $3,
+             successful_runs = $4,
+             last_run_at = $5,
+             promoted_at = $6,
+             managed_by = $7
+         where workspace_id = $1
+           and agent_profile = $2
+         returning
+           workspace_id,
+           agent_profile,
+           trust_tier,
+           successful_runs,
+           last_run_at,
+           promoted_at,
+           managed_by,
+           created_at,
+           updated_at`,
+        [
+          workspaceId,
+          agentProfile,
+          promoted ? "standard" : before.trust_tier,
+          nextSuccessfulRuns,
+          lastRunAt,
+          promotedAt,
+          before.managed_by
+        ]
+      );
+      const updated = this.singleOrThrow(updatedResult.rows, "Failed to update agent trust tier.");
+
+      return {
+        before,
+        after: {
+          ...updated,
+          workspace_name: workspace.name
+        },
+        promoted
+      };
+    });
   }
 
   async createTask(input: CreateTaskInput): Promise<DbTask> {

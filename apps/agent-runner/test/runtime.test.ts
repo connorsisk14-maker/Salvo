@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildRunnerPrompts, normalizeArtifacts, parseRunnerModelOutput, resolveRunnerLlmConfig, validateRunnerContract } from "../src/runtime";
+import {
+  buildRunnerPrompts,
+  normalizeArtifacts,
+  parseRunnerModelOutput,
+  reserveToolCall,
+  resolveRunnerLlmConfig,
+  validateRunnerContract
+} from "../src/runtime";
 
 test("resolveRunnerLlmConfig prefers integration config over env", () => {
   const config = resolveRunnerLlmConfig({
@@ -162,4 +169,12 @@ test("buildRunnerPrompts includes contract and workspace context", () => {
   assert.equal(prompts.systemPrompt.includes("strict JSON object"), true);
   assert.equal(prompts.userPrompt.includes("file: README.md"), true);
   assert.equal(prompts.userPrompt.includes("\"required_artifacts\""), true);
+});
+
+test("reserveToolCall throws once the contract budget is exceeded", () => {
+  const first = reserveToolCall(0, 2, "llm");
+  const second = reserveToolCall(first, 2, "filesystem.write");
+
+  assert.equal(second, 2);
+  assert.throws(() => reserveToolCall(second, 2, "command"), /Tool call limit exceeded/);
 });

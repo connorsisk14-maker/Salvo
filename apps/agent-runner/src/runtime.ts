@@ -97,6 +97,20 @@ export function parseContractPolicy(
   });
 }
 
+export function reserveToolCall(
+  currentToolCalls: number,
+  maxToolCalls: number,
+  tool: string
+): number {
+  const nextToolCalls = currentToolCalls + 1;
+  if (nextToolCalls > maxToolCalls) {
+    throw new Error(
+      `Tool call limit exceeded for ${tool}. Allowed ${maxToolCalls} total tool calls.`
+    );
+  }
+  return nextToolCalls;
+}
+
 export function resolveRunnerLlmConfig(input: {
   integrationConfigs: DbIntegrationConfig[];
   env: NodeJS.ProcessEnv;

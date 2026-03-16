@@ -89,6 +89,71 @@ export const AGENT_PROFILES = [
 
 export type AgentProfile = (typeof AGENT_PROFILES)[number];
 
+export const AGENT_TRUST_TIERS = [
+  "unrestricted",
+  "standard",
+  "restricted",
+  "probation"
+] as const;
+
+export type AgentTrustTier = (typeof AGENT_TRUST_TIERS)[number];
+
+export type AgentTrustTierPolicy = {
+  requiresApproval: boolean;
+  maxRuntimeMinutes: number;
+  maxToolCalls: number;
+  networkAccess: boolean;
+  installPackages: boolean;
+  runTests: boolean;
+  dbWrite: boolean;
+};
+
+export const DEFAULT_AGENT_TRUST_TIER_BY_PROFILE: Record<AgentProfile, AgentTrustTier> = {
+  builder: "standard",
+  researcher: "restricted",
+  debugger: "restricted",
+  documenter: "restricted"
+};
+
+export const AGENT_TRUST_TIER_POLICIES: Record<AgentTrustTier, AgentTrustTierPolicy> = {
+  unrestricted: {
+    requiresApproval: false,
+    maxRuntimeMinutes: 45,
+    maxToolCalls: 400,
+    networkAccess: true,
+    installPackages: true,
+    runTests: true,
+    dbWrite: true
+  },
+  standard: {
+    requiresApproval: false,
+    maxRuntimeMinutes: 25,
+    maxToolCalls: 200,
+    networkAccess: false,
+    installPackages: false,
+    runTests: true,
+    dbWrite: true
+  },
+  restricted: {
+    requiresApproval: false,
+    maxRuntimeMinutes: 18,
+    maxToolCalls: 90,
+    networkAccess: false,
+    installPackages: false,
+    runTests: true,
+    dbWrite: false
+  },
+  probation: {
+    requiresApproval: true,
+    maxRuntimeMinutes: 10,
+    maxToolCalls: 40,
+    networkAccess: false,
+    installPackages: false,
+    runTests: true,
+    dbWrite: false
+  }
+};
+
 export const RETRY_DISPOSITIONS = [
   "not_needed",
   "scheduled",

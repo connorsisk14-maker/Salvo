@@ -28,7 +28,8 @@ if (!databaseUrl) {
       "0006_llm_api_integration_cutover.sql",
       "0007_research_analysis_pipeline.sql",
       "0008_idempotency_recovery.sql",
-      "0009_budget_caps.sql"
+      "0009_budget_caps.sql",
+      "0010_agent_trust_tiers.sql"
     ]) {
       const sql = await readFile(path.join(migrationDir, fileName), "utf8");
       await pool.query(sql);
@@ -51,6 +52,7 @@ if (!databaseUrl) {
         public.salvo_tasks,
         public.salvo_idempotency_keys,
         public.salvo_budget_limits,
+        public.salvo_agent_trust_tiers,
         public.salvo_integration_configs,
         public.salvo_daemon_heartbeats,
         public.salvo_workspaces
@@ -597,6 +599,63 @@ if (!databaseUrl) {
       applicable.some((entry) => entry.scope === "family" && entry.remaining_usd === 0.75),
       true
     );
+  });
+
+  test("agent trust tiers return defaults when no overrides exist", async () => {
+    const workspace = await repo.ensureWorkspace(`trust-default-${randomUUID()}`, process.cwd());
+
+    const tiers = await repo.listAgentTrustTiers(workspace.id);
+    assert.equal(tiers.length, 4);
+    assert.equal(
+      tiers.some(
+        (entry) =>
+          entry.workspace_id === workspace.id &&
+          entry.agent_profile === "builder" &&
+          entry.trust_tier === "standard" &&
+          entry.managed_by === "system"
+      ),
+      true
+    );
+    assert.equal(
+      tiers.some(
+        (entry) =>
+          entry.workspace_id === workspace.id &&
+          entry.agent_profile === "researcher" &&
+          entry.trust_tier === "restricted"
+      ),
+      true
+    );
+  });
+
+  test("system-managed restricted agents auto-promote after three successful runs", async () => {
+    const workspace = await repo.ensureWorkspace(`trust-promote-${randomUUID()}`, process.cwd());
+
+    const first = await repo.recordAgentTrustTierOutcome(workspace.id, "researcher", true);
+    const second = await repo.recordAgentTrustTierOutcome(workspace.id, "researcher", true);
+    const third = await repo.recordAgentTrustTierOutcome(workspace.id, "researcher", true);
+
+    assert.equal(first.after.trust_tier, "restricted");
+    assert.equal(second.after.trust_tier, "restricted");
+    assert.equal(third.promoted, true);
+    assert.equal(third.after.trust_tier, "standard");
+    assert.equal(third.after.successful_runs, 3);
+    assert.ok(third.after.promoted_at);
+  });
+
+  test("manual trust tier overrides persist and do not auto-promote", async () => {
+    const workspace = await repo.ensureWorkspace(`trust-manual-${randomUUID()}`, process.cwd());
+
+    await repo.upsertAgentTrustTier({
+      workspaceId: workspace.id,
+      agentProfile: "debugger",
+      trustTier: "probation",
+      managedBy: "manual"
+    });
+
+    const outcome = await repo.recordAgentTrustTierOutcome(workspace.id, "debugger", true);
+    assert.equal(outcome.promoted, false);
+    assert.equal(outcome.after.trust_tier, "probation");
+    assert.equal(outcome.after.managed_by, "manual");
   });
 
   test("0006 migration converts legacy claude_local config into llm_api", async () => {

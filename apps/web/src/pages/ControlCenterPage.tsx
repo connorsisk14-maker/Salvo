@@ -9,16 +9,20 @@ import {
   getBudgetOverview,
   getOrchestratorHealth,
   getResearchHealth,
+  getTrustTierOverview,
   listRuns,
   listTasks,
   saveBudgetLimit,
+  saveTrustTier,
   triggerBackup,
   type ApiBackupStatus,
   type ApiBudgetOverview,
   type ApiDaemonHealth,
   type ApiRestartTarget,
   type ApiRun,
-  type ApiTask
+  type ApiTask,
+  type ApiTrustTier,
+  type ApiTrustTierOverview
 } from "../api/control-plane";
 
 function renderHeartbeatDate(value?: string): string {
@@ -44,6 +48,17 @@ function formatUsd(value: number): string {
   }).format(value);
 }
 
+function trustTierRowKey(workspaceId: string, agentProfile: string): string {
+  return `${workspaceId}:${agentProfile}`;
+}
+
+const TRUST_TIER_OPTIONS: ApiTrustTier["trust_tier"][] = [
+  "unrestricted",
+  "standard",
+  "restricted",
+  "probation"
+];
+
 export function ControlCenterPage() {
   const [title, setTitle] = useState("Create run summary scaffolding");
   const [request, setRequest] = useState(
@@ -56,16 +71,20 @@ export function ControlCenterPage() {
   const [researchHealth, setResearchHealth] = useState<ApiDaemonHealth | null>(null);
   const [backupStatus, setBackupStatus] = useState<ApiBackupStatus | null>(null);
   const [budgetOverview, setBudgetOverview] = useState<ApiBudgetOverview | null>(null);
+  const [trustTierOverview, setTrustTierOverview] = useState<ApiTrustTierOverview | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [backupSubmitting, setBackupSubmitting] = useState(false);
   const [budgetSubmitting, setBudgetSubmitting] = useState(false);
+  const [trustTierSavingKey, setTrustTierSavingKey] = useState<string | null>(null);
   const [restartTarget, setRestartTarget] = useState<ApiRestartTarget | null>(null);
   const [restartMessage, setRestartMessage] = useState<string | null>(null);
   const [backupMessage, setBackupMessage] = useState<string | null>(null);
   const [budgetMessage, setBudgetMessage] = useState<string | null>(null);
+  const [trustTierMessage, setTrustTierMessage] = useState<string | null>(null);
   const [budgetWorkspaceId, setBudgetWorkspaceId] = useState("");
   const [budgetFamilyKey, setBudgetFamilyKey] = useState("");
   const [budgetLimitUsd, setBudgetLimitUsd] = useState("25");
+  const [trustTierEdits, setTrustTierEdits] = useState<Record<string, ApiTrustTier["trust_tier"]>>({});
   const [error, setError] = useState<string | null>(null);
 
   const sortedRuns = useMemo(
@@ -81,6 +100,15 @@ export function ControlCenterPage() {
     }
     return "healthy";
   }, [budgetOverview]);
+  const trustTierState = useMemo(() => {
+    if (!trustTierOverview || trustTierOverview.tiers.length === 0) {
+      return "pending";
+    }
+    if (trustTierOverview.tiers.some((entry) => entry.trust_tier === "probation")) {
+      return "error";
+    }
+    return "healthy";
+  }, [trustTierOverview]);
 
   async function refresh() {
     try {
@@ -90,7 +118,8 @@ export function ControlCenterPage() {
         nextOrchestratorHealth,
         nextResearchHealth,
         nextBackupStatus,
-        nextBudgetOverview
+        nextBudgetOverview,
+        nextTrustTierOverview
       ] =
         await Promise.all([
           listTasks(),
@@ -98,7 +127,8 @@ export function ControlCenterPage() {
           getOrchestratorHealth(),
           getResearchHealth(),
           getBackupStatus(),
-          getBudgetOverview()
+          getBudgetOverview(),
+          getTrustTierOverview()
         ]);
       setTasks(nextTasks);
       setRuns(nextRuns);
@@ -106,11 +136,21 @@ export function ControlCenterPage() {
       setResearchHealth(nextResearchHealth);
       setBackupStatus(nextBackupStatus);
       setBudgetOverview(nextBudgetOverview);
+      setTrustTierOverview(nextTrustTierOverview);
       setBudgetWorkspaceId((current) =>
         nextBudgetOverview.workspaces.some((workspace) => workspace.id === current)
           ? current
           : (nextBudgetOverview.workspaces[0]?.id ?? "")
       );
+      setTrustTierEdits((current) => {
+        const next: Record<string, ApiTrustTier["trust_tier"]> = {};
+        for (const tier of nextTrustTierOverview.tiers) {
+          const key = trustTierRowKey(tier.workspace_id, tier.agent_profile);
+          const existing = current[key];
+          next[key] = existing && existing !== tier.trust_tier ? existing : tier.trust_tier;
+        }
+        return next;
+      });
       setError(null);
     } catch (refreshError) {
       setError((refreshError as Error).message);
@@ -219,6 +259,33 @@ export function ControlCenterPage() {
       setBudgetMessage(`Budget update failed: ${(budgetError as Error).message}`);
     } finally {
       setBudgetSubmitting(false);
+    }
+  }
+
+  async function onSaveTrustTier(tier: ApiTrustTier) {
+    const key = trustTierRowKey(tier.workspace_id, tier.agent_profile);
+    const trustTier = trustTierEdits[key] ?? tier.trust_tier;
+
+    setTrustTierSavingKey(key);
+    try {
+      await saveTrustTier({
+        workspaceId: tier.workspace_id,
+        agentProfile: tier.agent_profile,
+        trustTier
+      });
+      setTrustTierMessage(
+        `${tier.workspace_name} ${tier.agent_profile} trust tier set to ${trustTier}.`
+      );
+      setTrustTierEdits((current) => ({
+        ...current,
+        [key]: trustTier
+      }));
+      await refresh();
+      setError(null);
+    } catch (trustTierError) {
+      setTrustTierMessage(`Trust tier update failed: ${(trustTierError as Error).message}`);
+    } finally {
+      setTrustTierSavingKey(null);
     }
   }
 
@@ -487,6 +554,98 @@ export function ControlCenterPage() {
               <tr>
                 <td colSpan={7} className="muted">
                   No budget caps configured yet.
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </section>
+
+      <section className="panel">
+        <div className="health-card-head">
+          <h2>Trust Tiers</h2>
+          <span className={`status-pill status-${trustTierState}`}>{trustTierState}</span>
+        </div>
+        <div className="health-grid">
+          <article className="health-card">
+            <h3>Coverage</h3>
+            <p className="muted">Tracked profiles: {trustTierOverview?.tiers.length ?? 0}</p>
+            <p className="muted">Manual overrides: {trustTierOverview?.tiers.filter((entry) => entry.managed_by === "manual").length ?? 0}</p>
+            <p className="muted">Probation: {trustTierOverview?.tiers.filter((entry) => entry.trust_tier === "probation").length ?? 0}</p>
+          </article>
+
+          <article className="health-card">
+            <h3>Policy Notes</h3>
+            <p className="muted">Probation requires manual review and clamps runtime plus tool-call budget.</p>
+            <p className="muted">System-managed restricted agents auto-promote after three successful runs.</p>
+            <p className="muted">Manual overrides stop automatic promotion until the row is set back by an operator.</p>
+          </article>
+        </div>
+        {trustTierMessage ? <p className="muted restart-note">{trustTierMessage}</p> : null}
+
+        <table className="grid-table">
+          <thead>
+            <tr>
+              <th>Workspace</th>
+              <th>Profile</th>
+              <th>Tier</th>
+              <th>Managed By</th>
+              <th>Successful Runs</th>
+              <th>Last Run</th>
+              <th>Promoted</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {(trustTierOverview?.tiers ?? []).map((tier) => {
+              const key = trustTierRowKey(tier.workspace_id, tier.agent_profile);
+              const selectedTier = trustTierEdits[key] ?? tier.trust_tier;
+              const dirty = selectedTier !== tier.trust_tier;
+
+              return (
+                <tr key={key}>
+                  <td>{tier.workspace_name}</td>
+                  <td>{tier.agent_profile}</td>
+                  <td>
+                    <select
+                      value={selectedTier}
+                      onChange={(event) =>
+                        setTrustTierEdits((current) => ({
+                          ...current,
+                          [key]: event.target.value as ApiTrustTier["trust_tier"]
+                        }))
+                      }
+                    >
+                      {TRUST_TIER_OPTIONS.map((option) => (
+                        <option key={option} value={option}>
+                          {option}
+                        </option>
+                      ))}
+                    </select>
+                  </td>
+                  <td>{tier.managed_by}</td>
+                  <td>{tier.successful_runs}</td>
+                  <td>{renderDateTime(tier.last_run_at)}</td>
+                  <td>{renderDateTime(tier.promoted_at)}</td>
+                  <td>
+                    <button
+                      className="button-link"
+                      disabled={!dirty || trustTierSavingKey === key}
+                      onClick={() => {
+                        void onSaveTrustTier(tier);
+                      }}
+                      type="button"
+                    >
+                      {trustTierSavingKey === key ? "Saving..." : "Save"}
+                    </button>
+                  </td>
+                </tr>
+              );
+            })}
+            {trustTierOverview?.tiers.length ? null : (
+              <tr>
+                <td colSpan={8} className="muted">
+                  No trust tier data available yet.
                 </td>
               </tr>
             )}

@@ -6,7 +6,13 @@ import { createReadStream } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { createDbPool, SalvoRepository } from "@salvo/db";
-import { BackupAlreadyRunningError, BackupManager, initializeSecrets } from "@salvo/shared";
+import {
+  AGENT_PROFILES,
+  AGENT_TRUST_TIERS,
+  BackupAlreadyRunningError,
+  BackupManager,
+  initializeSecrets
+} from "@salvo/shared";
 import { z } from "zod";
 
 await initializeSecrets();
@@ -45,6 +51,12 @@ const budgetLimitSchema = z.object({
   workspaceId: z.string().uuid("workspaceId must be a valid UUID."),
   contractFamilyKey: z.string().trim().min(1, "contractFamilyKey must not be empty.").max(200, "contractFamilyKey must be 200 characters or fewer.").optional(),
   limitUsd: z.number().finite("limitUsd must be a number.").min(0, "limitUsd must be 0 or greater.").max(1_000_000, "limitUsd must be 1000000 or fewer.")
+}).strict();
+
+const trustTierSchema = z.object({
+  workspaceId: z.string().uuid("workspaceId must be a valid UUID."),
+  agentProfile: z.enum(AGENT_PROFILES),
+  trustTier: z.enum(AGENT_TRUST_TIERS)
 }).strict();
 
 const integrationConfigSchemas = {
@@ -932,6 +944,62 @@ export async function buildServer() {
     return {
       ok: true,
       budget
+    };
+  });
+
+  app.get("/trust-tiers", async () => {
+    const [workspaces, tiers] = await Promise.all([
+      repo.listWorkspaces(),
+      repo.listAgentTrustTiers()
+    ]);
+
+    return {
+      updated_at: new Date().toISOString(),
+      workspaces: workspaces.map((workspace) => ({
+        id: workspace.id,
+        name: workspace.name
+      })),
+      tiers
+    };
+  });
+
+  app.post<{
+    Body: {
+      workspaceId: string;
+      agentProfile: (typeof AGENT_PROFILES)[number];
+      trustTier: (typeof AGENT_TRUST_TIERS)[number];
+    };
+  }>("/trust-tiers", async (req, reply) => {
+    const parsedBody = parseRequestBody(trustTierSchema, req.body ?? {});
+    if (!parsedBody.ok) {
+      return reply.status(400).send({
+        error: "Invalid request body.",
+        issues: parsedBody.issues
+      });
+    }
+
+    const body = parsedBody.value;
+    const tier = await repo.upsertAgentTrustTier({
+      workspaceId: body.workspaceId,
+      agentProfile: body.agentProfile,
+      trustTier: body.trustTier,
+      managedBy: "manual"
+    });
+    await repo.createAuditEvent({
+      actor: auditActor(req),
+      action: "trust_tier.updated",
+      target: `${tier.workspace_id}:${tier.agent_profile}`,
+      metadata: {
+        workspace_id: tier.workspace_id,
+        agent_profile: tier.agent_profile,
+        trust_tier: tier.trust_tier,
+        managed_by: tier.managed_by
+      }
+    });
+
+    return {
+      ok: true,
+      tier
     };
   });
 

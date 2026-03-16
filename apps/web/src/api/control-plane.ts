@@ -200,6 +200,28 @@ export type ApiBudgetOverview = {
   budgets: ApiBudgetStatus[];
 };
 
+export type ApiTrustTier = {
+  workspace_id: string;
+  workspace_name: string;
+  agent_profile: string;
+  trust_tier: "unrestricted" | "standard" | "restricted" | "probation";
+  successful_runs: number;
+  last_run_at: string | null;
+  promoted_at: string | null;
+  managed_by: "system" | "manual";
+  created_at: string | null;
+  updated_at: string | null;
+};
+
+export type ApiTrustTierOverview = {
+  updated_at: string;
+  workspaces: Array<{
+    id: string;
+    name: string;
+  }>;
+  tiers: ApiTrustTier[];
+};
+
 export type ApiRunDetail = {
   run: ApiRun;
   task: ApiTask;
@@ -415,6 +437,21 @@ export function saveBudgetLimit(input: {
   limitUsd: number;
 }): Promise<ApiActionResponse & { budget?: ApiBudgetStatus }> {
   return request<ApiActionResponse & { budget?: ApiBudgetStatus }>("/budgets", {
+    method: "POST",
+    body: JSON.stringify(input)
+  });
+}
+
+export function getTrustTierOverview(): Promise<ApiTrustTierOverview> {
+  return request<ApiTrustTierOverview>("/trust-tiers");
+}
+
+export function saveTrustTier(input: {
+  workspaceId: string;
+  agentProfile: string;
+  trustTier: ApiTrustTier["trust_tier"];
+}): Promise<ApiActionResponse & { tier?: ApiTrustTier }> {
+  return request<ApiActionResponse & { tier?: ApiTrustTier }>("/trust-tiers", {
     method: "POST",
     body: JSON.stringify(input)
   });
