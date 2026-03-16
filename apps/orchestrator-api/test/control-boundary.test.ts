@@ -28,7 +28,8 @@ if (!databaseUrl) {
       "0004_run_cancellation.sql",
       "0005_integration_configs.sql",
       "0006_llm_api_integration_cutover.sql",
-      "0007_research_analysis_pipeline.sql"
+      "0007_research_analysis_pipeline.sql",
+      "0008_idempotency_recovery.sql"
     ]) {
       const sql = await readFile(path.join(migrationDir, fileName), "utf8");
       await pool.query(sql);
@@ -49,6 +50,7 @@ if (!databaseUrl) {
         public.salvo_runs,
         public.salvo_contracts,
         public.salvo_tasks,
+        public.salvo_idempotency_keys,
         public.salvo_integration_configs,
         public.audit_events,
         public.salvo_daemon_heartbeats,
@@ -137,6 +139,68 @@ if (!databaseUrl) {
     const runs = runsResponse.json();
     assert.equal(Array.isArray(runs), true);
     assert.equal(runs.length, 0);
+  });
+
+  test("task creation replays original response for duplicate idempotency key", async () => {
+    const first = await app.inject({
+      method: "POST",
+      url: "/tasks",
+      headers: {
+        idempotency_key: "task-idem-1"
+      },
+      payload: {
+        title: "boundary-check",
+        request: "create task only",
+        requiresApproval: false
+      }
+    });
+    const second = await app.inject({
+      method: "POST",
+      url: "/tasks",
+      headers: {
+        idempotency_key: "task-idem-1"
+      },
+      payload: {
+        title: "boundary-check",
+        request: "create task only",
+        requiresApproval: false
+      }
+    });
+
+    assert.equal(first.statusCode, 201);
+    assert.equal(second.statusCode, 201);
+    assert.equal(first.json().id, second.json().id);
+  });
+
+  test("task creation rejects idempotency key reuse with a different payload", async () => {
+    const first = await app.inject({
+      method: "POST",
+      url: "/tasks",
+      headers: {
+        idempotency_key: "task-idem-2"
+      },
+      payload: {
+        title: "boundary-check",
+        request: "create task only",
+        requiresApproval: false
+      }
+    });
+    assert.equal(first.statusCode, 201);
+
+    const second = await app.inject({
+      method: "POST",
+      url: "/tasks",
+      headers: {
+        idempotency_key: "task-idem-2"
+      },
+      payload: {
+        title: "boundary-check changed",
+        request: "create task only",
+        requiresApproval: false
+      }
+    });
+
+    assert.equal(second.statusCode, 409);
   });
 
   test("health endpoints return offline when no daemon heartbeat exists", async () => {
@@ -315,6 +379,38 @@ if (!databaseUrl) {
     );
     assert.equal(auditEvents.rows.length, 1);
     assert.equal(auditEvents.rows[0]?.target, task.id);
+  });
+
+  test("approve route replays original response for duplicate idempotency key", async () => {
+    const workspace = await repo.ensureWorkspace(`approve-idem-${randomUUID()}`, process.cwd());
+    const task = await repo.createTask({
+      workspaceId: workspace.id,
+      title: "approve review",
+      request: "schema migration install dependencies",
+      requiresApproval: false
+    });
+    await repo.transitionTaskStatus(task.id, "planning");
+    await repo.transitionTaskStatus(task.id, "needs_review");
+
+    const first = await app.inject({
+      method: "POST",
+      url: `/tasks/${task.id}/approve`,
+      headers: {
+        idempotency_key: "approve-idem-1"
+      }
+    });
+    const second = await app.inject({
+      method: "POST",
+      url: `/tasks/${task.id}/approve`,
+      headers: {
+        idempotency_key: "approve-idem-1"
+      }
+    });
+
+    assert.equal(first.statusCode, 200);
+    assert.equal(second.statusCode, 200);
+    assert.equal(first.json().approved_at, second.json().approved_at);
+    assert.equal(first.json().status, second.json().status);
   });
 
   test("research and memory review endpoints update review status", async () => {

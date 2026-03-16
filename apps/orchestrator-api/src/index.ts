@@ -1,6 +1,7 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
@@ -22,6 +23,8 @@ const rateLimitMaxRequests = readPositiveIntegerEnv("SALVO_API_RATE_LIMIT_PER_MI
 const rateLimitWindowMs = readPositiveIntegerEnv("SALVO_API_RATE_LIMIT_WINDOW_MS", 60_000);
 const taskTitleMaxLength = readPositiveIntegerEnv("SALVO_API_TASK_TITLE_MAX_LENGTH", 160);
 const taskRequestMaxLength = readPositiveIntegerEnv("SALVO_API_TASK_REQUEST_MAX_LENGTH", 20_000);
+const idempotencyTtlHours = readPositiveIntegerEnv("SALVO_API_IDEMPOTENCY_TTL_HOURS", 24);
+const idempotencyKeyMaxLength = readPositiveIntegerEnv("SALVO_API_IDEMPOTENCY_KEY_MAX_LENGTH", 200);
 
 const reviewStatusSchema = z.object({
   status: z.enum(["unreviewed", "accepted", "rejected"])
@@ -424,6 +427,29 @@ function auditActor(request: {
   headers: { authorization?: string };
 }): string {
   return request.headers.authorization ? `api_token:${request.ip}` : `anonymous:${request.ip}`;
+}
+
+function readIdempotencyKey(headers: Record<string, string | string[] | undefined>): string | null {
+  const value = headers["idempotency_key"] ?? headers["idempotency-key"];
+  const normalized = Array.isArray(value) ? value[0] : value;
+  if (!normalized) {
+    return null;
+  }
+
+  const key = normalized.trim();
+  if (!key) {
+    return null;
+  }
+
+  if (key.length > idempotencyKeyMaxLength) {
+    throw new Error(`Idempotency key must be ${idempotencyKeyMaxLength} characters or fewer.`);
+  }
+
+  return key;
+}
+
+function fingerprint(value: unknown): string {
+  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
 export async function buildServer() {
@@ -865,24 +891,62 @@ export async function buildServer() {
       });
     }
     const body = parsedBody.value;
+    let idempotencyKey: string | null = null;
+    try {
+      idempotencyKey = readIdempotencyKey(req.headers);
+    } catch (error) {
+      return reply.status(400).send({
+        error: (error as Error).message
+      });
+    }
 
-    const task = await repo.createTask({
-      title: body.title,
-      request: body.request,
-      workspaceId: body.workspaceId,
-      requiresApproval: body.requiresApproval
-    });
-    await repo.createAuditEvent({
-      actor: auditActor(req),
-      action: "task.created",
-      target: task.id,
-      metadata: {
-        workspace_id: task.workspace_id,
-        requires_approval: task.requires_approval
+    try {
+      const result = idempotencyKey
+        ? await repo.createTaskIdempotent(
+            {
+              title: body.title,
+              request: body.request,
+              workspaceId: body.workspaceId,
+              requiresApproval: body.requiresApproval
+            },
+            {
+              idempotencyKey,
+              requestFingerprint: fingerprint(body),
+              ttlHours: idempotencyTtlHours
+            }
+          )
+        : {
+            resource: await repo.createTask({
+              title: body.title,
+              request: body.request,
+              workspaceId: body.workspaceId,
+              requiresApproval: body.requiresApproval
+            }),
+            duplicate: false,
+            responseStatus: 201
+          };
+
+      if (!result.duplicate) {
+        await repo.createAuditEvent({
+          actor: auditActor(req),
+          action: "task.created",
+          target: result.resource.id,
+          metadata: {
+            workspace_id: result.resource.workspace_id,
+            requires_approval: result.resource.requires_approval,
+            idempotency_key: idempotencyKey
+          }
+        });
       }
-    });
 
-    return reply.status(201).send(task);
+      return reply.status(result.responseStatus).send(result.resource);
+    } catch (error) {
+      const message = (error as Error).message;
+      if (message.includes("Idempotency key already used") || message.includes("already in progress")) {
+        return reply.status(409).send({ error: message });
+      }
+      throw error;
+    }
   });
 
   app.get("/tasks", async () => {
@@ -899,17 +963,46 @@ export async function buildServer() {
 
   app.post<{ Params: { id: string } }>("/tasks/:id/approve", async (req, reply) => {
     try {
-      const task = await repo.approveTask(req.params.id);
-      await repo.createAuditEvent({
-        actor: auditActor(req),
-        action: "task.approved",
-        target: task.id,
-        metadata: {
-          status: task.status
-        }
-      });
-      return task;
+      let idempotencyKey: string | null = null;
+      try {
+        idempotencyKey = readIdempotencyKey(req.headers);
+      } catch (error) {
+        return reply.status(400).send({
+          error: (error as Error).message
+        });
+      }
+
+      const result = idempotencyKey
+        ? await repo.approveTaskIdempotent(req.params.id, {
+            idempotencyKey,
+            requestFingerprint: fingerprint({
+              taskId: req.params.id,
+              action: "approve"
+            }),
+            ttlHours: idempotencyTtlHours
+          })
+        : {
+            resource: await repo.approveTask(req.params.id),
+            duplicate: false,
+            responseStatus: 200
+          };
+      if (!result.duplicate) {
+        await repo.createAuditEvent({
+          actor: auditActor(req),
+          action: "task.approved",
+          target: result.resource.id,
+          metadata: {
+            status: result.resource.status,
+            idempotency_key: idempotencyKey
+          }
+        });
+      }
+      return reply.status(result.responseStatus).send(result.resource);
     } catch (error) {
+      const message = (error as Error).message;
+      if (message.includes("Idempotency key already used") || message.includes("already in progress")) {
+        return reply.status(409).send({ error: message });
+      }
       return reply.status(404).send({ error: (error as Error).message });
     }
   });

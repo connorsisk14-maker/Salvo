@@ -31,6 +31,10 @@ Copy `.env.example` to `.env` and set:
 - `SALVO_BACKUP_HOUR_LOCAL`: daily backup hour in local server time (default `3`)
 - `SALVO_BACKUP_RETENTION_DAILY`: number of daily archives to keep (default `7`)
 - `SALVO_BACKUP_RETENTION_WEEKLY`: number of weekly archives to keep after daily retention (default `4`)
+- `SALVO_API_IDEMPOTENCY_TTL_HOURS`: how long idempotent responses are replayable (default `24`)
+- `SALVO_RECOVERY_ORPHAN_RUN_AFTER_SECONDS`: stale/orphan run timeout for recovery (default `30`)
+- `SALVO_RECOVERY_ORPHAN_TASK_AFTER_SECONDS`: planning task recovery timeout when no run exists (default `120`)
+- `SALVO_RECOVERY_MAX_RUN_ATTEMPTS`: max attempts before stale runs are exhausted (default `2`)
 - `VITE_SALVO_API_URL`: API URL for dashboard (default `http://localhost:8787`)
 
 Secret values such as `SALVO_DATABASE_URL`, `SALVO_API_TOKEN`, `SALVO_LLM_API_KEY`, and adapter tokens should not be stored in plaintext `.env`. Use the configured secrets backend instead. See [docs/SECRETS.md](/Users/connorsisk/Desktop/SALVO/docs/SECRETS.md).
@@ -46,6 +50,7 @@ Raw SQL migrations live in `supabase/migrations`.
 - `0005_integration_configs.sql` integration configuration storage
 - `0006_llm_api_integration_cutover.sql` `claude_local -> llm_api` migration with compatibility merge
 - `0007_research_analysis_pipeline.sql` research ingestion/experiment tables + contract-family memory scope
+- `0008_idempotency_recovery.sql` idempotency record storage + recovery support metadata
 
 ## Local Run
 
@@ -109,6 +114,7 @@ Control-plane health endpoints:
 - `GET /health/orchestrator`
 - `GET /health/research`
 - `POST /control/restart` with body `{ "target": "orchestrator" | "research" | "all" }`
+- `POST /tasks` accepts `idempotency_key` or `idempotency-key` for 24h replay
 - `GET /backups/status`, `POST /control/backup` for verified database backups
 - `POST /runs/:id/retry` to re-queue failed/blocked/cancelled run tasks
 - `POST /runs/:id/cancel` (active runs get `run.cancel_requested`; daemon force-cancels and finalizes)
@@ -119,6 +125,8 @@ Control-plane health endpoints:
 - `GET /stream/overview`, `GET /stream/runs/:id` (SSE polling replacement for dashboard updates)
 
 Daemon endpoints are DB-backed via `salvo_daemon_heartbeats` and return `healthy`, `stale`, or `offline`.
+
+The orchestrator also re-queues orphaned planning tasks and recovers orphaned/stale runs using configurable thresholds, with each recovery action written to `audit_events`.
 
 Backup automation writes compressed custom-format Postgres dumps, verifies them with `pg_restore --list`, and exposes status in the Control Center page. Recovery steps live in [docs/BACKUPS.md](/Users/connorsisk/Desktop/SALVO/docs/BACKUPS.md).
 

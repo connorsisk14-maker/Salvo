@@ -132,6 +132,18 @@ export type DbIntegrationConfig = {
   updated_at: string;
 };
 
+export type DbIdempotencyKey = {
+  scope: string;
+  idempotency_key: string;
+  request_fingerprint: string;
+  status: "processing" | "completed";
+  response_status: number | null;
+  response_json: Record<string, unknown> | null;
+  created_at: string;
+  updated_at: string;
+  expires_at: string;
+};
+
 export type DbResearchReviewStatus = "unreviewed" | "accepted" | "rejected";
 
 export type DbResearchIngestion = {
@@ -189,6 +201,12 @@ export type CreateTaskInput = {
   title: string;
   request: string;
   requiresApproval?: boolean;
+};
+
+export type IdempotentResult<T> = {
+  resource: T;
+  duplicate: boolean;
+  responseStatus: number;
 };
 
 export type CreateAuditEventInput = {

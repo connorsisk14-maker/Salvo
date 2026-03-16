@@ -8,10 +8,24 @@ import { BackupManager, createLogger, initializeSecrets, isTerminalRunStatus } f
 await initializeSecrets();
 
 const workerId = `orchestrator-${randomUUID().slice(0, 8)}`;
+const staleRunThresholdSeconds = readPositiveIntegerEnv(
+  "SALVO_RECOVERY_ORPHAN_RUN_AFTER_SECONDS",
+  30
+);
+const orphanTaskThresholdSeconds = readPositiveIntegerEnv(
+  "SALVO_RECOVERY_ORPHAN_TASK_AFTER_SECONDS",
+  120
+);
+const recoveryMaxAttempts = readPositiveIntegerEnv("SALVO_RECOVERY_MAX_RUN_ATTEMPTS", 2);
 const logger = createLogger({
   component: "orchestrator-daemon",
   daemon_id: workerId
 });
+
+function readPositiveIntegerEnv(name: string, fallback: number): number {
+  const value = Number(process.env[name] ?? fallback);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
 
 class OrchestratorDaemon {
   private readonly repo: SalvoRepository;
@@ -19,6 +33,7 @@ class OrchestratorDaemon {
   private readonly activeRuns = new Map<string, ChildProcess>();
   private claimTimer?: NodeJS.Timeout;
   private staleTimer?: NodeJS.Timeout;
+  private recoveryTimer?: NodeJS.Timeout;
   private cancellationTimer?: NodeJS.Timeout;
   private heartbeatTimer?: NodeJS.Timeout;
   private backupTimer?: NodeJS.Timeout;
@@ -43,6 +58,10 @@ class OrchestratorDaemon {
       void this.staleLoop();
     }, 5_000);
 
+    this.recoveryTimer = setInterval(() => {
+      void this.recoverOrphanedTasksLoop();
+    }, 15_000);
+
     this.cancellationTimer = setInterval(() => {
       void this.cancellationLoop();
     }, 1_500);
@@ -57,6 +76,7 @@ class OrchestratorDaemon {
 
     await this.claimLoop();
     await this.staleLoop();
+    await this.recoverOrphanedTasksLoop();
     await this.cancellationLoop();
     await this.backupLoop();
   }
@@ -72,6 +92,9 @@ class OrchestratorDaemon {
     }
     if (this.staleTimer) {
       clearInterval(this.staleTimer);
+    }
+    if (this.recoveryTimer) {
+      clearInterval(this.recoveryTimer);
     }
     if (this.cancellationTimer) {
       clearInterval(this.cancellationTimer);
@@ -162,18 +185,34 @@ class OrchestratorDaemon {
   }
 
   private async staleLoop(): Promise<void> {
-    const staleRuns = await this.repo.findStaleRuns(30);
+    const staleRuns = await this.repo.findStaleRuns(staleRunThresholdSeconds);
 
     for (const staleRun of staleRuns) {
       if (this.activeRuns.has(staleRun.id)) {
         continue;
       }
 
-      const retry = await this.repo.scheduleRetryFromStaleRun(staleRun.id, workerId, 2);
+      const retry = await this.repo.scheduleRetryFromStaleRun(
+        staleRun.id,
+        workerId,
+        recoveryMaxAttempts
+      );
       logger.warn("stale run detected", {
         run_id: staleRun.id,
         task_id: staleRun.task_id,
         retry_disposition: retry.disposition
+      });
+      await this.repo.createAuditEvent({
+        actor: `system:${workerId}`,
+        action: "recovery.run_marked_stale",
+        target: staleRun.id,
+        metadata: {
+          task_id: staleRun.task_id,
+          stale_after_seconds: staleRunThresholdSeconds,
+          retry_disposition: retry.disposition,
+          attempt_no: staleRun.attempt_no,
+          status: staleRun.status
+        }
       });
       await this.repo.appendRunEvent(staleRun.id, "run.failed", "error", {
         reason: "stale_runner",
@@ -188,6 +227,33 @@ class OrchestratorDaemon {
         await this.repo.transitionRunStatus(retry.retryRun.id, "starting", { workerId });
         await this.launchRun(retry.retryRun);
       }
+    }
+  }
+
+  private async recoverOrphanedTasksLoop(): Promise<void> {
+    const tasks = await this.repo.findOrphanedTasks(orphanTaskThresholdSeconds, 20);
+
+    for (const task of tasks) {
+      const recovered = await this.repo.recoverOrphanedTask(task.id);
+      if (recovered.status !== "queued") {
+        continue;
+      }
+
+      logger.warn("orphaned task re-queued", {
+        task_id: recovered.id,
+        workspace_id: recovered.workspace_id,
+        claimed_by: task.claimed_by
+      });
+      await this.repo.createAuditEvent({
+        actor: `system:${workerId}`,
+        action: "recovery.orphan_task_requeued",
+        target: recovered.id,
+        metadata: {
+          workspace_id: recovered.workspace_id,
+          orphan_after_seconds: orphanTaskThresholdSeconds,
+          prior_claimed_by: task.claimed_by
+        }
+      });
     }
   }
 

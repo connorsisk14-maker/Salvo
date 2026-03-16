@@ -14,6 +14,7 @@ import type {
   CreateAuditEventInput,
   DaemonType,
   CreateContractInput,
+  DbIdempotencyKey,
   CreateMemoryInput,
   CreateResearchInput,
   CreateRunInput,
@@ -32,6 +33,7 @@ import type {
   DbRunEvent,
   DbTask,
   DbWorkspace,
+  IdempotentResult,
   ResearchIngestionCandidate,
   RecordEvaluationInput
 } from "./types";
@@ -82,6 +84,126 @@ export class SalvoRepository {
     return row;
   }
 
+  private buildIdempotencyExpiry(ttlHours = 24): string {
+    const expiresAt = new Date(Date.now() + ttlHours * 60 * 60 * 1000);
+    return expiresAt.toISOString();
+  }
+
+  private async beginIdempotentRequest<T extends Record<string, unknown>>(
+    client: PoolClient,
+    scope: string,
+    idempotencyKey: string,
+    requestFingerprint: string,
+    ttlHours = 24
+  ): Promise<
+    | { kind: "execute" }
+    | { kind: "replay"; responseStatus: number; responseJson: T }
+  > {
+    const expiresAt = this.buildIdempotencyExpiry(ttlHours);
+    const inserted = await client.query<DbIdempotencyKey>(
+      `insert into public.salvo_idempotency_keys (
+         scope,
+         idempotency_key,
+         request_fingerprint,
+         status,
+         expires_at
+       )
+       values ($1, $2, $3, 'processing', $4)
+       on conflict do nothing
+       returning *`,
+      [scope, idempotencyKey, requestFingerprint, expiresAt]
+    );
+
+    if (inserted.rows[0]) {
+      return { kind: "execute" };
+    }
+
+    const existingResult = await client.query<DbIdempotencyKey>(
+      `select *
+       from public.salvo_idempotency_keys
+       where scope = $1
+         and idempotency_key = $2
+       for update`,
+      [scope, idempotencyKey]
+    );
+    const existing = this.singleOrThrow(
+      existingResult.rows,
+      `Idempotency key not found: ${scope}:${idempotencyKey}`
+    );
+
+    const expired = new Date(existing.expires_at).getTime() <= Date.now();
+    if (expired) {
+      await client.query(
+        `update public.salvo_idempotency_keys
+         set request_fingerprint = $3,
+             status = 'processing',
+             response_status = null,
+             response_json = null,
+             expires_at = $4
+         where scope = $1
+           and idempotency_key = $2`,
+        [scope, idempotencyKey, requestFingerprint, expiresAt]
+      );
+      return { kind: "execute" };
+    }
+
+    if (existing.request_fingerprint !== requestFingerprint) {
+      throw new Error("Idempotency key already used for a different request.");
+    }
+
+    if (existing.status !== "completed" || existing.response_status === null || !existing.response_json) {
+      throw new Error("A matching request is already in progress.");
+    }
+
+    return {
+      kind: "replay",
+      responseStatus: existing.response_status,
+      responseJson: existing.response_json as T
+    };
+  }
+
+  private async completeIdempotentRequest(
+    client: PoolClient,
+    scope: string,
+    idempotencyKey: string,
+    responseStatus: number,
+    responseJson: Record<string, unknown>
+  ): Promise<void> {
+    await client.query(
+      `update public.salvo_idempotency_keys
+       set status = 'completed',
+           response_status = $3,
+           response_json = $4::jsonb
+       where scope = $1
+         and idempotency_key = $2`,
+      [scope, idempotencyKey, responseStatus, JSON.stringify(responseJson)]
+    );
+  }
+
+  private async insertTask(client: PoolClient, input: CreateTaskInput): Promise<DbTask> {
+    const workspaceId = input.workspaceId ?? (await this.ensureWorkspace()).id;
+
+    const title = input.title.trim() || "Untitled task";
+    const request = input.request.trim();
+    const normalized = request.replace(/\s+/g, " ");
+
+    const result = await client.query<DbTask>(
+      `insert into public.salvo_tasks (
+         workspace_id,
+         title,
+         original_request,
+         normalized_request,
+         status,
+         requires_approval
+       )
+       values ($1, $2, $3, $4, 'queued', $5)
+       returning *`,
+      [workspaceId, title, request, normalized, input.requiresApproval ?? false]
+    );
+
+    return this.singleOrThrow(result.rows, "Failed to create task.");
+  }
+
   async ensureWorkspace(name = "default", localPath = process.cwd()): Promise<DbWorkspace> {
     const existing = await this.pool.query<DbWorkspace>(
       `select * from public.salvo_workspaces where name = $1 limit 1`,
@@ -103,28 +225,38 @@ export class SalvoRepository {
   }
 
   async createTask(input: CreateTaskInput): Promise<DbTask> {
-    const workspaceId =
-      input.workspaceId ?? (await this.ensureWorkspace()).id;
+    return this.withTransaction(async (client) => this.insertTask(client, input));
+  }
 
-    const title = input.title.trim() || "Untitled task";
-    const request = input.request.trim();
-    const normalized = request.replace(/\s+/g, " ");
+  async createTaskIdempotent(input: CreateTaskInput, options: {
+    idempotencyKey: string;
+    requestFingerprint: string;
+    ttlHours?: number;
+  }): Promise<IdempotentResult<DbTask>> {
+    return this.withTransaction(async (client) => {
+      const idempotency = await this.beginIdempotentRequest<DbTask>(
+        client,
+        "task.create",
+        options.idempotencyKey,
+        options.requestFingerprint,
+        options.ttlHours ?? 24
+      );
+      if (idempotency.kind === "replay") {
+        return {
+          resource: idempotency.responseJson as DbTask,
+          duplicate: true,
+          responseStatus: idempotency.responseStatus
+        };
+      }
 
-    const result = await this.pool.query<DbTask>(
-      `insert into public.salvo_tasks (
-         workspace_id,
-         title,
-         original_request,
-         normalized_request,
-         status,
-         requires_approval
-       )
-       values ($1, $2, $3, $4, 'queued', $5)
-       returning *`,
-      [workspaceId, title, request, normalized, input.requiresApproval ?? false]
-    );
-
-    return this.singleOrThrow(result.rows, "Failed to create task.");
+      const task = await this.insertTask(client, input);
+      await this.completeIdempotentRequest(client, "task.create", options.idempotencyKey, 201, task);
+      return {
+        resource: task,
+        duplicate: false,
+        responseStatus: 201
+      };
+    });
   }
 
   async createAuditEvent(input: CreateAuditEventInput): Promise<DbAuditEvent> {
@@ -187,28 +319,64 @@ export class SalvoRepository {
 
   async approveTask(taskId: string): Promise<DbTask> {
     return this.withTransaction(async (client) => {
-      const currentResult = await client.query<DbTask>(
-        `select * from public.salvo_tasks where id = $1 for update`,
-        [taskId]
-      );
-      const current = this.singleOrThrow(currentResult.rows, `Task not found: ${taskId}`);
+      return this.approveTaskInTransaction(client, taskId);
+    });
+  }
 
-      let nextStatus = current.status;
-      if (current.status === "needs_review") {
-        assertTaskTransition(current.status, "queued");
-        nextStatus = "queued";
+  private async approveTaskInTransaction(client: PoolClient, taskId: string): Promise<DbTask> {
+    const currentResult = await client.query<DbTask>(
+      `select * from public.salvo_tasks where id = $1 for update`,
+      [taskId]
+    );
+    const current = this.singleOrThrow(currentResult.rows, `Task not found: ${taskId}`);
+
+    let nextStatus = current.status;
+    if (current.status === "needs_review") {
+      assertTaskTransition(current.status, "queued");
+      nextStatus = "queued";
+    }
+
+    const result = await client.query<DbTask>(
+      `update public.salvo_tasks
+       set approved_at = now(),
+           status = $2
+       where id = $1
+       returning *`,
+      [taskId, nextStatus]
+    );
+
+    return this.singleOrThrow(result.rows, `Task not found: ${taskId}`);
+  }
+
+  async approveTaskIdempotent(taskId: string, options: {
+    idempotencyKey: string;
+    requestFingerprint: string;
+    ttlHours?: number;
+  }): Promise<IdempotentResult<DbTask>> {
+    return this.withTransaction(async (client) => {
+      const scope = `task.approve:${taskId}`;
+      const idempotency = await this.beginIdempotentRequest<DbTask>(
+        client,
+        scope,
+        options.idempotencyKey,
+        options.requestFingerprint,
+        options.ttlHours ?? 24
+      );
+      if (idempotency.kind === "replay") {
+        return {
+          resource: idempotency.responseJson as DbTask,
+          duplicate: true,
+          responseStatus: idempotency.responseStatus
+        };
       }
 
-      const result = await client.query<DbTask>(
-        `update public.salvo_tasks
-         set approved_at = now(),
-             status = $2
-         where id = $1
-         returning *`,
-        [taskId, nextStatus]
-      );
-
-      return this.singleOrThrow(result.rows, `Task not found: ${taskId}`);
+      const task = await this.approveTaskInTransaction(client, taskId);
+      await this.completeIdempotentRequest(client, scope, options.idempotencyKey, 200, task);
+      return {
+        resource: task,
+        duplicate: false,
+        responseStatus: 200
+      };
     });
   }
 
@@ -605,7 +773,7 @@ export class SalvoRepository {
     const result = await this.pool.query<DbRun>(
       `select *
        from public.salvo_runs
-       where status in ('starting', 'running', 'evaluating')
+       where status in ('created', 'provisioning', 'starting', 'running', 'evaluating')
          and coalesce(heartbeat_at, started_at, created_at) < now() - ($1::text || ' seconds')::interval
        order by created_at asc`,
       [staleAfterSeconds]
@@ -901,6 +1069,67 @@ export class SalvoRepository {
     );
 
     return result.rows;
+  }
+
+  async findOrphanedTasks(orphanAfterSeconds = 120, limit = 50): Promise<DbTask[]> {
+    const result = await this.pool.query<DbTask>(
+      `select t.*
+       from public.salvo_tasks t
+       where t.status = 'planning'
+         and t.claimed_at is not null
+         and t.claimed_at < now() - ($1::text || ' seconds')::interval
+         and not exists (
+           select 1
+           from public.salvo_runs r
+           where r.task_id = t.id
+         )
+       order by t.claimed_at asc
+       limit $2`,
+      [orphanAfterSeconds, limit]
+    );
+
+    return result.rows;
+  }
+
+  async recoverOrphanedTask(taskId: string): Promise<DbTask> {
+    return this.withTransaction(async (client) => {
+      const taskResult = await client.query<DbTask>(
+        `select *
+         from public.salvo_tasks
+         where id = $1
+         for update`,
+        [taskId]
+      );
+      const task = this.singleOrThrow(taskResult.rows, `Task not found: ${taskId}`);
+
+      if (task.status !== "planning") {
+        return task;
+      }
+
+      const runCountResult = await client.query<{ count: string }>(
+        `select count(*)::text as count
+         from public.salvo_runs
+         where task_id = $1`,
+        [taskId]
+      );
+      const runCount = Number(runCountResult.rows[0]?.count ?? "0");
+      if (runCount > 0) {
+        return task;
+      }
+
+      assertTaskTransition(task.status, "queued");
+      const updatedResult = await client.query<DbTask>(
+        `update public.salvo_tasks
+         set status = 'queued',
+             claimed_by = null,
+             claimed_at = null,
+             cancelled_at = null
+         where id = $1
+         returning *`,
+        [taskId]
+      );
+      return this.singleOrThrow(updatedResult.rows, `Task update failed: ${taskId}`);
+    });
   }
 
   async recordEvaluation(input: RecordEvaluationInput): Promise<DbEvaluation> {

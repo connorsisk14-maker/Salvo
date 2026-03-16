@@ -26,7 +26,8 @@ if (!databaseUrl) {
       "0004_run_cancellation.sql",
       "0005_integration_configs.sql",
       "0006_llm_api_integration_cutover.sql",
-      "0007_research_analysis_pipeline.sql"
+      "0007_research_analysis_pipeline.sql",
+      "0008_idempotency_recovery.sql"
     ]) {
       const sql = await readFile(path.join(migrationDir, fileName), "utf8");
       await pool.query(sql);
@@ -47,6 +48,7 @@ if (!databaseUrl) {
         public.salvo_runs,
         public.salvo_contracts,
         public.salvo_tasks,
+        public.salvo_idempotency_keys,
         public.salvo_integration_configs,
         public.salvo_daemon_heartbeats,
         public.salvo_workspaces
@@ -178,6 +180,62 @@ if (!databaseUrl) {
 
     const events = await repo.listRunEvents(run.id);
     assert.equal(events.some((event) => event.event_type === "run.retry_requested"), true);
+  });
+
+  test("idempotent task creation replays the original task row", async () => {
+    const workspace = await repo.ensureWorkspace(`idem-${randomUUID()}`, process.cwd());
+    const first = await repo.createTaskIdempotent(
+      {
+        workspaceId: workspace.id,
+        title: "same task",
+        request: "do the same thing",
+        requiresApproval: false
+      },
+      {
+        idempotencyKey: "task-create-1",
+        requestFingerprint: "fingerprint-a"
+      }
+    );
+    const second = await repo.createTaskIdempotent(
+      {
+        workspaceId: workspace.id,
+        title: "same task",
+        request: "do the same thing",
+        requiresApproval: false
+      },
+      {
+        idempotencyKey: "task-create-1",
+        requestFingerprint: "fingerprint-a"
+      }
+    );
+
+    assert.equal(first.duplicate, false);
+    assert.equal(second.duplicate, true);
+    assert.equal(first.resource.id, second.resource.id);
+  });
+
+  test("orphaned planning tasks can be recovered back to queued", async () => {
+    const workspace = await repo.ensureWorkspace(`orphan-${randomUUID()}`, process.cwd());
+    const task = await repo.createTask({
+      workspaceId: workspace.id,
+      title: "orphan task",
+      request: "stuck during planning"
+    });
+    await repo.claimNextTask("worker-orphan");
+
+    await pool.query(
+      `update public.salvo_tasks
+       set claimed_at = now() - interval '10 minutes'
+       where id = $1`,
+      [task.id]
+    );
+
+    const orphaned = await repo.findOrphanedTasks(60, 10);
+    assert.equal(orphaned.some((item) => item.id === task.id), true);
+
+    const recovered = await repo.recoverOrphanedTask(task.id);
+    assert.equal(recovered.status, "queued");
+    assert.equal(recovered.claimed_at, null);
   });
 
   test("cancel run moves run/task to cancelled and appends cancellation event", async () => {
