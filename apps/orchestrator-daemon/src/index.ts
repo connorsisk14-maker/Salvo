@@ -3,7 +3,9 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { buildContractV1 } from "@salvo/contracts";
 import { createDbPool, SalvoRepository, type DbRun, type DbRunEvent } from "@salvo/db";
 import { evaluateRun } from "@salvo/evaluation";
-import { BackupManager, createLogger, isTerminalRunStatus } from "@salvo/shared";
+import { BackupManager, createLogger, initializeSecrets, isTerminalRunStatus } from "@salvo/shared";
+
+await initializeSecrets();
 
 const workerId = `orchestrator-${randomUUID().slice(0, 8)}`;
 const logger = createLogger({

@@ -7,7 +7,9 @@ import {
   FilesystemAdapter,
   type ToolPolicy
 } from "@salvo/tools";
-import { createLogger } from "@salvo/shared";
+import { createLogger, initializeSecrets } from "@salvo/shared";
+
+await initializeSecrets();
 
 const MODEL_BY_PROFILE = {
   builder: "gpt-5-mini",

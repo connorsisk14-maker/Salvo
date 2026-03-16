@@ -2,6 +2,7 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
+import { loadSecretsIntoEnv } from "../packages/shared/src/secrets.ts";
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const envFilePath = path.join(rootDir, ".env");
@@ -39,6 +40,7 @@ async function runtimeEnv() {
     ...process.env,
     ...dotEnv
   };
+  await loadSecretsIntoEnv(merged);
 
   const databaseUrl = merged.SALVO_DATABASE_URL ?? merged.SALVO_TEST_DATABASE_URL;
   if (!databaseUrl) {

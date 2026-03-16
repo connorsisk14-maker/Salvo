@@ -5,8 +5,10 @@ import { createReadStream } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { createDbPool, SalvoRepository } from "@salvo/db";
-import { BackupAlreadyRunningError, BackupManager } from "@salvo/shared";
+import { BackupAlreadyRunningError, BackupManager, initializeSecrets } from "@salvo/shared";
 import { z } from "zod";
+
+await initializeSecrets();
 
 const apiPort = Number(process.env.SALVO_API_PORT ?? 8787);
 const orchestratorThresholdSeconds = Number(

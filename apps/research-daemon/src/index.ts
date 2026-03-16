@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { createDbPool, ResearchRepository } from "@salvo/db";
-import { createLogger } from "@salvo/shared";
+import { createLogger, initializeSecrets } from "@salvo/shared";
 import { ResearchAnalysisService } from "./service";
+
+await initializeSecrets();
 
 const daemonId = `research-${randomUUID().slice(0, 8)}`;
 const synthesisIntervalMs = 15_000;

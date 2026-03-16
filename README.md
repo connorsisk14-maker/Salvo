@@ -23,9 +23,8 @@ Local-first agentic harness with a strict runtime contract, policy-enforced adap
 
 Copy `.env.example` to `.env` and set:
 
-- `SALVO_DATABASE_URL`: Postgres connection string
+- `SALVO_SECRETS_BACKEND`: secret source (`env`, `file`, or `keychain`)
 - `SALVO_WORKSPACE_ROOT`: local path used for run workspaces and artifacts
-- `SALVO_API_TOKEN`: bearer token required by the dashboard and protected API routes
 - `SALVO_LOG_LEVEL`: structured log threshold (`debug`, `info`, `warn`, `error`)
 - `SALVO_LOG_TARGET`: structured log output target (`stdout`, `stderr`, or `split`)
 - `SALVO_BACKUP_DIR`: optional filesystem path for verified database backups
@@ -33,6 +32,8 @@ Copy `.env.example` to `.env` and set:
 - `SALVO_BACKUP_RETENTION_DAILY`: number of daily archives to keep (default `7`)
 - `SALVO_BACKUP_RETENTION_WEEKLY`: number of weekly archives to keep after daily retention (default `4`)
 - `VITE_SALVO_API_URL`: API URL for dashboard (default `http://localhost:8787`)
+
+Secret values such as `SALVO_DATABASE_URL`, `SALVO_API_TOKEN`, `SALVO_LLM_API_KEY`, and adapter tokens should not be stored in plaintext `.env`. Use the configured secrets backend instead. See [docs/SECRETS.md](/Users/connorsisk/Desktop/SALVO/docs/SECRETS.md).
 
 ## Migrations
 
@@ -85,6 +86,20 @@ pnpm test:e2e
 
 For DB-backed integration tests, set `SALVO_TEST_DATABASE_URL` (recommended) or `SALVO_DATABASE_URL`.
 For e2e smoke test, keep API/orchestrator/research running and optionally set `SALVO_E2E_API_URL`.
+
+## Secrets Management
+
+- `SALVO_SECRETS_BACKEND=env`: reads secrets directly from the shell environment
+- `SALVO_SECRETS_BACKEND=file`: decrypts `SALVO_SECRETS_FILE_PATH` using `SALVO_SECRETS_FILE_PASSPHRASE`
+- `SALVO_SECRETS_BACKEND=keychain`: reads from macOS Keychain using `SALVO_SECRETS_KEYCHAIN_SERVICE_PREFIX`
+
+Helper commands:
+
+```bash
+pnpm secrets:template > secrets.json
+export SALVO_SECRETS_FILE_PASSPHRASE='choose-a-strong-passphrase'
+pnpm secrets:encrypt --input secrets.json --output config/secrets.enc.json
+```
 
 ## Daemon Health
 
