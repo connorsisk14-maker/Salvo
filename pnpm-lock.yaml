@@ -72,6 +72,9 @@ importers:
       '@salvo/evaluation':
         specifier: workspace:*
         version: link:../../packages/evaluation
+      '@salvo/llm':
+        specifier: workspace:*
+        version: link:../../packages/llm
       '@salvo/shared':
         specifier: workspace:*
         version: link:../../packages/shared

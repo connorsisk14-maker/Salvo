@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import type { ContractV1 } from "@salvo/contracts";
-import { buildContractV1 } from "@salvo/contracts";
 import { createDbPool, SalvoRepository, type DbRun, type DbRunEvent } from "@salvo/db";
 import { evaluateRun } from "@salvo/evaluation";
 import {
@@ -12,6 +11,12 @@ import {
   isTerminalRunStatus,
   resolveLlmProviderAndModel
 } from "@salvo/shared";
+import {
+  buildHeuristicContract,
+  collectWorkspaceSnapshot,
+  planContract,
+  resolveContractPlannerConfig
+} from "./contract-planner";
 
 await initializeSecrets();
 
@@ -137,22 +142,73 @@ class OrchestratorDaemon {
       workspace_id: task.workspace_id
     });
 
-    const contract = buildContractV1({
+    const heuristicContract = buildHeuristicContract({
       contractId: randomUUID(),
       taskId: task.id,
       workspaceId: task.workspace_id,
       request: task.original_request,
-      taskTitle: task.title,
-      preferredProfile: "builder"
+      taskTitle: task.title
     });
+    const [workspace, memoryContext, integrationConfigs] = await Promise.all([
+      this.repo.getWorkspace(task.workspace_id),
+      this.repo.listContractMemoryPromptContext(
+        task.workspace_id,
+        heuristicContract.family_key,
+        5
+      ),
+      this.repo.listIntegrationConfigs()
+    ]);
+    const workspaceContext = workspace ?? {
+      id: task.workspace_id,
+      name: "default",
+      local_path: process.env.SALVO_WORKSPACE_ROOT ?? process.cwd()
+    };
+    const workspaceEntries = await collectWorkspaceSnapshot(workspaceContext.local_path);
+    const plannedContract = await planContract({
+      task,
+      workspace: workspaceContext,
+      baseContract: heuristicContract,
+      workspaceEntries,
+      memories: memoryContext,
+      llmConfig: resolveContractPlannerConfig({
+        integrationConfigs,
+        env: process.env
+      })
+    });
+    const contract = plannedContract.contract;
 
-    const memoryContext = await this.repo.listContractMemoryContext(
+    const memoryReferenceContext = await this.repo.listContractMemoryContext(
       task.workspace_id,
       contract.family_key,
       5
     );
-    contract.context.memory_excerpt_ids = memoryContext.map((entry) => entry.id);
-    contract.context.recent_runs = [...new Set(memoryContext.flatMap((entry) => entry.source_run_ids))];
+    contract.context.memory_excerpt_ids = [
+      ...new Set(memoryReferenceContext.map((entry) => entry.id))
+    ];
+    contract.context.recent_runs = [
+      ...new Set(memoryReferenceContext.flatMap((entry) => entry.source_run_ids))
+    ];
+
+    if (plannedContract.source === "fallback") {
+      await this.repo.createAuditEvent({
+        actor: `system:${workerId}`,
+        action: "contract.llm_fallback",
+        target: task.id,
+        metadata: {
+          workspace_id: task.workspace_id,
+          contract_family_key: heuristicContract.family_key,
+          reason: plannedContract.reason ?? "unknown"
+        }
+      });
+    }
+    logger.info("contract planned", {
+      task_id: task.id,
+      workspace_id: task.workspace_id,
+      contract_source: plannedContract.source,
+      family_key: contract.family_key,
+      risk: contract.risk,
+      agent_profile: contract.agent_profile
+    });
 
     const requiresManualReview = contract.risk === "high" && !task.approved_at;
     const budgetCheck = await this.checkBudgetCap(task, contract);

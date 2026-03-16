@@ -16,6 +16,16 @@ export type DbWorkspace = {
   created_at: string;
 };
 
+export type DbContractMemoryPrompt = {
+  id: string;
+  title: string;
+  summary: string;
+  body_markdown: string;
+  confidence: number;
+  review_status: "unreviewed" | "accepted" | "rejected";
+  source_run_ids: string[];
+};
+
 export type DbTask = {
   id: string;
   workspace_id: string;

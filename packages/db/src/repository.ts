@@ -28,6 +28,7 @@ import type {
   DbAuditEvent,
   DbBudgetLimit,
   DbBudgetStatus,
+  DbContractMemoryPrompt,
   DbIntegrationConfig,
   DbIntegrationKey,
   DbRun,
@@ -234,6 +235,18 @@ export class SalvoRepository {
     );
 
     return result.rows;
+  }
+
+  async getWorkspace(workspaceId: string): Promise<DbWorkspace | null> {
+    const result = await this.pool.query<DbWorkspace>(
+      `select *
+       from public.salvo_workspaces
+       where id = $1
+       limit 1`,
+      [workspaceId]
+    );
+
+    return result.rows[0] ?? null;
   }
 
   async createTask(input: CreateTaskInput): Promise<DbTask> {
@@ -2106,6 +2119,32 @@ export class SalvoRepository {
       source_run_ids: string[];
     }>(
       `select id, confidence, review_status, source_run_ids
+       from public.salvo_memories
+       where workspace_id = $1
+         and contract_family_key = $2
+         and review_status = 'accepted'
+       order by confidence desc, created_at desc
+       limit $3`,
+      [workspaceId, contractFamilyKey, limit]
+    );
+
+    return result.rows;
+  }
+
+  async listContractMemoryPromptContext(
+    workspaceId: string,
+    contractFamilyKey: string,
+    limit = 5
+  ): Promise<DbContractMemoryPrompt[]> {
+    const result = await this.pool.query<DbContractMemoryPrompt>(
+      `select
+         id,
+         title,
+         summary,
+         body_markdown,
+         confidence,
+         review_status,
+         source_run_ids
        from public.salvo_memories
        where workspace_id = $1
          and contract_family_key = $2
