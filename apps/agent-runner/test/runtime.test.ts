@@ -166,7 +166,8 @@ test("buildRunnerPrompts includes contract and workspace context", () => {
     }
   });
 
-  assert.equal(prompts.systemPrompt.includes("strict JSON object"), true);
+  assert.equal(prompts.systemPrompt.includes("## Scope Boundaries"), true);
+  assert.equal(prompts.systemPrompt.includes("salvo_complete"), true);
   assert.equal(prompts.userPrompt.includes("file: README.md"), true);
   assert.equal(prompts.userPrompt.includes("\"required_artifacts\""), true);
 });

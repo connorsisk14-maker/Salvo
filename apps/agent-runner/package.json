@@ -12,6 +12,7 @@
   "dependencies": {
     "@salvo/contracts": "workspace:*",
     "@salvo/db": "workspace:*",
+    "@salvo/llm": "workspace:*",
     "@salvo/shared": "workspace:*",
     "@salvo/tools": "workspace:*"
   },

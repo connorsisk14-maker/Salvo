@@ -1,6 +1,7 @@
 import type { ContractV1 } from "@salvo/contracts";
 import { validateContractV1 } from "@salvo/contracts";
 import type { DbIntegrationConfig, DbRun, DbTask } from "@salvo/db";
+import { buildSystemPrompt } from "@salvo/llm";
 import {
   resolveLlmProviderAndModel,
   usageCostUsd,
@@ -171,15 +172,9 @@ export function buildRunnerPrompts(input: {
   systemPrompt: string;
   userPrompt: string;
 } {
-  const systemPrompt = [
-    "You are the Salvo agent runner.",
-    "Return a strict JSON object with keys: plan_steps, summary, artifacts, learnings.",
-    "Do not wrap the JSON in markdown fences.",
-    "Artifacts must stay within the allowed write scope from the contract.",
-    "Artifacts should satisfy the contract deliverables and reflect the task request accurately.",
-    "Each learning must include type, title, and body.",
-    "Plan steps should be concise, execution-oriented strings."
-  ].join(" ");
+  const systemPrompt = buildSystemPrompt({
+    contract: input.contract
+  });
 
   const userPrompt = [
     `Run ID: ${input.run.id}`,

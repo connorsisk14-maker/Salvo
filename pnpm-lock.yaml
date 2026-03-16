@@ -16,6 +16,9 @@ importers:
       '@salvo/db':
         specifier: workspace:*
         version: link:../../packages/db
+      '@salvo/llm':
+        specifier: workspace:*
+        version: link:../../packages/llm
       '@salvo/shared':
         specifier: workspace:*
         version: link:../../packages/shared
@@ -226,6 +229,10 @@ importers:
         version: 5.9.3
 
   packages/llm:
+    dependencies:
+      '@salvo/contracts':
+        specifier: workspace:*
+        version: link:../contracts
     devDependencies:
       '@types/node':
         specifier: ^22.15.2
