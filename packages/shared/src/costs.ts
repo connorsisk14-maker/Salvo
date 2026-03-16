@@ -1,4 +1,7 @@
+import { resolveModelPricing, type LlmProvider } from "@salvo/llm";
 import type { AgentProfile } from "./runtime";
+
+export type { LlmProvider } from "@salvo/llm";
 
 const MODEL_BY_PROVIDER_AND_PROFILE = {
   openai: {
@@ -21,42 +24,12 @@ const MODEL_BY_PROVIDER_AND_PROFILE = {
   }
 } as const satisfies Record<LlmProvider, Record<AgentProfile, string>>;
 
-const MODEL_PRICING_USD_PER_1M = [
-  {
-    matchers: ["gpt-5-mini"],
-    input: 0.3,
-    output: 1.2
-  },
-  {
-    matchers: ["gpt-5-nano"],
-    input: 0.05,
-    output: 0.2
-  },
-  {
-    matchers: ["gpt-5"],
-    input: 1.25,
-    output: 10
-  },
-  {
-    matchers: ["claude-3-5-haiku", "claude-3-haiku"],
-    input: 0.8,
-    output: 4
-  },
-  {
-    matchers: ["claude-3-5-sonnet", "claude-3-7-sonnet", "claude-sonnet-4"],
-    input: 3,
-    output: 15
-  }
-] as const;
-
 const OUTPUT_TOKEN_ESTIMATE_BY_PROFILE = {
   builder: 1_800,
   researcher: 2_800,
   debugger: 1_600,
   documenter: 1_200
 } as const satisfies Record<AgentProfile, number>;
-
-export type LlmProvider = "anthropic" | "openai" | "custom";
 
 function readString(config: Record<string, unknown>, key: string, fallback = ""): string {
   const value = config[key];
@@ -93,16 +66,13 @@ export function resolveLlmProviderAndModel(input: {
 }
 
 export function usageCostUsd(model: string, inputTokens: number, outputTokens: number): number {
-  const normalizedModel = model.toLowerCase();
-  const pricing = MODEL_PRICING_USD_PER_1M.find((entry) =>
-    entry.matchers.some((matcher) => normalizedModel.includes(matcher))
-  );
+  const pricing = resolveModelPricing(model);
   if (!pricing) {
     return 0;
   }
 
-  const inputCost = (inputTokens / 1_000_000) * pricing.input;
-  const outputCost = (outputTokens / 1_000_000) * pricing.output;
+  const inputCost = (inputTokens / 1_000_000) * pricing.inputUsdPer1mTokens;
+  const outputCost = (outputTokens / 1_000_000) * pricing.outputUsdPer1mTokens;
   return Number((inputCost + outputCost).toFixed(6));
 }
 

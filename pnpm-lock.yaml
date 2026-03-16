@@ -222,7 +222,20 @@ importers:
         specifier: ^5.8.2
         version: 5.9.3
 
+  packages/llm:
+    devDependencies:
+      '@types/node':
+        specifier: ^22.15.2
+        version: 22.19.15
+      typescript:
+        specifier: ^5.8.2
+        version: 5.9.3
+
   packages/shared:
+    dependencies:
+      '@salvo/llm':
+        specifier: workspace:*
+        version: link:../llm
     devDependencies:
       '@types/node':
         specifier: ^22.15.2
