@@ -5,6 +5,7 @@ import { createReadStream } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { createDbPool, SalvoRepository } from "@salvo/db";
+import { BackupAlreadyRunningError, BackupManager } from "@salvo/shared";
 import { z } from "zod";
 
 const apiPort = Number(process.env.SALVO_API_PORT ?? 8787);
@@ -426,6 +427,7 @@ function auditActor(request: {
 export async function buildServer() {
   const pool = createDbPool();
   const repo = new SalvoRepository(pool);
+  const backupManager = new BackupManager();
   await repo.ensureWorkspace("default", process.env.SALVO_WORKSPACE_ROOT ?? process.cwd());
 
   const rateLimitState = new Map<string, RateLimitEntry>();
@@ -550,6 +552,10 @@ export async function buildServer() {
       threshold_seconds: researchThresholdSeconds,
       metadata: heartbeat.metadata_json
     };
+  });
+
+  app.get("/backups/status", async () => {
+    return backupManager.getStatus();
   });
 
   app.get("/integrations", async () => {
@@ -1279,6 +1285,49 @@ export async function buildServer() {
       }
     }
   );
+
+  app.post("/control/backup", async (req, reply) => {
+    try {
+      const result = await backupManager.runManualBackup();
+      await repo.createAuditEvent({
+        actor: auditActor(req),
+        action: "backup.triggered",
+        target: result.backup?.path ?? "manual-backup",
+        metadata: {
+          trigger: result.trigger,
+          started_at: result.started_at,
+          completed_at: result.completed_at,
+          backup_size_bytes: result.backup?.size_bytes ?? null
+        }
+      });
+      return {
+        ok: true,
+        result
+      };
+    } catch (error) {
+      if (error instanceof BackupAlreadyRunningError) {
+        const runningError = error as BackupAlreadyRunningError;
+        return reply.status(409).send({
+          ok: false,
+          error: "A backup is already running.",
+          running: runningError.lockInfo ?? null
+        });
+      }
+
+      await repo.createAuditEvent({
+        actor: auditActor(req),
+        action: "backup.trigger_failed",
+        target: "manual-backup",
+        metadata: {
+          error: (error as Error).message
+        }
+      });
+      return reply.status(500).send({
+        ok: false,
+        error: (error as Error).message
+      });
+    }
+  });
 
   app.addHook("onClose", async () => {
     await repo.close();

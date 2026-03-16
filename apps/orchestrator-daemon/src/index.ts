@@ -3,7 +3,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { buildContractV1 } from "@salvo/contracts";
 import { createDbPool, SalvoRepository, type DbRun, type DbRunEvent } from "@salvo/db";
 import { evaluateRun } from "@salvo/evaluation";
-import { createLogger, isTerminalRunStatus } from "@salvo/shared";
+import { BackupManager, createLogger, isTerminalRunStatus } from "@salvo/shared";
 
 const workerId = `orchestrator-${randomUUID().slice(0, 8)}`;
 const logger = createLogger({
@@ -13,11 +13,13 @@ const logger = createLogger({
 
 class OrchestratorDaemon {
   private readonly repo: SalvoRepository;
+  private readonly backupManager = new BackupManager();
   private readonly activeRuns = new Map<string, ChildProcess>();
   private claimTimer?: NodeJS.Timeout;
   private staleTimer?: NodeJS.Timeout;
   private cancellationTimer?: NodeJS.Timeout;
   private heartbeatTimer?: NodeJS.Timeout;
+  private backupTimer?: NodeJS.Timeout;
   private stopped = false;
 
   constructor(repo: SalvoRepository) {
@@ -47,9 +49,14 @@ class OrchestratorDaemon {
       void this.publishHeartbeat();
     }, 5_000);
 
+    this.backupTimer = setInterval(() => {
+      void this.backupLoop();
+    }, 60_000);
+
     await this.claimLoop();
     await this.staleLoop();
     await this.cancellationLoop();
+    await this.backupLoop();
   }
 
   async stop(): Promise<void> {
@@ -69,6 +76,9 @@ class OrchestratorDaemon {
     }
     if (this.heartbeatTimer) {
       clearInterval(this.heartbeatTimer);
+    }
+    if (this.backupTimer) {
+      clearInterval(this.backupTimer);
     }
     await this.publishHeartbeat({ state: "stopping" });
     logger.info("daemon stopping", {
@@ -183,6 +193,26 @@ class OrchestratorDaemon {
     const runs = await this.repo.listCancellationRequestedRuns(20);
     for (const run of runs) {
       await this.forceCancelRun(run);
+    }
+  }
+
+  private async backupLoop(): Promise<void> {
+    try {
+      const result = await this.backupManager.runScheduledBackupIfDue();
+      if (!result) {
+        return;
+      }
+
+      logger.info("scheduled backup completed", {
+        started_at: result.started_at,
+        completed_at: result.completed_at,
+        backup_path: result.backup?.path ?? null,
+        backup_size_bytes: result.backup?.size_bytes ?? null
+      });
+    } catch (error) {
+      logger.error("scheduled backup failed", {
+        error
+      });
     }
   }
 

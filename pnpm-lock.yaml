@@ -38,6 +38,9 @@ importers:
       '@salvo/db':
         specifier: workspace:*
         version: link:../../packages/db
+      '@salvo/shared':
+        specifier: workspace:*
+        version: link:../../packages/shared
       fastify:
         specifier: ^5.2.1
         version: 5.8.2

@@ -28,6 +28,10 @@ Copy `.env.example` to `.env` and set:
 - `SALVO_API_TOKEN`: bearer token required by the dashboard and protected API routes
 - `SALVO_LOG_LEVEL`: structured log threshold (`debug`, `info`, `warn`, `error`)
 - `SALVO_LOG_TARGET`: structured log output target (`stdout`, `stderr`, or `split`)
+- `SALVO_BACKUP_DIR`: optional filesystem path for verified database backups
+- `SALVO_BACKUP_HOUR_LOCAL`: daily backup hour in local server time (default `3`)
+- `SALVO_BACKUP_RETENTION_DAILY`: number of daily archives to keep (default `7`)
+- `SALVO_BACKUP_RETENTION_WEEKLY`: number of weekly archives to keep after daily retention (default `4`)
 - `VITE_SALVO_API_URL`: API URL for dashboard (default `http://localhost:8787`)
 
 ## Migrations
@@ -90,6 +94,7 @@ Control-plane health endpoints:
 - `GET /health/orchestrator`
 - `GET /health/research`
 - `POST /control/restart` with body `{ "target": "orchestrator" | "research" | "all" }`
+- `GET /backups/status`, `POST /control/backup` for verified database backups
 - `POST /runs/:id/retry` to re-queue failed/blocked/cancelled run tasks
 - `POST /runs/:id/cancel` (active runs get `run.cancel_requested`; daemon force-cancels and finalizes)
 - `POST /tasks/:id/reject` for `needs_review` tasks
@@ -99,6 +104,8 @@ Control-plane health endpoints:
 - `GET /stream/overview`, `GET /stream/runs/:id` (SSE polling replacement for dashboard updates)
 
 Daemon endpoints are DB-backed via `salvo_daemon_heartbeats` and return `healthy`, `stale`, or `offline`.
+
+Backup automation writes compressed custom-format Postgres dumps, verifies them with `pg_restore --list`, and exposes status in the Control Center page. Recovery steps live in [docs/BACKUPS.md](/Users/connorsisk/Desktop/SALVO/docs/BACKUPS.md).
 
 ## Auditing Completed Work
 

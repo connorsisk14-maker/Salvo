@@ -231,6 +231,13 @@ strong {
   background: #fde8e8;
 }
 
+.status-pending,
+.status-running {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
 .restart-controls {
   margin-top: 0.8rem;
   border-top: 1px solid var(--line);
@@ -253,6 +260,20 @@ strong {
   margin-top: 0.6rem;
   font-family: "IBM Plex Mono", "Menlo", monospace;
   font-size: 0.84rem;
+}
+
+.backup-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 0.7rem;
+  margin-bottom: 0.8rem;
+}
+
+.backup-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-bottom: 0.8rem;
 }
 
 .cost-grid {

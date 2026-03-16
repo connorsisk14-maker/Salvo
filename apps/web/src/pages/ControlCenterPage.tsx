@@ -5,10 +5,13 @@ import {
   cancelTask,
   createTask,
   forceRestartDaemon,
+  getBackupStatus,
   getOrchestratorHealth,
   getResearchHealth,
   listRuns,
   listTasks,
+  triggerBackup,
+  type ApiBackupStatus,
   type ApiDaemonHealth,
   type ApiRestartTarget,
   type ApiRun,
@@ -22,6 +25,13 @@ function renderHeartbeatDate(value?: string): string {
   return new Date(value).toLocaleTimeString();
 }
 
+function renderDateTime(value?: string | null): string {
+  if (!value) {
+    return "-";
+  }
+  return new Date(value).toLocaleString();
+}
+
 export function ControlCenterPage() {
   const [title, setTitle] = useState("Create run summary scaffolding");
   const [request, setRequest] = useState(
@@ -32,9 +42,12 @@ export function ControlCenterPage() {
   const [runs, setRuns] = useState<ApiRun[]>([]);
   const [orchestratorHealth, setOrchestratorHealth] = useState<ApiDaemonHealth | null>(null);
   const [researchHealth, setResearchHealth] = useState<ApiDaemonHealth | null>(null);
+  const [backupStatus, setBackupStatus] = useState<ApiBackupStatus | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [backupSubmitting, setBackupSubmitting] = useState(false);
   const [restartTarget, setRestartTarget] = useState<ApiRestartTarget | null>(null);
   const [restartMessage, setRestartMessage] = useState<string | null>(null);
+  const [backupMessage, setBackupMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const sortedRuns = useMemo(
@@ -44,17 +57,19 @@ export function ControlCenterPage() {
 
   async function refresh() {
     try {
-      const [nextTasks, nextRuns, nextOrchestratorHealth, nextResearchHealth] =
+      const [nextTasks, nextRuns, nextOrchestratorHealth, nextResearchHealth, nextBackupStatus] =
         await Promise.all([
           listTasks(),
           listRuns(),
           getOrchestratorHealth(),
-          getResearchHealth()
+          getResearchHealth(),
+          getBackupStatus()
         ]);
       setTasks(nextTasks);
       setRuns(nextRuns);
       setOrchestratorHealth(nextOrchestratorHealth);
       setResearchHealth(nextResearchHealth);
+      setBackupStatus(nextBackupStatus);
       setError(null);
     } catch (refreshError) {
       setError((refreshError as Error).message);
@@ -122,6 +137,25 @@ export function ControlCenterPage() {
       setRestartMessage(`Restart failed: ${(restartError as Error).message}`);
     } finally {
       setRestartTarget(null);
+    }
+  }
+
+  async function onTriggerBackup() {
+    setBackupSubmitting(true);
+    try {
+      const response = await triggerBackup();
+      if (!response.ok || !response.result) {
+        throw new Error(response.error ?? "Backup trigger failed.");
+      }
+
+      setBackupMessage(
+        `Backup verified at ${renderDateTime(response.result.completed_at)} (${response.result.backup?.size_bytes ?? 0} bytes).`
+      );
+      await refresh();
+    } catch (backupError) {
+      setBackupMessage(`Backup failed: ${(backupError as Error).message}`);
+    } finally {
+      setBackupSubmitting(false);
     }
   }
 
@@ -216,6 +250,86 @@ export function ControlCenterPage() {
           </div>
           {restartMessage ? <p className="muted restart-note">{restartMessage}</p> : null}
         </details>
+      </section>
+
+      <section className="panel">
+        <div className="health-card-head">
+          <h2>Backups</h2>
+          <span className={`status-pill status-${backupStatus?.state ?? "pending"}`}>
+            {backupStatus?.state ?? "pending"}
+          </span>
+        </div>
+        <div className="backup-grid">
+          <article className="health-card">
+            <h3>Schedule</h3>
+            <p className="muted">Storage: <span className="mono">{backupStatus?.storage_dir ?? "-"}</span></p>
+            <p className="muted">Next run: {renderDateTime(backupStatus?.next_scheduled_at)}</p>
+            <p className="muted">
+              Retention: {backupStatus?.retention.daily ?? "-"} daily / {backupStatus?.retention.weekly ?? "-"} weekly
+            </p>
+            <p className="muted">Hour: {backupStatus?.schedule_hour_local ?? "-"}:00 local</p>
+          </article>
+
+          <article className="health-card">
+            <h3>Latest Result</h3>
+            <p className="muted">Started: {renderDateTime(backupStatus?.last_run?.started_at)}</p>
+            <p className="muted">Completed: {renderDateTime(backupStatus?.last_run?.completed_at)}</p>
+            <p className="muted">Trigger: {backupStatus?.last_run?.trigger ?? "-"}</p>
+            <p className="muted">
+              Archive: <span className="mono">{backupStatus?.last_run?.backup?.file_name ?? "-"}</span>
+            </p>
+            <p className="muted">
+              Error: {backupStatus?.last_run?.success === false ? backupStatus.last_run.error : "-"}
+            </p>
+          </article>
+        </div>
+        <div className="backup-actions">
+          <button
+            className="button-link"
+            disabled={backupSubmitting || backupStatus?.state === "running"}
+            onClick={() => {
+              void onTriggerBackup();
+            }}
+            type="button"
+          >
+            {backupSubmitting ? "Running backup..." : "Run backup now"}
+          </button>
+          {backupStatus?.running ? (
+            <p className="muted">
+              Running: {backupStatus.running.trigger} by pid {backupStatus.running.pid} since{" "}
+              {renderDateTime(backupStatus.running.started_at)}
+            </p>
+          ) : null}
+          {backupMessage ? <p className="muted restart-note">{backupMessage}</p> : null}
+        </div>
+
+        <table className="grid-table">
+          <thead>
+            <tr>
+              <th>Backup</th>
+              <th>Created</th>
+              <th>Verified</th>
+              <th>Size</th>
+            </tr>
+          </thead>
+          <tbody>
+            {(backupStatus?.recent_backups ?? []).map((backup) => (
+              <tr key={backup.path}>
+                <td className="mono">{backup.file_name}</td>
+                <td>{renderDateTime(backup.created_at)}</td>
+                <td>{renderDateTime(backup.verified_at)}</td>
+                <td>{backup.size_bytes.toLocaleString()} bytes</td>
+              </tr>
+            ))}
+            {backupStatus?.recent_backups.length ? null : (
+              <tr>
+                <td colSpan={4} className="muted">
+                  No backups recorded yet.
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
       </section>
 
       <section className="panel">

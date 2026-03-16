@@ -65,6 +65,45 @@ export type ApiActionResponse = {
   error?: string;
 };
 
+export type ApiBackupFileRecord = {
+  file_name: string;
+  path: string;
+  created_at: string;
+  size_bytes: number;
+  verified_at: string;
+};
+
+export type ApiBackupRunRecord = {
+  trigger: "scheduled" | "manual";
+  started_at: string;
+  completed_at: string;
+  success: boolean;
+  error: string | null;
+  backup: ApiBackupFileRecord | null;
+};
+
+export type ApiBackupStatus = {
+  state: "pending" | "running" | "healthy" | "stale" | "error";
+  storage_dir: string;
+  schedule_hour_local: number;
+  next_scheduled_at: string;
+  retention: {
+    daily: number;
+    weekly: number;
+  };
+  running: {
+    pid: number;
+    trigger: "scheduled" | "manual";
+    started_at: string;
+  } | null;
+  last_run: ApiBackupRunRecord | null;
+  recent_backups: ApiBackupFileRecord[];
+};
+
+export type ApiBackupTriggerResponse = ApiActionResponse & {
+  result?: ApiBackupRunRecord;
+};
+
 export type ApiResearchDoc = {
   id: string;
   workspace_id: string;
@@ -331,6 +370,10 @@ export function getResearchHealth(): Promise<ApiDaemonHealth> {
   return request<ApiDaemonHealth>("/health/research");
 }
 
+export function getBackupStatus(): Promise<ApiBackupStatus> {
+  return request<ApiBackupStatus>("/backups/status");
+}
+
 export function listIntegrations(): Promise<ApiIntegration[]> {
   return request<ApiIntegration[]>("/integrations");
 }
@@ -355,6 +398,12 @@ export function forceRestartDaemon(
   return request<ApiRestartResponse>("/control/restart", {
     method: "POST",
     body: JSON.stringify({ target })
+  });
+}
+
+export function triggerBackup(): Promise<ApiBackupTriggerResponse> {
+  return request<ApiBackupTriggerResponse>("/control/backup", {
+    method: "POST"
   });
 }
 
