@@ -58,6 +58,8 @@ export type LlmConfig = {
   apiKey: string;
   baseUrl: string;
   model: string;
+  maxTokens?: number;
+  temperature?: number;
   timeoutMs?: number;
   headers?: Record<string, string>;
 };
@@ -115,3 +117,24 @@ export function resolveModelPricing(model: string): LlmPricing | null {
 
   return null;
 }
+
+export type AnthropicToolDefinition = {
+  name: string;
+  description: string;
+  input_schema: Record<string, unknown>;
+};
+
+export type AnthropicMessageRequest = {
+  model: string;
+  max_tokens: number;
+  temperature?: number;
+  system?: string;
+  messages: Array<{
+    role: "user" | "assistant";
+    content: string | Array<
+      | { type: "text"; text: string }
+      | { type: "tool_result"; tool_use_id: string; content: string; is_error?: boolean }
+    >;
+  }>;
+  tools?: AnthropicToolDefinition[];
+};
