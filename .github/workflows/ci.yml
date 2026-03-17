@@ -27,6 +27,10 @@ jobs:
       SALVO_TEST_DATABASE_URL: postgresql://salvo:salvo@localhost:54329/salvo_test
       SALVO_WORKSPACE_ROOT: ${{ github.workspace }}/.salvo-workspace
       SALVO_E2E_API_URL: http://localhost:8787
+      SALVO_LLM_PROVIDER: anthropic
+      SALVO_LLM_API_KEY: test-key
+      SALVO_LLM_BASE_URL: http://127.0.0.1:9797
+      SALVO_FAKE_LLM_PORT: 9797
 
     steps:
       - name: Checkout
@@ -69,6 +73,8 @@ jobs:
         run: |
           set -euo pipefail
 
+          node scripts/fake-llm-server.mjs > /tmp/salvo-fake-llm.log 2>&1 &
+          FAKE_LLM_PID=$!
           pnpm --filter @salvo/orchestrator-api start > /tmp/salvo-api.log 2>&1 &
           API_PID=$!
           pnpm --filter @salvo/orchestrator-daemon start > /tmp/salvo-orchestrator.log 2>&1 &
@@ -77,7 +83,7 @@ jobs:
           RESEARCH_PID=$!
 
           cleanup() {
-            kill "$API_PID" "$ORCH_PID" "$RESEARCH_PID" >/dev/null 2>&1 || true
+            kill "$FAKE_LLM_PID" "$API_PID" "$ORCH_PID" "$RESEARCH_PID" >/dev/null 2>&1 || true
           }
           trap cleanup EXIT
 
@@ -94,6 +100,8 @@ jobs:
       - name: Dump daemon logs on failure
         if: failure()
         run: |
+          echo "=== fake-llm ==="
+          cat /tmp/salvo-fake-llm.log || true
           echo "=== orchestrator-api ==="
           cat /tmp/salvo-api.log || true
           echo "=== orchestrator-daemon ==="

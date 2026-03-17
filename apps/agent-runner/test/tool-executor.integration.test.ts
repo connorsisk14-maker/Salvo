@@ -156,4 +156,124 @@ if (!databaseUrl) {
     assert.equal(artifacts[0]?.artifact_type, "markdown");
     assert.equal(artifacts[0]?.metadata_json.label, "run-summary.md");
   });
+
+  test("run_command persists tool results and required test evidence", async () => {
+    const { task, run } = await createBasicRun();
+    const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "salvo-tool-executor-"));
+    const policy = buildToolPolicy(workspaceRoot, {
+      allowedReadPaths: ["."],
+      allowedWritePaths: ["."],
+      forbiddenPaths: [],
+      allowedCommandCwds: ["."],
+      allowedCommands: ["echo"],
+      commandTimeoutMs: 5_000
+    });
+    const filesystem = new FilesystemAdapter(workspaceRoot, policy);
+    const command = new CommandAdapter(policy);
+
+    const outcome = await executeToolUse({
+      block: {
+        type: "tool_use",
+        id: "cmd-1",
+        name: "run_command",
+        input: {
+          command: "echo",
+          args: ["salvo-test"]
+        }
+      },
+      workspaceRoot,
+      requiredTestCommands: new Set(["echo salvo-test"]),
+      deps: {
+        readFile: (targetPath) => filesystem.readFile(targetPath),
+        writeFile: (targetPath, content) => filesystem.writeFile(targetPath, content),
+        listDirectory: (targetPath) => filesystem.listDirectory(targetPath),
+        runCommand: (cmd, args, cwd, timeoutMs) => command.run(cmd, args, cwd, timeoutMs)
+      },
+      persistence: {
+        appendRunEvent: (eventType, level, payload) => repo.appendRunEvent(run.id, eventType, level, payload).then(() => undefined),
+        createArtifact: (params) =>
+          repo.createArtifact({
+            runId: run.id,
+            taskId: task.id,
+            artifactType: params.artifactType,
+            path: params.path,
+            metadataJson: params.metadataJson
+          })
+      }
+    });
+
+    assert.equal(outcome.policyDenied, false);
+    assert.deepEqual(outcome.requiredTestCommandResult, {
+      command: "echo salvo-test",
+      evidence: {
+        command: "echo salvo-test",
+        exit_code: 0,
+        stdout: "salvo-test",
+        stderr: "",
+        duration_ms: outcome.requiredTestCommandResult?.evidence.duration_ms
+      }
+    });
+
+    const events = await repo.listRunEvents(run.id);
+    assert.deepEqual(
+      events.map((event) => event.event_type),
+      ["tool.called", "tool.result"]
+    );
+  });
+
+  test("run_command deny persists policy.denied without artifacts", async () => {
+    const { task, run } = await createBasicRun();
+    const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "salvo-tool-executor-"));
+    const policy = buildToolPolicy(workspaceRoot, {
+      allowedReadPaths: ["."],
+      allowedWritePaths: ["."],
+      forbiddenPaths: [],
+      allowedCommandCwds: ["."],
+      allowedCommands: ["echo"],
+      commandTimeoutMs: 5_000
+    });
+    const filesystem = new FilesystemAdapter(workspaceRoot, policy);
+    const command = new CommandAdapter(policy);
+
+    const outcome = await executeToolUse({
+      block: {
+        type: "tool_use",
+        id: "cmd-2",
+        name: "run_command",
+        input: {
+          command: "pnpm",
+          args: ["test"]
+        }
+      },
+      workspaceRoot,
+      requiredTestCommands: new Set(["pnpm test"]),
+      deps: {
+        readFile: (targetPath) => filesystem.readFile(targetPath),
+        writeFile: (targetPath, content) => filesystem.writeFile(targetPath, content),
+        listDirectory: (targetPath) => filesystem.listDirectory(targetPath),
+        runCommand: (cmd, args, cwd, timeoutMs) => command.run(cmd, args, cwd, timeoutMs)
+      },
+      persistence: {
+        appendRunEvent: (eventType, level, payload) => repo.appendRunEvent(run.id, eventType, level, payload).then(() => undefined),
+        createArtifact: (params) =>
+          repo.createArtifact({
+            runId: run.id,
+            taskId: task.id,
+            artifactType: params.artifactType,
+            path: params.path,
+            metadataJson: params.metadataJson
+          })
+      }
+    });
+
+    assert.equal(outcome.policyDenied, true);
+
+    const events = await repo.listRunEvents(run.id);
+    assert.deepEqual(
+      events.map((event) => event.event_type),
+      ["tool.called", "policy.denied"]
+    );
+    const artifacts = await repo.listArtifactsForRun(run.id);
+    assert.equal(artifacts.length, 0);
+  });
 }

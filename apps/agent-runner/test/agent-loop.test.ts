@@ -116,6 +116,57 @@ test("runAgentLoop completes after tool execution and accumulates usage", async 
   assert.equal(events.filter((event) => event === "usage.reported").length, 2);
 });
 
+test("runAgentLoop executes multiple tool calls from a single assistant turn", async () => {
+  const contract = buildContract();
+  const executedTools: string[] = [];
+
+  const result = await runAgentLoop({
+    provider: "anthropic",
+    model: "claude-sonnet-4",
+    systemPrompt: "system",
+    userPrompt: "user",
+    contract,
+    workspaceRoot: "/tmp/workspace",
+    createMessage: async () => ({
+      provider: "anthropic",
+      model: "claude-sonnet-4",
+      stopReason: "tool_use",
+      usage: { inputTokens: 20, outputTokens: 10 },
+      content: [
+        {
+          type: "tool_use",
+          id: "tool-1",
+          name: "read_file",
+          input: { path: "README.md" }
+        },
+        {
+          type: "tool_use",
+          id: "tool-2",
+          name: "salvo_complete",
+          input: completionPayload()
+        }
+      ],
+      raw: {}
+    }),
+    executeToolUse: async (block): Promise<ToolExecutionOutcome> => {
+      executedTools.push(block.name);
+      return {
+        toolResult: {
+          type: "tool_result",
+          toolUseId: block.id,
+          content: JSON.stringify({ ok: true })
+        },
+        completionPayload: block.name === "salvo_complete" ? completionPayload() : undefined,
+        policyDenied: false
+      };
+    },
+    appendRunEvent: async () => {}
+  });
+
+  assert.equal(result.finalPayload.status, "completed");
+  assert.deepEqual(executedTools, ["read_file", "salvo_complete"]);
+});
+
 test("runAgentLoop blocks when the tool call limit is exceeded", async () => {
   const contract = buildContract();
   contract.constraints.max_tool_calls = 1;
@@ -381,4 +432,167 @@ test("runAgentLoop can complete from a plain JSON text response", async () => {
   assert.equal(result.finalPayload.deliverables[0], "run-summary.md");
   assert.equal(executedBlocks.some((block) => block.name === "write_file"), true);
   assert.equal(executedBlocks.some((block) => block.name === "run_command"), true);
+});
+
+test("runAgentLoop supports a custom completion tool name", async () => {
+  const contract = buildContract();
+
+  const result = await runAgentLoop({
+    provider: "anthropic",
+    model: "claude-sonnet-4",
+    systemPrompt: "system",
+    userPrompt: "user",
+    contract,
+    workspaceRoot: "/tmp/workspace",
+    completionToolName: "submit_result",
+    createMessage: async () => ({
+      provider: "anthropic",
+      model: "claude-sonnet-4",
+      stopReason: "tool_use",
+      usage: { inputTokens: 10, outputTokens: 5 },
+      content: [
+        {
+          type: "tool_use",
+          id: "tool-1",
+          name: "submit_result",
+          input: completionPayload()
+        }
+      ],
+      raw: {}
+    }),
+    executeToolUse: async (block): Promise<ToolExecutionOutcome> => ({
+      toolResult: {
+        type: "tool_result",
+        toolUseId: block.id,
+        content: JSON.stringify({ ok: true })
+      },
+      completionPayload: completionPayload(),
+      policyDenied: false
+    }),
+    appendRunEvent: async () => {}
+  });
+
+  assert.equal(result.finalPayload.status, "completed");
+  assert.equal(result.exitReason, "salvo_complete");
+});
+
+test("runAgentLoop blocks plain JSON fallback when artifact persistence is denied", async () => {
+  const contract = buildContract();
+
+  const result = await runAgentLoop({
+    provider: "anthropic",
+    model: "claude-sonnet-4",
+    systemPrompt: "system",
+    userPrompt: "user",
+    contract,
+    workspaceRoot: "/tmp/workspace",
+    createMessage: async () => ({
+      provider: "anthropic",
+      model: "claude-sonnet-4",
+      stopReason: "end_turn",
+      usage: { inputTokens: 10, outputTokens: 5 },
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            plan_steps: ["Write summary"],
+            summary: "Done.",
+            artifacts: [
+              {
+                path: "run-summary.md",
+                content: "# Done"
+              }
+            ],
+            learnings: []
+          })
+        }
+      ],
+      raw: {}
+    }),
+    executeToolUse: async (block): Promise<ToolExecutionOutcome> => ({
+      toolResult: {
+        type: "tool_result",
+        toolUseId: block.id,
+        content: JSON.stringify({ ok: false }),
+        isError: true
+      },
+      requiredTestCommandResult:
+        block.name === "run_command"
+          ? {
+              command: String(block.input.command),
+              evidence: {
+                command: String(block.input.command),
+                exit_code: 0
+              }
+            }
+          : undefined,
+      policyDenied: block.name === "write_file"
+    }),
+    appendRunEvent: async () => {}
+  });
+
+  assert.equal(result.finalPayload.status, "blocked");
+  assert.equal(result.exitReason, "policy_denied");
+});
+
+test("runAgentLoop preserves denied required test evidence from plain JSON fallback", async () => {
+  const contract = buildContract();
+
+  const result = await runAgentLoop({
+    provider: "anthropic",
+    model: "claude-sonnet-4",
+    systemPrompt: "system",
+    userPrompt: "user",
+    contract,
+    workspaceRoot: "/tmp/workspace",
+    createMessage: async () => ({
+      provider: "anthropic",
+      model: "claude-sonnet-4",
+      stopReason: "end_turn",
+      usage: { inputTokens: 10, outputTokens: 5 },
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            plan_steps: ["Write summary"],
+            summary: "Done.",
+            artifacts: [
+              {
+                path: "run-summary.md",
+                content: "# Done"
+              }
+            ],
+            learnings: []
+          })
+        }
+      ],
+      raw: {}
+    }),
+    executeToolUse: async (block): Promise<ToolExecutionOutcome> => ({
+      toolResult: {
+        type: "tool_result",
+        toolUseId: block.id,
+        content: JSON.stringify({ ok: !block.name.startsWith("run_command") }),
+        isError: block.name === "run_command" ? true : undefined
+      },
+      requiredTestCommandResult:
+        block.name === "run_command"
+          ? {
+              command: "echo salvo-test",
+              evidence: {
+                command: "echo salvo-test",
+                denied: true,
+                reason: "command_not_allowlisted",
+                message: "blocked"
+              }
+            }
+          : undefined,
+      policyDenied: block.name === "run_command"
+    }),
+    appendRunEvent: async () => {}
+  });
+
+  assert.equal(result.finalPayload.status, "blocked");
+  assert.equal(result.finalPayload.evidence.tests_run[0]?.command, "echo salvo-test");
+  assert.equal(result.finalPayload.evidence.tests_run[0]?.denied, true);
 });

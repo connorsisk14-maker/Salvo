@@ -3,7 +3,7 @@ import { mkdir } from "node:fs/promises";
 import { createDbPool, SalvoRepository } from "@salvo/db";
 import { buildToolDefinitions, executeToolUse, LlmClient } from "@salvo/llm";
 import { CommandAdapter, FilesystemAdapter } from "@salvo/tools";
-import { createLogger, initializeSecrets, type RunExitReason, type RunEventType } from "@salvo/shared";
+import { createLogger, initializeSecrets, type RunEventType } from "@salvo/shared";
 import {
   buildRunnerPrompts,
   collectPromptContext,
@@ -25,24 +25,6 @@ function parseArg(flag: string): string | undefined {
     return undefined;
   }
   return process.argv[idx + 1];
-}
-
-function mapExitReason(reason: string): RunExitReason {
-  switch (reason) {
-    case "salvo_complete":
-      return "success";
-    case "policy_denied":
-      return "policy_violation";
-    case "max_runtime":
-    case "max_tokens":
-      return "timeout";
-    case "tool_call_limit":
-      return "policy_violation";
-    case "end_turn":
-      return "unknown";
-    default:
-      return "unknown";
-  }
 }
 
 async function main(): Promise<void> {
@@ -162,12 +144,8 @@ async function main(): Promise<void> {
             messages,
             buildToolDefinitions(contractJson)
           ),
-        executeToolUse: async (block) => {
-          await trackToolCall({
-            tool: block.name
-          });
-
-          return executeToolUse({
+        executeToolUse: async (block) =>
+          executeToolUse({
             block,
             workspaceRoot,
             requiredTestCommands: new Set(contractJson.success_criteria.required_test_commands),
@@ -195,8 +173,7 @@ async function main(): Promise<void> {
                   metadataJson: params.metadataJson
                 })
             }
-          });
-        },
+          }),
         appendRunEvent: (eventType, level, payload) =>
           repo.appendRunEvent(
             run.id,
@@ -208,37 +185,16 @@ async function main(): Promise<void> {
 
       const finalLevel = loopResult.finalPayload.status === "completed" ? "info" : "error";
       await repo.appendRunEvent(run.id, "run.final_payload", finalLevel, loopResult.finalPayload);
-      await repo.transitionRunStatus(
-        run.id,
-        loopResult.finalPayload.status === "completed" ? "completed" : "failed",
-        {
-          endedAt: new Date(),
-          outcomeSummary: loopResult.finalPayload.summary,
-          exitReason:
-            loopResult.finalPayload.status === "completed"
-              ? undefined
-              : mapExitReason(loopResult.exitReason)
-        }
-      );
-      await repo.transitionTaskStatus(
-        task.id,
-        loopResult.finalPayload.status === "completed" ? "completed" : "failed"
-      );
-
-      if (loopResult.finalPayload.status === "completed") {
-        await repo.appendRunEvent(run.id, "run.completed", "info", {
-          summary: loopResult.finalPayload.summary,
-          deliverables: loopResult.finalPayload.deliverables
-        });
-        logger.info("run completed", {
-          task_id: task.id,
-          deliverables: loopResult.finalPayload.deliverables
-        });
-      } else {
+      if (loopResult.finalPayload.status !== "completed") {
         await repo.appendRunEvent(run.id, "run.failed", "error", {
           reason: loopResult.exitReason
         });
         process.exitCode = 1;
+      } else {
+        logger.info("run completed", {
+          task_id: task.id,
+          deliverables: loopResult.finalPayload.deliverables
+        });
       }
       return;
     }
@@ -312,12 +268,6 @@ async function main(): Promise<void> {
             ],
             learnings: llmResult.output.learnings
           });
-          await repo.transitionRunStatus(run.id, "failed", {
-            endedAt: new Date(),
-            outcomeSummary: llmResult.output.summary,
-            exitReason: "policy_violation"
-          });
-          await repo.transitionTaskStatus(task.id, "failed");
           await repo.appendRunEvent(run.id, "run.failed", "error", {
             reason: "policy_denied"
           });
@@ -397,15 +347,6 @@ async function main(): Promise<void> {
       roadblocks: [],
       learnings: llmResult.output.learnings
     });
-    await repo.transitionRunStatus(run.id, "completed", {
-      endedAt: new Date(),
-      outcomeSummary: llmResult.output.summary
-    });
-    await repo.transitionTaskStatus(task.id, "completed");
-    await repo.appendRunEvent(run.id, "run.completed", "info", {
-      summary: llmResult.output.summary,
-      deliverables: createdArtifacts
-    });
     logger.info("run completed", {
       task_id: task.id,
       deliverables: createdArtifacts
@@ -415,11 +356,6 @@ async function main(): Promise<void> {
       task_id: task.id,
       error
     });
-    await repo.transitionRunStatus(run.id, "failed", {
-      endedAt: new Date(),
-      exitReason: "runner_crash"
-    });
-    await repo.transitionTaskStatus(task.id, "failed");
     await repo.appendRunEvent(run.id, "run.failed", "error", {
       error: (error as Error).message
     });
