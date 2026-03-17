@@ -1,8 +1,9 @@
 import path from "node:path";
 import { mkdir } from "node:fs/promises";
 import { createDbPool, SalvoRepository } from "@salvo/db";
+import { buildToolDefinitions, executeToolUse, LlmClient } from "@salvo/llm";
 import { CommandAdapter, FilesystemAdapter } from "@salvo/tools";
-import { createLogger, initializeSecrets } from "@salvo/shared";
+import { createLogger, initializeSecrets, type RunExitReason, type RunEventType } from "@salvo/shared";
 import {
   buildRunnerPrompts,
   collectPromptContext,
@@ -14,6 +15,7 @@ import {
   runLlmGeneration,
   validateRunnerContract
 } from "./runtime";
+import { runAgentLoop } from "./agent-loop";
 
 await initializeSecrets();
 
@@ -23,6 +25,24 @@ function parseArg(flag: string): string | undefined {
     return undefined;
   }
   return process.argv[idx + 1];
+}
+
+function mapExitReason(reason: string): RunExitReason {
+  switch (reason) {
+    case "salvo_complete":
+      return "success";
+    case "policy_denied":
+      return "policy_violation";
+    case "max_runtime":
+    case "max_tokens":
+      return "timeout";
+    case "tool_call_limit":
+      return "policy_violation";
+    case "end_turn":
+      return "unknown";
+    default:
+      return "unknown";
+  }
 }
 
 async function main(): Promise<void> {
@@ -127,6 +147,102 @@ async function main(): Promise<void> {
   };
 
   try {
+    if (llmConfig.provider === "anthropic") {
+      const llmClient = new LlmClient(llmConfig);
+      const loopResult = await runAgentLoop({
+        provider: llmConfig.provider,
+        model: llmConfig.model,
+        systemPrompt: prompts.systemPrompt,
+        userPrompt: prompts.userPrompt,
+        contract: contractJson,
+        workspaceRoot,
+        createMessage: (systemPrompt, messages) =>
+          llmClient.createMessage(
+            systemPrompt,
+            messages,
+            buildToolDefinitions(contractJson)
+          ),
+        executeToolUse: async (block) => {
+          await trackToolCall({
+            tool: block.name
+          });
+
+          return executeToolUse({
+            block,
+            workspaceRoot,
+            requiredTestCommands: new Set(contractJson.success_criteria.required_test_commands),
+            deps: {
+              readFile: (targetPath) => filesystem.readFile(targetPath),
+              writeFile: (targetPath, content) => filesystem.writeFile(targetPath, content),
+              listDirectory: (targetPath) => filesystem.listDirectory(targetPath),
+              runCommand: (commandName, args, cwd, timeoutMs) =>
+                command.run(commandName, args, cwd, timeoutMs)
+            },
+            persistence: {
+              appendRunEvent: (eventType, level, payload) =>
+                repo.appendRunEvent(
+                  run.id,
+                  eventType as RunEventType,
+                  level,
+                  payload
+                ).then(() => undefined),
+              createArtifact: (params) =>
+                repo.createArtifact({
+                  runId: run.id,
+                  taskId: task.id,
+                  artifactType: params.artifactType,
+                  path: params.path,
+                  metadataJson: params.metadataJson
+                })
+            }
+          });
+        },
+        appendRunEvent: (eventType, level, payload) =>
+          repo.appendRunEvent(
+            run.id,
+            eventType as RunEventType,
+            level,
+            payload
+          ).then(() => undefined)
+      });
+
+      const finalLevel = loopResult.finalPayload.status === "completed" ? "info" : "error";
+      await repo.appendRunEvent(run.id, "run.final_payload", finalLevel, loopResult.finalPayload);
+      await repo.transitionRunStatus(
+        run.id,
+        loopResult.finalPayload.status === "completed" ? "completed" : "failed",
+        {
+          endedAt: new Date(),
+          outcomeSummary: loopResult.finalPayload.summary,
+          exitReason:
+            loopResult.finalPayload.status === "completed"
+              ? undefined
+              : mapExitReason(loopResult.exitReason)
+        }
+      );
+      await repo.transitionTaskStatus(
+        task.id,
+        loopResult.finalPayload.status === "completed" ? "completed" : "failed"
+      );
+
+      if (loopResult.finalPayload.status === "completed") {
+        await repo.appendRunEvent(run.id, "run.completed", "info", {
+          summary: loopResult.finalPayload.summary,
+          deliverables: loopResult.finalPayload.deliverables
+        });
+        logger.info("run completed", {
+          task_id: task.id,
+          deliverables: loopResult.finalPayload.deliverables
+        });
+      } else {
+        await repo.appendRunEvent(run.id, "run.failed", "error", {
+          reason: loopResult.exitReason
+        });
+        process.exitCode = 1;
+      }
+      return;
+    }
+
     await trackToolCall({
       tool: "llm",
       provider: llmConfig.provider,
@@ -156,6 +272,8 @@ async function main(): Promise<void> {
 
     const artifacts = normalizeArtifacts(llmResult.output, contractJson);
     const createdArtifacts: string[] = [];
+    const testsRun: Array<{ command: string; exit_code?: number; denied?: boolean }> = [];
+    const commandResults: Record<string, unknown>[] = [];
 
     for (const artifact of artifacts) {
       await trackToolCall({
@@ -194,6 +312,12 @@ async function main(): Promise<void> {
             ],
             learnings: llmResult.output.learnings
           });
+          await repo.transitionRunStatus(run.id, "failed", {
+            endedAt: new Date(),
+            outcomeSummary: llmResult.output.summary,
+            exitReason: "policy_violation"
+          });
+          await repo.transitionTaskStatus(task.id, "failed");
           await repo.appendRunEvent(run.id, "run.failed", "error", {
             reason: "policy_denied"
           });
@@ -220,8 +344,6 @@ async function main(): Promise<void> {
       createdArtifacts.push(artifact.path);
     }
 
-    const testsRun: Array<{ command: string; exit_code?: number; denied?: boolean }> = [];
-    const commandResults: Record<string, unknown>[] = [];
     for (const testCommand of contractJson.success_criteria.required_test_commands) {
       const parts = testCommand.trim().split(/\s+/).filter(Boolean);
       const commandName = parts[0] ?? "echo";
@@ -275,7 +397,11 @@ async function main(): Promise<void> {
       roadblocks: [],
       learnings: llmResult.output.learnings
     });
-
+    await repo.transitionRunStatus(run.id, "completed", {
+      endedAt: new Date(),
+      outcomeSummary: llmResult.output.summary
+    });
+    await repo.transitionTaskStatus(task.id, "completed");
     await repo.appendRunEvent(run.id, "run.completed", "info", {
       summary: llmResult.output.summary,
       deliverables: createdArtifacts
@@ -289,6 +415,11 @@ async function main(): Promise<void> {
       task_id: task.id,
       error
     });
+    await repo.transitionRunStatus(run.id, "failed", {
+      endedAt: new Date(),
+      exitReason: "runner_crash"
+    });
+    await repo.transitionTaskStatus(task.id, "failed");
     await repo.appendRunEvent(run.id, "run.failed", "error", {
       error: (error as Error).message
     });
