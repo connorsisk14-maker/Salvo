@@ -16,6 +16,8 @@ import type {
   CreateAuditEventInput,
   DaemonType,
   CreateContractInput,
+  DbTaskChatMessage,
+  DbTaskChatSession,
   DbIdempotencyKey,
   CreateMemoryInput,
   CreateResearchInput,
@@ -31,6 +33,7 @@ import type {
   DbAgentTrustTier,
   DbBudgetLimit,
   DbBudgetStatus,
+  DbContractMemoryContext,
   DbContractMemoryPrompt,
   DbIntegrationConfig,
   DbIntegrationKey,
@@ -40,6 +43,7 @@ import type {
   DbTask,
   DbWorkspace,
   IdempotentResult,
+  TaskChatProposal,
   ResearchIngestionCandidate,
   RecordEvaluationInput
 } from "./types";
@@ -59,6 +63,50 @@ const CANCELLABLE_RUN_STATUSES = new Set<RunStatus>([
   "running",
   "evaluating"
 ]);
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseTaskChatProposal(payload: Record<string, unknown> | null): TaskChatProposal | null {
+  if (!payload) {
+    return null;
+  }
+  if (!isPlainRecord(payload)) {
+    return null;
+  }
+
+  const title = payload.title;
+  const request = payload.request;
+  const risk = payload.risk;
+  const contractJson = payload.contract_json;
+  const requiresApproval = payload.requires_approval;
+  if (
+    typeof title !== "string" ||
+    title.trim().length === 0 ||
+    typeof request !== "string" ||
+    request.trim().length === 0
+  ) {
+    return null;
+  }
+  if (risk !== "low" && risk !== "medium" && risk !== "high") {
+    return null;
+  }
+  if (!isPlainRecord(contractJson)) {
+    return null;
+  }
+  if (requiresApproval !== undefined && typeof requiresApproval !== "boolean") {
+    return null;
+  }
+
+  return {
+    title: title.trim(),
+    request: request.trim(),
+    risk,
+    requires_approval: requiresApproval ?? risk === "high",
+    contract_json: contractJson
+  };
+}
 
 export class SalvoRepository {
   constructor(private readonly pool: Pool) {}
@@ -615,6 +663,297 @@ export class SalvoRepository {
       await this.completeIdempotentRequest(client, scope, options.idempotencyKey, 200, task);
       return {
         resource: task,
+        duplicate: false,
+        responseStatus: 200
+      };
+    });
+  }
+
+  async createTaskChatSession(workspaceId?: string): Promise<DbTaskChatSession> {
+    const resolvedWorkspaceId = workspaceId ?? (await this.ensureWorkspace()).id;
+    const result = await this.pool.query<DbTaskChatSession>(
+      `insert into public.salvo_task_chat_sessions (
+         workspace_id,
+         status
+       )
+       values ($1, 'active')
+       returning *`,
+      [resolvedWorkspaceId]
+    );
+
+    return this.singleOrThrow(result.rows, "Failed to create task chat session.");
+  }
+
+  async getTaskChatSession(sessionId: string): Promise<DbTaskChatSession | null> {
+    const result = await this.pool.query<DbTaskChatSession>(
+      `select *
+       from public.salvo_task_chat_sessions
+       where id = $1
+       limit 1`,
+      [sessionId]
+    );
+
+    return result.rows[0] ?? null;
+  }
+
+  async listTaskChatMessages(sessionId: string): Promise<DbTaskChatMessage[]> {
+    const result = await this.pool.query<DbTaskChatMessage>(
+      `select *
+       from public.salvo_task_chat_messages
+       where session_id = $1
+       order by id asc`,
+      [sessionId]
+    );
+
+    return result.rows;
+  }
+
+  async saveTaskChatTurn(input: {
+    workspaceId?: string;
+    sessionId?: string;
+    userMessage: string;
+    assistantResponse: string;
+    proposedContract?: TaskChatProposal | null;
+  }): Promise<{ session: DbTaskChatSession; assistantMessage: DbTaskChatMessage }> {
+    return this.withTransaction(async (client) => {
+      let session: DbTaskChatSession;
+      if (input.sessionId) {
+        const sessionResult = await client.query<DbTaskChatSession>(
+          `select *
+           from public.salvo_task_chat_sessions
+           where id = $1
+           for update`,
+          [input.sessionId]
+        );
+        session = this.singleOrThrow(sessionResult.rows, `Task chat session not found: ${input.sessionId}`);
+      } else {
+        const workspaceId = input.workspaceId ?? (await this.ensureWorkspace()).id;
+        const insertedSession = await client.query<DbTaskChatSession>(
+          `insert into public.salvo_task_chat_sessions (
+             workspace_id,
+             status
+           )
+           values ($1, 'active')
+           returning *`,
+          [workspaceId]
+        );
+        session = this.singleOrThrow(insertedSession.rows, "Failed to create task chat session.");
+      }
+
+      await client.query(
+        `insert into public.salvo_task_chat_messages (
+           session_id,
+           role,
+           message_text
+         )
+         values ($1, 'user', $2)`,
+        [session.id, input.userMessage]
+      );
+
+      const proposedContractJson = input.proposedContract
+        ? JSON.stringify(input.proposedContract)
+        : null;
+      const assistantMessageResult = await client.query<DbTaskChatMessage>(
+        `insert into public.salvo_task_chat_messages (
+           session_id,
+           role,
+           message_text,
+           proposed_contract_json
+         )
+         values ($1, 'assistant', $2, $3::jsonb)
+         returning *`,
+        [session.id, input.assistantResponse, proposedContractJson]
+      );
+      const assistantMessage = this.singleOrThrow(
+        assistantMessageResult.rows,
+        "Failed to append task chat assistant message."
+      );
+
+      const updatedSessionResult = await client.query<DbTaskChatSession>(
+        `update public.salvo_task_chat_sessions
+         set pending_proposal_json = $2::jsonb,
+             status = 'active'
+         where id = $1
+         returning *`,
+        [session.id, proposedContractJson]
+      );
+      const updatedSession = this.singleOrThrow(updatedSessionResult.rows, "Failed to update task chat session.");
+
+      return {
+        session: updatedSession,
+        assistantMessage
+      };
+    });
+  }
+
+  private async approveTaskChatProposalInTransaction(
+    client: PoolClient,
+    sessionId: string,
+    proposalOverride?: Record<string, unknown> | null
+  ): Promise<{ session: DbTaskChatSession; task: DbTask; contract: DbContract }> {
+    const sessionResult = await client.query<DbTaskChatSession>(
+      `select *
+       from public.salvo_task_chat_sessions
+       where id = $1
+       for update`,
+      [sessionId]
+    );
+    const session = this.singleOrThrow(sessionResult.rows, `Task chat session not found: ${sessionId}`);
+
+    if (session.approved_task_id && session.approved_contract_id) {
+      const [taskResult, contractResult] = await Promise.all([
+        client.query<DbTask>(
+          `select *
+           from public.salvo_tasks
+           where id = $1
+           limit 1`,
+          [session.approved_task_id]
+        ),
+        client.query<DbContract>(
+          `select *
+           from public.salvo_contracts
+           where id = $1
+           limit 1`,
+          [session.approved_contract_id]
+        )
+      ]);
+      const task = this.singleOrThrow(taskResult.rows, `Task not found: ${session.approved_task_id}`);
+      const contract = this.singleOrThrow(contractResult.rows, `Contract not found: ${session.approved_contract_id}`);
+      return {
+        session,
+        task,
+        contract
+      };
+    }
+
+    const proposal = proposalOverride
+      ? parseTaskChatProposal(proposalOverride)
+      : parseTaskChatProposal(session.pending_proposal_json);
+    if (!proposal) {
+      throw new Error("No proposed contract is available for this task chat session.");
+    }
+
+    const createdTask = await this.insertTask(client, {
+      workspaceId: session.workspace_id,
+      title: proposal.title,
+      request: proposal.request,
+      requiresApproval: proposal.requires_approval
+    });
+    const approvedTask = await this.approveTaskInTransaction(client, createdTask.id);
+
+    const versionResult = await client.query<{ version: number }>(
+      `select coalesce(max(version), 0) + 1 as version
+       from public.salvo_contracts
+       where task_id = $1`,
+      [approvedTask.id]
+    );
+    const version = versionResult.rows[0]?.version ?? 1;
+    const contractId = randomUUID();
+    const nowIso = new Date().toISOString();
+    const contractJson = {
+      ...proposal.contract_json,
+      schema_version: proposal.contract_json.schema_version ?? 1,
+      contract_id: contractId,
+      task_id: approvedTask.id,
+      workspace_id: session.workspace_id,
+      created_at:
+        typeof proposal.contract_json.created_at === "string"
+          ? proposal.contract_json.created_at
+          : nowIso,
+      risk: proposal.risk
+    };
+    const contractResult = await client.query<DbContract>(
+      `insert into public.salvo_contracts (
+         id,
+         task_id,
+         version,
+         status,
+         risk,
+         contract_json
+       )
+       values ($1, $2, $3, 'active', $4, $5)
+       returning *`,
+      [contractId, approvedTask.id, version, proposal.risk, contractJson]
+    );
+    const contract = this.singleOrThrow(contractResult.rows, "Failed to create contract from task chat proposal.");
+
+    const updatedSessionResult = await client.query<DbTaskChatSession>(
+      `update public.salvo_task_chat_sessions
+       set status = 'approved',
+           approved_task_id = $2,
+           approved_contract_id = $3,
+           approved_at = coalesce(approved_at, now()),
+           pending_proposal_json = $4::jsonb
+       where id = $1
+       returning *`,
+      [session.id, approvedTask.id, contract.id, JSON.stringify(proposal)]
+    );
+    const updatedSession = this.singleOrThrow(updatedSessionResult.rows, "Failed to approve task chat session.");
+
+    return {
+      session: updatedSession,
+      task: approvedTask,
+      contract
+    };
+  }
+
+  async approveTaskChatProposal(
+    sessionId: string,
+    proposalOverride?: Record<string, unknown> | null
+  ): Promise<{ session: DbTaskChatSession; task: DbTask; contract: DbContract }> {
+    return this.withTransaction(async (client) =>
+      this.approveTaskChatProposalInTransaction(client, sessionId, proposalOverride)
+    );
+  }
+
+  async approveTaskChatProposalIdempotent(
+    sessionId: string,
+    options: {
+      idempotencyKey: string;
+      requestFingerprint: string;
+      ttlHours?: number;
+      proposalOverride?: Record<string, unknown> | null;
+    }
+  ): Promise<
+    IdempotentResult<{
+      session: DbTaskChatSession;
+      task: DbTask;
+      contract: DbContract;
+    }>
+  > {
+    return this.withTransaction(async (client) => {
+      const scope = `task.chat.approve:${sessionId}`;
+      const idempotency = await this.beginIdempotentRequest<{
+        session: DbTaskChatSession;
+        task: DbTask;
+        contract: DbContract;
+      }>(
+        client,
+        scope,
+        options.idempotencyKey,
+        options.requestFingerprint,
+        options.ttlHours ?? 24
+      );
+      if (idempotency.kind === "replay") {
+        return {
+          resource: idempotency.responseJson as {
+            session: DbTaskChatSession;
+            task: DbTask;
+            contract: DbContract;
+          },
+          duplicate: true,
+          responseStatus: idempotency.responseStatus
+        };
+      }
+
+      const resource = await this.approveTaskChatProposalInTransaction(
+        client,
+        sessionId,
+        options.proposalOverride
+      );
+      await this.completeIdempotentRequest(client, scope, options.idempotencyKey, 200, resource);
+      return {
+        resource,
         duplicate: false,
         responseStatus: 200
       };
@@ -2079,7 +2418,7 @@ export class SalvoRepository {
         return false;
       }
 
-      await client.query(
+      const memoryInsertResult = await client.query<{ id: string }>(
         `insert into public.salvo_memories (
            workspace_id,
            source_run_ids,
@@ -2092,7 +2431,8 @@ export class SalvoRepository {
            confidence,
            review_status
          )
-         values ($1, $2, $3, 'research_experiment', $4, $5, $6, $7, $8, 'accepted')`,
+         values ($1, $2, $3, 'research_experiment', $4, $5, $6, $7, $8, 'accepted')
+         returning id`,
         [
           experiment.workspace_id,
           experiment.source_run_ids,
@@ -2100,16 +2440,29 @@ export class SalvoRepository {
           `Experiment memory: ${experiment.contract_category}${
             experiment.contract_subcategory ? `/${experiment.contract_subcategory}` : ""
           }`,
-          `Deterministic experiment from ${experiment.sample_size} runs.`,
+          `Deterministic experiment from ${experiment.sample_size} runs (experiment ${experiment.id}).`,
           experiment.body_markdown,
           [
             "research",
             "experiment",
+            `experiment:${experiment.id}`,
             `family:${experiment.contract_family_key}`,
             `category:${experiment.contract_category}`
           ],
           experiment.confidence
         ]
+      );
+      const memoryId = this.singleOrThrow(
+        memoryInsertResult.rows,
+        `Memory publish insert failed for experiment ${experiment.id}`
+      ).id;
+
+      await client.query(
+        `update public.salvo_research_findings
+         set published_memory_id = $2
+         where experiment_id = $1
+           and published_memory_id is null`,
+        [experiment.id, memoryId]
       );
 
       await client.query(
@@ -2320,21 +2673,19 @@ export class SalvoRepository {
     workspaceId: string,
     contractFamilyKey: string,
     limit = 5
-  ): Promise<
-    {
-      id: string;
-      confidence: number;
-      review_status: "unreviewed" | "accepted" | "rejected";
-      source_run_ids: string[];
-    }[]
-  > {
-    const result = await this.pool.query<{
-      id: string;
-      confidence: number;
-      review_status: "unreviewed" | "accepted" | "rejected";
-      source_run_ids: string[];
-    }>(
-      `select id, confidence, review_status, source_run_ids
+  ): Promise<DbContractMemoryContext[]> {
+    const result = await this.pool.query<DbContractMemoryContext>(
+      `select
+         id,
+         confidence,
+         review_status,
+         source_run_ids,
+         (
+           select replace(tag, 'experiment:', '')
+           from unnest(tags) as t(tag)
+           where tag like 'experiment:%'
+           limit 1
+         ) as experiment_id
        from public.salvo_memories
        where workspace_id = $1
          and contract_family_key = $2

@@ -276,6 +276,22 @@ export type ApiArtifactPreview =
       content_url: string;
     };
 
+export type ApiProposedContract = Record<string, unknown>;
+
+export type ApiTaskChatResponse = {
+  response: string;
+  session_id: string;
+  proposed_contract?: ApiProposedContract | null;
+};
+
+export type ApiTaskChatApproveResponse = {
+  ok?: boolean;
+  task_id?: string;
+  task?: ApiTask;
+  contract_id?: string;
+  [key: string]: unknown;
+};
+
 const baseUrl = import.meta.env.VITE_SALVO_API_URL ?? "http://localhost:8787";
 export const controlPlaneBaseUrl = baseUrl;
 
@@ -377,6 +393,42 @@ export function listTasks(): Promise<ApiTask[]> {
   return request<ApiTask[]>("/tasks");
 }
 
+export function sendTaskChat(input: {
+  message: string;
+  sessionId?: string | null;
+}): Promise<ApiTaskChatResponse> {
+  const body: Record<string, unknown> = {
+    message: input.message
+  };
+
+  if (input.sessionId) {
+    body.session_id = input.sessionId;
+  }
+
+  return request<ApiTaskChatResponse>("/tasks/chat", {
+    method: "POST",
+    body: JSON.stringify(body)
+  });
+}
+
+export function approveTaskChat(input: {
+  sessionId: string;
+  proposedContract?: ApiProposedContract | null;
+}): Promise<ApiTaskChatApproveResponse> {
+  const body: Record<string, unknown> = {
+    session_id: input.sessionId
+  };
+
+  if (input.proposedContract) {
+    body.proposed_contract = input.proposedContract;
+  }
+
+  return request<ApiTaskChatApproveResponse>("/tasks/chat/approve", {
+    method: "POST",
+    body: JSON.stringify(body)
+  });
+}
+
 export function approveTask(taskId: string): Promise<ApiTask> {
   return request<ApiTask>(`/tasks/${taskId}/approve`, {
     method: "POST"
@@ -458,7 +510,7 @@ export function saveTrustTier(input: {
 }
 
 export function updateIntegrationConfig(
-  key: "supabase" | "llm_api" | "process" | "http",
+  key: "supabase" | "llm_api" | "process" | "http" | "google_sheets",
   input: Record<string, unknown>
 ): Promise<ApiActionResponse> {
   return request<ApiActionResponse>(`/integrations/${key}/config`, {

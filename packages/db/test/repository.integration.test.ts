@@ -29,7 +29,8 @@ if (!databaseUrl) {
       "0007_research_analysis_pipeline.sql",
       "0008_idempotency_recovery.sql",
       "0009_budget_caps.sql",
-      "0010_agent_trust_tiers.sql"
+      "0010_agent_trust_tiers.sql",
+      "0011_contract_review_chat.sql"
     ]) {
       const sql = await readFile(path.join(migrationDir, fileName), "utf8");
       await pool.query(sql);
@@ -49,6 +50,8 @@ if (!databaseUrl) {
         public.salvo_run_events,
         public.salvo_runs,
         public.salvo_contracts,
+        public.salvo_task_chat_messages,
+        public.salvo_task_chat_sessions,
         public.salvo_tasks,
         public.salvo_idempotency_keys,
         public.salvo_budget_limits,
@@ -216,6 +219,129 @@ if (!databaseUrl) {
     assert.equal(first.duplicate, false);
     assert.equal(second.duplicate, true);
     assert.equal(first.resource.id, second.resource.id);
+  });
+
+  test("task chat turns persist session state and history", async () => {
+    const workspace = await repo.ensureWorkspace(`chat-${randomUUID()}`, process.cwd());
+
+    const first = await repo.saveTaskChatTurn({
+      workspaceId: workspace.id,
+      userMessage: "help",
+      assistantResponse: "Please clarify what should be built.",
+      proposedContract: null
+    });
+    assert.equal(first.session.workspace_id, workspace.id);
+    assert.equal(first.session.status, "active");
+
+    const second = await repo.saveTaskChatTurn({
+      sessionId: first.session.id,
+      userMessage: "Implement task chat approvals with a persisted session.",
+      assistantResponse: "Here is a proposal.",
+      proposedContract: {
+        title: "Implement task chat approvals with a persisted session.",
+        request: "Implement task chat approvals with a persisted session.",
+        risk: "medium",
+        requires_approval: false,
+        contract_json: {
+          schema_version: 1,
+          family_key: "family_chat_test",
+          category: "general",
+          risk: "medium",
+          agent_profile: "builder"
+        }
+      }
+    });
+    assert.equal(second.session.id, first.session.id);
+    assert.notEqual(second.session.pending_proposal_json, null);
+
+    const messages = await repo.listTaskChatMessages(first.session.id);
+    assert.equal(messages.length, 4);
+    assert.equal(messages[0].role, "user");
+    assert.equal(messages[1].role, "assistant");
+    assert.equal(messages[2].role, "user");
+    assert.equal(messages[3].role, "assistant");
+  });
+
+  test("task chat proposal approval creates task/contract and replays idempotent responses", async () => {
+    const workspace = await repo.ensureWorkspace(`chat-approve-${randomUUID()}`, process.cwd());
+    const chat = await repo.saveTaskChatTurn({
+      workspaceId: workspace.id,
+      userMessage: "Create a task for chat proposal approval endpoint implementation.",
+      assistantResponse: "Draft proposal ready.",
+      proposedContract: {
+        title: "Create a task for chat proposal approval endpoint implementation.",
+        request: "Create a task for chat proposal approval endpoint implementation.",
+        risk: "low",
+        requires_approval: false,
+        contract_json: {
+          schema_version: 1,
+          family_key: "family_chat_approve_test",
+          category: "general",
+          risk: "low",
+          agent_profile: "builder",
+          created_at: new Date().toISOString()
+        }
+      }
+    });
+
+    const firstApprove = await repo.approveTaskChatProposalIdempotent(chat.session.id, {
+      idempotencyKey: "chat-approve-1",
+      requestFingerprint: "chat-approve-fingerprint"
+    });
+    assert.equal(firstApprove.duplicate, false);
+    assert.equal(firstApprove.resource.task.workspace_id, workspace.id);
+    assert.equal(firstApprove.resource.contract.task_id, firstApprove.resource.task.id);
+    assert.notEqual(firstApprove.resource.task.approved_at, null);
+    assert.equal(firstApprove.resource.session.status, "approved");
+
+    const secondApprove = await repo.approveTaskChatProposalIdempotent(chat.session.id, {
+      idempotencyKey: "chat-approve-1",
+      requestFingerprint: "chat-approve-fingerprint"
+    });
+    assert.equal(secondApprove.duplicate, true);
+    assert.equal(secondApprove.resource.task.id, firstApprove.resource.task.id);
+    assert.equal(secondApprove.resource.contract.id, firstApprove.resource.contract.id);
+  });
+
+  test("task chat approval uses proposal override when supplied", async () => {
+    const workspace = await repo.ensureWorkspace(`chat-override-${randomUUID()}`, process.cwd());
+    const chat = await repo.saveTaskChatTurn({
+      workspaceId: workspace.id,
+      userMessage: "Build a robust analytics endpoint.",
+      assistantResponse: "Draft proposal ready.",
+      proposedContract: {
+        title: "Build a robust analytics endpoint.",
+        request: "Build a robust analytics endpoint.",
+        risk: "low",
+        requires_approval: false,
+        contract_json: {
+          schema_version: 1,
+          family_key: "family_chat_override_test",
+          category: "general",
+          risk: "low",
+          agent_profile: "builder",
+          created_at: new Date().toISOString()
+        }
+      }
+    });
+
+    const approved = await repo.approveTaskChatProposal(chat.session.id, {
+      title: "Edited analytics endpoint title",
+      request: "Edited analytics endpoint request with explicit acceptance.",
+      risk: "medium",
+      requires_approval: false,
+      contract_json: {
+        schema_version: 1,
+        family_key: "family_chat_override_test",
+        category: "general",
+        risk: "medium",
+        agent_profile: "builder",
+        created_at: new Date().toISOString()
+      }
+    });
+
+    assert.equal(approved.task.title, "Edited analytics endpoint title");
+    assert.equal(approved.contract.risk, "medium");
   });
 
   test("orphaned planning tasks can be recovered back to queued", async () => {
@@ -448,6 +574,81 @@ if (!databaseUrl) {
     const familyAlpha = await repo.listContractMemoryContext(workspace.id, "family-alpha", 10);
     assert.equal(familyAlpha.length, 1);
     assert.equal(familyAlpha[0].review_status, "accepted");
+  });
+
+  test("accepted experiment publishing creates linked memory and exposes it in contract memory context", async () => {
+    const workspace = await repo.ensureWorkspace(`publish-${randomUUID()}`, process.cwd());
+    const sourceRunIds = [randomUUID(), randomUUID(), randomUUID()];
+    const created = await repo.createResearchExperiment({
+      workspaceId: workspace.id,
+      familyKey: "family-publish",
+      category: "integration",
+      subcategory: "memory",
+      sampleSize: sourceRunIds.length,
+      sourceDigest: `digest-${randomUUID()}`,
+      sourceRunIds,
+      metricsJson: {
+        sample_size: sourceRunIds.length
+      },
+      bodyMarkdown: "## experiment body",
+      confidence: 0.82,
+      reviewStatus: "accepted"
+    });
+
+    await repo.createResearchFinding({
+      experimentId: created.experiment.id,
+      workspaceId: workspace.id,
+      findingType: "experiment_summary",
+      title: "finding title",
+      bodyMarkdown: "finding body",
+      confidence: 0.71
+    });
+
+    const firstPublish = await repo.publishAcceptedResearchExperiment(created.experiment.id);
+    const secondPublish = await repo.publishAcceptedResearchExperiment(created.experiment.id);
+    assert.equal(firstPublish, true);
+    assert.equal(secondPublish, false);
+
+    const familyMemory = await repo.listContractMemoryContext(workspace.id, "family-publish", 10);
+    assert.equal(familyMemory.length, 1);
+    assert.equal(familyMemory[0].review_status, "accepted");
+    assert.equal(familyMemory[0].experiment_id, created.experiment.id);
+    assert.deepEqual(new Set(familyMemory[0].source_run_ids), new Set(sourceRunIds));
+
+    const memoryRow = await pool.query<{
+      memory_type: string;
+      review_status: "unreviewed" | "accepted" | "rejected";
+      tags: string[];
+      summary: string;
+    }>(
+      `select memory_type, review_status, tags, summary
+       from public.salvo_memories
+       where id = $1
+       limit 1`,
+      [familyMemory[0].id]
+    );
+    assert.equal(memoryRow.rows[0]?.memory_type, "research_experiment");
+    assert.equal(memoryRow.rows[0]?.review_status, "accepted");
+    assert.equal(memoryRow.rows[0]?.tags.includes(`experiment:${created.experiment.id}`), true);
+    assert.equal(memoryRow.rows[0]?.summary.includes(created.experiment.id), true);
+
+    const findingLink = await pool.query<{ published_memory_id: string | null }>(
+      `select published_memory_id
+       from public.salvo_research_findings
+       where experiment_id = $1`,
+      [created.experiment.id]
+    );
+    assert.equal(findingLink.rows.length, 1);
+    assert.equal(findingLink.rows[0]?.published_memory_id, familyMemory[0].id);
+
+    const experimentStatus = await pool.query<{ published_at: string | null }>(
+      `select published_at
+       from public.salvo_research_experiments
+       where id = $1
+       limit 1`,
+      [created.experiment.id]
+    );
+    assert.notEqual(experimentStatus.rows[0]?.published_at, null);
   });
 
   test("pending experiment families respect minimum sample size of 15", async () => {

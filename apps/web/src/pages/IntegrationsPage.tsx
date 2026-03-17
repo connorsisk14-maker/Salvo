@@ -34,6 +34,8 @@ export function IntegrationsPage() {
   const [processCommand, setProcessCommand] = useState("");
   const [httpBaseUrl, setHttpBaseUrl] = useState("");
   const [httpToken, setHttpToken] = useState("");
+  const [googleSpreadsheetId, setGoogleSpreadsheetId] = useState("");
+  const [googleCredentials, setGoogleCredentials] = useState("");
 
   async function refresh() {
     try {
@@ -69,12 +71,13 @@ export function IntegrationsPage() {
   const llmApi = integrationMap.get("llm_api");
   const processIntegration = integrationMap.get("process");
   const http = integrationMap.get("http");
+  const googleSheetsIntegration = integrationMap.get("google_sheets");
 
   useEffect(() => {
     if (initialized.current) {
       return;
     }
-    if (!supabase && !llmApi && !processIntegration && !http) {
+    if (!supabase && !llmApi && !processIntegration && !http && !googleSheetsIntegration) {
       return;
     }
 
@@ -86,6 +89,7 @@ export function IntegrationsPage() {
     };
     const processConfig = (processIntegration?.config ?? {}) as { command?: string };
     const httpConfig = (http?.config ?? {}) as { base_url?: string };
+    const googleConfig = (googleSheetsIntegration?.config ?? {}) as { spreadsheet_id?: string };
 
     setSupabaseUrl(supabaseConfig.url ?? "");
     setLlmProvider(llmConfig.provider ?? "anthropic");
@@ -93,11 +97,12 @@ export function IntegrationsPage() {
     setLlmDefaultModel(llmConfig.default_model ?? "");
     setProcessCommand(processConfig.command ?? "");
     setHttpBaseUrl(httpConfig.base_url ?? "");
+    setGoogleSpreadsheetId(googleConfig.spreadsheet_id ?? "");
     initialized.current = true;
-  }, [http, llmApi, processIntegration, supabase]);
+  }, [googleSheetsIntegration, http, llmApi, processIntegration, supabase]);
 
   async function saveConfig(
-    key: "supabase" | "llm_api" | "process" | "http",
+    key: "supabase" | "llm_api" | "process" | "http" | "google_sheets",
     payload: Record<string, unknown>
   ) {
     setBusyKey(key);
@@ -111,6 +116,9 @@ export function IntegrationsPage() {
       }
       if (key === "http") {
         setHttpToken("");
+      }
+      if (key === "google_sheets") {
+        setGoogleCredentials("");
       }
       await refresh();
     } catch (saveError) {
@@ -316,6 +324,54 @@ export function IntegrationsPage() {
             </p>
             <button className="button-link" type="submit" disabled={busyKey === "http"}>
               {busyKey === "http" ? "Saving..." : "Save HTTP Adapter"}
+            </button>
+          </form>
+
+          <form
+            className="integration-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              const payload: Record<string, unknown> = {};
+              if (googleSpreadsheetId.trim().length > 0) {
+                payload.spreadsheetId = googleSpreadsheetId.trim();
+              }
+              if (googleCredentials.trim().length > 0) {
+                payload.credentialsJson = googleCredentials;
+              }
+              if (Object.keys(payload).length === 0) {
+                setError("Provide a spreadsheet ID or new credentials to update Google Sheets.");
+                return;
+              }
+              void saveConfig("google_sheets", payload);
+            }}
+          >
+            <h3>Google Sheets</h3>
+            <label>
+              Spreadsheet ID
+              <input
+                value={googleSpreadsheetId}
+                onChange={(event) => setGoogleSpreadsheetId(event.target.value)}
+                placeholder="Spreadsheet ID"
+              />
+            </label>
+            <label>
+              Service account credentials (JSON)
+              <textarea
+                value={googleCredentials}
+                onChange={(event) => setGoogleCredentials(event.target.value)}
+                placeholder="Paste service account JSON"
+                rows={4}
+              />
+            </label>
+            <p className="muted">
+              Credentials configured:{" "}
+              {String(
+                ((googleSheetsIntegration?.config ?? {}) as { credentials_configured?: boolean })
+                  .credentials_configured ?? false
+              )}
+            </p>
+            <button className="button-link" type="submit" disabled={busyKey === "google_sheets"}>
+              {busyKey === "google_sheets" ? "Saving..." : "Save Google Sheets"}
             </button>
           </form>
         </div>

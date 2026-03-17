@@ -27,6 +27,14 @@ export type DbContractMemoryPrompt = {
   source_run_ids: string[];
 };
 
+export type DbContractMemoryContext = {
+  id: string;
+  confidence: number;
+  review_status: "unreviewed" | "accepted" | "rejected";
+  source_run_ids: string[];
+  experiment_id: string | null;
+};
+
 export type DbTask = {
   id: string;
   workspace_id: string;
@@ -41,6 +49,39 @@ export type DbTask = {
   claimed_at: string | null;
   created_at: string;
   updated_at: string;
+};
+
+export type TaskChatSessionStatus = "active" | "approved";
+
+export type TaskChatRole = "user" | "assistant";
+
+export type TaskChatProposal = {
+  title: string;
+  request: string;
+  risk: "low" | "medium" | "high";
+  requires_approval: boolean;
+  contract_json: Record<string, unknown>;
+};
+
+export type DbTaskChatSession = {
+  id: string;
+  workspace_id: string;
+  status: TaskChatSessionStatus;
+  pending_proposal_json: Record<string, unknown> | null;
+  approved_task_id: string | null;
+  approved_contract_id: string | null;
+  approved_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type DbTaskChatMessage = {
+  id: number;
+  session_id: string;
+  role: TaskChatRole;
+  message_text: string;
+  proposed_contract_json: Record<string, unknown> | null;
+  created_at: string;
 };
 
 export type DbContract = {
@@ -135,7 +176,12 @@ export type DbDaemonHeartbeat = {
   updated_at: string;
 };
 
-export type DbIntegrationKey = "supabase" | "llm_api" | "process" | "http";
+export type DbIntegrationKey =
+  | "supabase"
+  | "llm_api"
+  | "process"
+  | "http"
+  | "google_sheets";
 
 export type DbIntegrationConfig = {
   integration_key: DbIntegrationKey;

@@ -83,6 +83,22 @@ strong {
   cursor: pointer;
 }
 
+.top-nav-chat {
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  padding: 0.35rem 0.7rem;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-family: "IBM Plex Mono", "Menlo", monospace;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.top-nav-chat:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 .clip-card {
   position: relative;
   border: 2px solid var(--line);
@@ -136,6 +152,146 @@ strong {
   display: flex;
   gap: 0.5rem;
   flex-wrap: wrap;
+}
+
+.chat-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(23, 32, 52, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+  z-index: 30;
+}
+
+.chat-modal {
+  width: min(100%, 860px);
+}
+
+.chat-modal-content {
+  display: grid;
+  gap: 0.7rem;
+}
+
+.chat-modal-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.6rem;
+}
+
+.chat-modal-header-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.4rem;
+}
+
+.chat-transcript {
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  background: #f5eedf;
+  padding: 0.65rem;
+  max-height: min(58vh, 640px);
+  overflow: auto;
+  display: grid;
+  gap: 0.6rem;
+}
+
+.chat-message {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.55rem;
+  display: grid;
+  gap: 0.4rem;
+  max-width: min(100%, 740px);
+}
+
+.chat-message-user {
+  margin-left: auto;
+  background: #e4eefc;
+}
+
+.chat-message-assistant {
+  margin-right: auto;
+  background: #f9f2e4;
+}
+
+.chat-message-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+  font-size: 0.82rem;
+}
+
+.chat-message-content {
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+.chat-contract-card {
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  background: #f3ecde;
+  padding: 0.55rem;
+  display: grid;
+  gap: 0.45rem;
+}
+
+.chat-contract-card h3 {
+  margin: 0;
+}
+
+.chat-contract-highlights {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.chat-contract-card p {
+  margin: 0;
+}
+
+.chat-contract-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.chat-proposal-editor {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.chat-proposal-editor textarea {
+  margin-top: 0;
+  min-height: 180px;
+  font-family: "IBM Plex Mono", "Menlo", monospace;
+  font-size: 0.8rem;
+}
+
+.chat-proposal-editor-actions {
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.chat-input-row {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.chat-input-row textarea {
+  margin-top: 0;
+  resize: vertical;
+}
+
+.chat-input-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
 }
 
 .content-header {
@@ -703,5 +859,31 @@ textarea {
     background: #f9f5ea;
     border-radius: 8px;
     padding: 0.6rem 0.45rem 0.45rem;
+  }
+
+  .chat-modal {
+    width: 100%;
+  }
+
+  .chat-modal-header {
+    flex-direction: column;
+  }
+
+  .chat-modal-header-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .chat-transcript {
+    max-height: 52vh;
+  }
+
+  .chat-message {
+    max-width: 100%;
+  }
+
+  .chat-input-actions {
+    flex-direction: column;
+    align-items: flex-start;
   }
 }

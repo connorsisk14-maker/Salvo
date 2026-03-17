@@ -31,7 +31,8 @@ if (!databaseUrl) {
       "0007_research_analysis_pipeline.sql",
       "0008_idempotency_recovery.sql",
       "0009_budget_caps.sql",
-      "0010_agent_trust_tiers.sql"
+      "0010_agent_trust_tiers.sql",
+      "0011_contract_review_chat.sql"
     ]) {
       const sql = await readFile(path.join(migrationDir, fileName), "utf8");
       await pool.query(sql);
@@ -51,6 +52,8 @@ if (!databaseUrl) {
         public.salvo_run_events,
         public.salvo_runs,
         public.salvo_contracts,
+        public.salvo_task_chat_messages,
+        public.salvo_task_chat_sessions,
         public.salvo_tasks,
         public.salvo_idempotency_keys,
         public.salvo_budget_limits,
@@ -205,6 +208,112 @@ if (!databaseUrl) {
     });
 
     assert.equal(second.statusCode, 409);
+  });
+
+  test("task chat endpoint asks clarifying questions for ambiguous requests and persists session turns", async () => {
+    const first = await app.inject({
+      method: "POST",
+      url: "/tasks/chat",
+      payload: {
+        message: "help"
+      }
+    });
+    assert.equal(first.statusCode, 200);
+    assert.equal(typeof first.json().session_id, "string");
+    assert.equal(first.json().proposed_contract, undefined);
+    assert.ok((first.json().response as string).toLowerCase().includes("detail"));
+
+    const second = await app.inject({
+      method: "POST",
+      url: "/tasks/chat",
+      payload: {
+        session_id: first.json().session_id,
+        message: "Implement a new POST /tasks/chat endpoint with persisted session state and proposal approval."
+      }
+    });
+    assert.equal(second.statusCode, 200);
+    assert.equal(second.json().session_id, first.json().session_id);
+    assert.equal(typeof second.json().proposed_contract?.title, "string");
+    assert.equal(typeof second.json().proposed_contract?.contract_json?.family_key, "string");
+
+    const messages = await repo.listTaskChatMessages(first.json().session_id as string);
+    assert.equal(messages.length, 4);
+    assert.equal(messages[0].role, "user");
+    assert.equal(messages[1].role, "assistant");
+    assert.equal(messages[2].role, "user");
+    assert.equal(messages[3].role, "assistant");
+  });
+
+  test("task chat approve endpoint creates task and contract and replays idempotent approvals", async () => {
+    const chat = await app.inject({
+      method: "POST",
+      url: "/tasks/chat",
+      payload: {
+        message: "Create a migration-safe endpoint for task chat proposal approvals with repository integration tests."
+      }
+    });
+    assert.equal(chat.statusCode, 200);
+    assert.equal(typeof chat.json().proposed_contract?.title, "string");
+
+    const firstApprove = await app.inject({
+      method: "POST",
+      url: "/tasks/chat/approve",
+      headers: {
+        idempotency_key: "task-chat-approve-1"
+      },
+      payload: {
+        session_id: chat.json().session_id
+      }
+    });
+    assert.equal(firstApprove.statusCode, 200);
+    assert.equal(firstApprove.json().session_id, chat.json().session_id);
+    assert.equal(firstApprove.json().task.id, firstApprove.json().contract.task_id);
+    assert.notEqual(firstApprove.json().task.approved_at, null);
+
+    const secondApprove = await app.inject({
+      method: "POST",
+      url: "/tasks/chat/approve",
+      headers: {
+        idempotency_key: "task-chat-approve-1"
+      },
+      payload: {
+        session_id: chat.json().session_id
+      }
+    });
+    assert.equal(secondApprove.statusCode, 200);
+    assert.equal(secondApprove.json().task.id, firstApprove.json().task.id);
+    assert.equal(secondApprove.json().contract.id, firstApprove.json().contract.id);
+  });
+
+  test("task chat approve accepts edited proposal override", async () => {
+    const chat = await app.inject({
+      method: "POST",
+      url: "/tasks/chat",
+      payload: {
+        message: "Create a dashboard intake flow with approval handling and tests."
+      }
+    });
+    assert.equal(chat.statusCode, 200);
+
+    const proposal = structuredClone(chat.json().proposed_contract) as Record<string, unknown>;
+    proposal.title = "Edited proposal title";
+    proposal.request = "Edited proposal request with clearer completion criteria.";
+    proposal.risk = "medium";
+    if (typeof proposal.contract_json === "object" && proposal.contract_json !== null) {
+      (proposal.contract_json as Record<string, unknown>).risk = "medium";
+    }
+
+    const approve = await app.inject({
+      method: "POST",
+      url: "/tasks/chat/approve",
+      payload: {
+        session_id: chat.json().session_id,
+        proposed_contract: proposal
+      }
+    });
+    assert.equal(approve.statusCode, 200);
+    assert.equal(approve.json().task.title, "Edited proposal title");
+    assert.equal(approve.json().contract.risk, "medium");
   });
 
   test("health endpoints return offline when no daemon heartbeat exists", async () => {
@@ -632,6 +741,43 @@ if (!databaseUrl) {
       .json()
       .find((item: { key: string }) => item.key === "llm_api");
     assert.ok(llmRow);
+  });
+
+  test("integrations endpoint exposes Google Sheets entry", async () => {
+    const integrations = await app.inject({
+      method: "GET",
+      url: "/integrations"
+    });
+    assert.equal(integrations.statusCode, 200);
+    const googleRow = integrations
+      .json()
+      .find((item: { key: string }) => item.key === "google_sheets");
+    assert.ok(googleRow);
+    assert.equal(typeof googleRow.config.spreadsheet_id, "string");
+  });
+
+  test("integration config update persists Google Sheets settings", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/integrations/google_sheets/config",
+      payload: {
+        spreadsheetId: "sheet-xyz",
+        credentialsJson: '{"client_email":"service@salvo.test","private_key":"secret"}'
+      }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().ok, true);
+
+    const integrations = await app.inject({
+      method: "GET",
+      url: "/integrations"
+    });
+    assert.equal(integrations.statusCode, 200);
+    const googleRow = integrations
+      .json()
+      .find((item: { key: string }) => item.key === "google_sheets");
+    assert.equal(googleRow.config.spreadsheet_id, "sheet-xyz");
+    assert.equal(googleRow.config.credentials_configured, true);
   });
 
   test("budget endpoints persist limits and return spend state", async () => {

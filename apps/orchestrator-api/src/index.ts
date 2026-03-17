@@ -1,11 +1,11 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
-import { createDbPool, SalvoRepository } from "@salvo/db";
+import { createDbPool, SalvoRepository, type TaskChatProposal } from "@salvo/db";
 import {
   AGENT_PROFILES,
   AGENT_TRUST_TIERS,
@@ -47,6 +47,20 @@ const taskCreateSchema = z.object({
   requiresApproval: z.boolean().optional()
 }).strict();
 
+const taskChatSchema = z.object({
+  message: z.string().trim().min(1, "Message is required.").max(taskRequestMaxLength, `Message must be ${taskRequestMaxLength} characters or fewer.`),
+  sessionId: z.string().uuid("sessionId must be a valid UUID.").optional(),
+  session_id: z.string().uuid("session_id must be a valid UUID.").optional(),
+  workspaceId: z.string().uuid("workspaceId must be a valid UUID.").optional(),
+  workspace_id: z.string().uuid("workspace_id must be a valid UUID.").optional()
+}).strict();
+
+const taskChatApproveSchema = z.object({
+  sessionId: z.string().uuid("sessionId must be a valid UUID.").optional(),
+  session_id: z.string().uuid("session_id must be a valid UUID.").optional(),
+  proposed_contract: z.record(z.unknown()).optional()
+}).strict();
+
 const budgetLimitSchema = z.object({
   workspaceId: z.string().uuid("workspaceId must be a valid UUID."),
   contractFamilyKey: z.string().trim().min(1, "contractFamilyKey must not be empty.").max(200, "contractFamilyKey must be 200 characters or fewer.").optional(),
@@ -57,6 +71,11 @@ const trustTierSchema = z.object({
   workspaceId: z.string().uuid("workspaceId must be a valid UUID."),
   agentProfile: z.enum(AGENT_PROFILES),
   trustTier: z.enum(AGENT_TRUST_TIERS)
+}).strict();
+
+const googleSheetsConfigSchema = z.object({
+  spreadsheetId: z.string().trim().max(256, "spreadsheetId must be 256 characters or fewer.").optional(),
+  credentialsJson: z.string().trim().min(1, "credentialsJson must not be empty.").optional()
 }).strict();
 
 const integrationConfigSchemas = {
@@ -76,7 +95,8 @@ const integrationConfigSchemas = {
   http: z.object({
     baseUrl: z.string().trim().max(2048, "baseUrl must be 2048 characters or fewer.").optional(),
     token: z.string().trim().max(4096, "token must be 4096 characters or fewer.").optional()
-  }).strict()
+  }).strict(),
+  google_sheets: googleSheetsConfigSchema
 } as const;
 
 function daemonHealthStatus(heartbeatAt: string, thresholdSeconds: number): "healthy" | "stale" {
@@ -99,7 +119,7 @@ type IntegrationStatus =
   | "healthy"
   | "stale"
   | "offline";
-type EditableIntegrationKey = "supabase" | "llm_api" | "process" | "http";
+type EditableIntegrationKey = "supabase" | "llm_api" | "process" | "http" | "google_sheets";
 type LlmProvider = "anthropic" | "openai" | "custom";
 
 type IntegrationConfigMap = {
@@ -120,6 +140,10 @@ type IntegrationConfigMap = {
     baseUrl: string;
     token: string;
   };
+  googleSheets: {
+    spreadsheetId: string;
+    credentialsJson: string;
+  };
 };
 
 type RateLimitEntry = {
@@ -133,6 +157,8 @@ type ValidationIssue = {
 };
 
 const IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"]);
+const TASK_CHAT_ACTION_KEYWORD = /\b(add|build|create|debug|deploy|design|document|fix|implement|integrat|migrat|refactor|test|update|write)\b/i;
+const TASK_CHAT_GREETING = /^(ok|okay|thanks|thank you|hello|hi|hey|help)\b/i;
 const TEXT_EXTENSIONS = new Set([
   ".md",
   ".txt",
@@ -339,6 +365,10 @@ function createDefaultConfigMap(): IntegrationConfigMap {
     http: {
       baseUrl: process.env.SALVO_HTTP_BASE_URL ?? "",
       token: process.env.SALVO_HTTP_TOKEN ?? ""
+    },
+    googleSheets: {
+      spreadsheetId: process.env.SALVO_GOOGLE_SHEETS_SPREADSHEET_ID ?? "",
+      credentialsJson: process.env.SALVO_GOOGLE_SHEETS_CREDENTIALS_JSON ?? ""
     }
   };
 }
@@ -382,6 +412,19 @@ function applyStoredConfig(
     if (row.integration_key === "http") {
       next.http.baseUrl = readString(config, "baseUrl", next.http.baseUrl);
       next.http.token = readString(config, "token", next.http.token);
+    }
+
+    if (row.integration_key === "google_sheets") {
+      next.googleSheets.spreadsheetId = readString(
+        config,
+        "spreadsheetId",
+        next.googleSheets.spreadsheetId
+      );
+      next.googleSheets.credentialsJson = readString(
+        config,
+        "credentialsJson",
+        next.googleSheets.credentialsJson
+      );
     }
   }
 
@@ -468,6 +511,217 @@ function readIdempotencyKey(headers: Record<string, string | string[] | undefine
 
 function fingerprint(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+function readAliasedUuid(
+  camelValue: string | undefined,
+  snakeValue: string | undefined,
+  camelLabel: string,
+  snakeLabel: string
+): string | null {
+  const camel = camelValue?.trim();
+  const snake = snakeValue?.trim();
+  if (camel && snake && camel !== snake) {
+    throw new Error(`${camelLabel} and ${snakeLabel} must match when both are provided.`);
+  }
+  return camel ?? snake ?? null;
+}
+
+function buildTaskTitleFromRequest(request: string): string {
+  const compact = request.replace(/\s+/g, " ").trim();
+  if (compact.length <= taskTitleMaxLength) {
+    return compact;
+  }
+  return `${compact.slice(0, taskTitleMaxLength - 3).trimEnd()}...`;
+}
+
+function classifyTaskChatRisk(request: string): "low" | "medium" | "high" {
+  const lowered = request.toLowerCase();
+  if (
+    lowered.includes("schema") ||
+    lowered.includes("migration") ||
+    lowered.includes("delete") ||
+    lowered.includes("drop") ||
+    lowered.includes("install")
+  ) {
+    return "high";
+  }
+  if (lowered.includes("refactor") || lowered.includes("rename")) {
+    return "medium";
+  }
+  return "low";
+}
+
+function classifyTaskChatCategory(request: string): {
+  category: "general" | "migration" | "integration" | "quality" | "documentation" | "operations" | "debug";
+  subcategory?: string;
+} {
+  const lowered = request.toLowerCase();
+  if (lowered.includes("migration") || lowered.includes("schema") || lowered.includes("database")) {
+    return {
+      category: "migration",
+      subcategory: "database"
+    };
+  }
+  if (
+    lowered.includes("integrat") ||
+    lowered.includes("connector") ||
+    lowered.includes("api key") ||
+    lowered.includes("webhook")
+  ) {
+    return {
+      category: "integration",
+      subcategory: "external-api"
+    };
+  }
+  if (lowered.includes("test") || lowered.includes("coverage") || lowered.includes("qa")) {
+    return {
+      category: "quality",
+      subcategory: "testing"
+    };
+  }
+  if (lowered.includes("doc") || lowered.includes("readme")) {
+    return {
+      category: "documentation",
+      subcategory: "knowledge"
+    };
+  }
+  if (
+    lowered.includes("incident") ||
+    lowered.includes("ops") ||
+    lowered.includes("deploy") ||
+    lowered.includes("rollback")
+  ) {
+    return {
+      category: "operations",
+      subcategory: "runtime"
+    };
+  }
+  if (lowered.includes("bug") || lowered.includes("fix") || lowered.includes("debug")) {
+    return {
+      category: "debug",
+      subcategory: "bugfix"
+    };
+  }
+  return {
+    category: "general"
+  };
+}
+
+function buildTaskChatFamilyKey(input: {
+  request: string;
+  risk: "low" | "medium" | "high";
+  category: string;
+  subcategory?: string;
+}): string {
+  const normalize = (value: string) => value.trim().toLowerCase().replace(/\s+/g, " ");
+  const seed = [
+    normalize(input.category),
+    normalize(input.subcategory ?? "none"),
+    normalize(input.risk),
+    normalize(input.request)
+  ].join("|");
+  const digest = createHash("sha256").update(seed).digest("hex").slice(0, 16);
+  return `family_${digest}`;
+}
+
+function buildTaskChatProposal(workspaceId: string, request: string): TaskChatProposal {
+  const risk = classifyTaskChatRisk(request);
+  const category = classifyTaskChatCategory(request);
+  const title = buildTaskTitleFromRequest(request);
+  const contractId = randomUUID();
+  const taskId = randomUUID();
+  const createdAt = new Date().toISOString();
+  const familyKey = buildTaskChatFamilyKey({
+    request,
+    risk,
+    category: category.category,
+    subcategory: category.subcategory
+  });
+
+  return {
+    title,
+    request,
+    risk,
+    requires_approval: risk === "high",
+    contract_json: {
+      schema_version: 1,
+      contract_id: contractId,
+      task_id: taskId,
+      workspace_id: workspaceId,
+      created_at: createdAt,
+      objective: {
+        primary: title,
+        secondary: [],
+        non_goals: ["Do not modify files outside allowed scope."]
+      },
+      context: {
+        relevant_files: [],
+        recent_runs: [],
+        memory_excerpt_ids: []
+      },
+      scope: {
+        read_paths: ["."],
+        write_paths: ["."],
+        forbidden_paths: [".env", ".git", "node_modules"]
+      },
+      capabilities: {
+        filesystem_read: true,
+        filesystem_write: true,
+        run_tests: true,
+        install_packages: false,
+        network_access: false,
+        db_read: true,
+        db_write: true
+      },
+      constraints: {
+        max_runtime_minutes: 25,
+        max_tool_calls: 200,
+        no_destructive_commands: true,
+        approval_required_for: risk === "high" ? ["schema_change", "dependency_install"] : []
+      },
+      deliverables: {
+        required_artifacts: ["run-summary.md"],
+        evidence_required: true,
+        summary_required: true
+      },
+      success_criteria: {
+        required_test_commands: ["echo salvo-test"],
+        assertions: [
+          "Runner emits a final payload event.",
+          "At least one deliverable produced."
+        ]
+      },
+      failure_handling: {
+        stop_on_policy_denial: true
+      },
+      learnings_output: {
+        required: true
+      },
+      risk,
+      category: category.category,
+      subcategory: category.subcategory,
+      family_key: familyKey,
+      agent_profile: "builder"
+    }
+  };
+}
+
+function isAmbiguousTaskChatRequest(latestMessage: string, fullRequest: string): boolean {
+  const latest = latestMessage.trim().toLowerCase();
+  if (!latest) {
+    return true;
+  }
+  if (TASK_CHAT_GREETING.test(latest)) {
+    return true;
+  }
+
+  const wordCount = fullRequest.trim().split(/\s+/).filter(Boolean).length;
+  if (wordCount < 6) {
+    return true;
+  }
+
+  return !TASK_CHAT_ACTION_KEYWORD.test(fullRequest);
 }
 
 export async function buildServer() {
@@ -684,6 +938,24 @@ export async function buildServer() {
         }
       },
       {
+        key: "google_sheets",
+        label: "Google Sheets",
+        status:
+          hasValue(config.googleSheets.spreadsheetId) && hasValue(config.googleSheets.credentialsJson)
+            ? "ready"
+            : "not_configured",
+        detail:
+          hasValue(config.googleSheets.spreadsheetId) && hasValue(config.googleSheets.credentialsJson)
+            ? "Spreadsheet and credentials are configured."
+            : "Set spreadsheet ID and service account credentials.",
+        updated_at: configUpdatedByKey.get("google_sheets") ?? now,
+        editable: true,
+        config: {
+          spreadsheet_id: config.googleSheets.spreadsheetId,
+          credentials_configured: hasValue(config.googleSheets.credentialsJson)
+        }
+      },
+      {
         key: "orchestrator_daemon",
         label: "Orchestrator Daemon",
         status: orchestratorHeartbeat
@@ -715,7 +987,7 @@ export async function buildServer() {
     Body: Record<string, unknown>;
   }>("/integrations/:key/config", async (req, reply) => {
     const key = req.params.key;
-    if (!["supabase", "llm_api", "process", "http"].includes(key)) {
+    if (!["supabase", "llm_api", "process", "http", "google_sheets"].includes(key)) {
       return reply.status(400).send({ ok: false, error: "Invalid integration key." });
     }
 
@@ -772,6 +1044,27 @@ export async function buildServer() {
       }
       if (typeof body.defaultModel === "string") {
         nextConfig.defaultModel = body.defaultModel.trim();
+      }
+    } else if (key === "google_sheets") {
+      const parsedBody = parseRequestBody(integrationConfigSchemas.google_sheets, rawBody);
+      if (!parsedBody.ok) {
+        return reply.status(400).send({
+          error: "Invalid request body.",
+          issues: parsedBody.issues
+        });
+      }
+      if (!hasConfigChanges(parsedBody.value)) {
+        return reply.status(400).send({
+          error: "Invalid request body.",
+          issues: [{ path: "body", message: "At least one config field is required." }]
+        });
+      }
+      const body = parsedBody.value;
+      if (typeof body.spreadsheetId === "string") {
+        nextConfig.spreadsheetId = body.spreadsheetId.trim();
+      }
+      if (typeof body.credentialsJson === "string") {
+        nextConfig.credentialsJson = body.credentialsJson.trim();
       }
     } else if (key === "process") {
       const parsedBody = parseRequestBody(integrationConfigSchemas.process, rawBody);
@@ -1001,6 +1294,191 @@ export async function buildServer() {
       ok: true,
       tier
     };
+  });
+
+  app.post<{
+    Body: {
+      message: string;
+      sessionId?: string;
+      session_id?: string;
+      workspaceId?: string;
+      workspace_id?: string;
+    };
+  }>("/tasks/chat", async (req, reply) => {
+    const parsedBody = parseRequestBody(taskChatSchema, req.body ?? {});
+    if (!parsedBody.ok) {
+      return reply.status(400).send({
+        error: "Invalid request body.",
+        issues: parsedBody.issues
+      });
+    }
+
+    const body = parsedBody.value;
+    let sessionId: string | null = null;
+    let workspaceId: string | null = null;
+    try {
+      sessionId = readAliasedUuid(body.sessionId, body.session_id, "sessionId", "session_id");
+      workspaceId = readAliasedUuid(body.workspaceId, body.workspace_id, "workspaceId", "workspace_id");
+    } catch (error) {
+      return reply.status(400).send({
+        error: (error as Error).message
+      });
+    }
+
+    if (workspaceId) {
+      const workspace = await repo.getWorkspace(workspaceId);
+      if (!workspace) {
+        return reply.status(404).send({
+          error: `Workspace not found: ${workspaceId}`
+        });
+      }
+    }
+
+    const userMessage = body.message.trim();
+    let targetWorkspaceId = workspaceId;
+    let priorUserMessages: string[] = [];
+    if (sessionId) {
+      const existingSession = await repo.getTaskChatSession(sessionId);
+      if (!existingSession) {
+        return reply.status(404).send({
+          error: `Task chat session not found: ${sessionId}`
+        });
+      }
+      targetWorkspaceId = existingSession.workspace_id;
+      const messages = await repo.listTaskChatMessages(sessionId);
+      priorUserMessages = messages
+        .filter((message) => message.role === "user")
+        .map((message) => message.message_text);
+    }
+
+    if (!targetWorkspaceId) {
+      targetWorkspaceId = (await repo.ensureWorkspace()).id;
+    }
+
+    const fullRequest = [...priorUserMessages, userMessage].join("\n").trim();
+    const ambiguous = isAmbiguousTaskChatRequest(userMessage, fullRequest);
+    let proposedContract: TaskChatProposal | null = null;
+    let response: string;
+    if (ambiguous) {
+      response = "I need a bit more detail before I can draft a contract. What should be built, where it should live, and what done looks like?";
+    } else {
+      proposedContract = buildTaskChatProposal(targetWorkspaceId, fullRequest);
+      response = `I drafted a contract proposal for "${proposedContract.title}". Approve it to create the task and contract.`;
+    }
+
+    const saved = await repo.saveTaskChatTurn({
+      workspaceId: targetWorkspaceId,
+      sessionId: sessionId ?? undefined,
+      userMessage,
+      assistantResponse: response,
+      proposedContract
+    });
+    await repo.createAuditEvent({
+      actor: auditActor(req),
+      action: "task.chat.turn",
+      target: saved.session.id,
+      metadata: {
+        ambiguous,
+        has_proposal: Boolean(proposedContract)
+      }
+    });
+
+    return {
+      response,
+      proposed_contract: proposedContract ?? undefined,
+      session_id: saved.session.id
+    };
+  });
+
+  app.post<{
+    Body: {
+      sessionId?: string;
+      session_id?: string;
+      proposed_contract?: Record<string, unknown>;
+    };
+  }>("/tasks/chat/approve", async (req, reply) => {
+    const parsedBody = parseRequestBody(taskChatApproveSchema, req.body ?? {});
+    if (!parsedBody.ok) {
+      return reply.status(400).send({
+        error: "Invalid request body.",
+        issues: parsedBody.issues
+      });
+    }
+
+    let sessionId: string | null = null;
+    try {
+      sessionId = readAliasedUuid(
+        parsedBody.value.sessionId,
+        parsedBody.value.session_id,
+        "sessionId",
+        "session_id"
+      );
+    } catch (error) {
+      return reply.status(400).send({
+        error: (error as Error).message
+      });
+    }
+    if (!sessionId) {
+      return reply.status(400).send({
+        error: "session_id is required."
+      });
+    }
+
+    let idempotencyKey: string | null = null;
+    try {
+      idempotencyKey = readIdempotencyKey(req.headers);
+    } catch (error) {
+      return reply.status(400).send({
+        error: (error as Error).message
+      });
+    }
+
+    try {
+      const result = idempotencyKey
+        ? await repo.approveTaskChatProposalIdempotent(sessionId, {
+            idempotencyKey,
+            requestFingerprint: fingerprint({
+              session_id: sessionId,
+              action: "approve",
+              proposed_contract: parsedBody.value.proposed_contract ?? null
+            }),
+            ttlHours: idempotencyTtlHours,
+            proposalOverride: parsedBody.value.proposed_contract
+          })
+        : {
+            resource: await repo.approveTaskChatProposal(sessionId, parsedBody.value.proposed_contract),
+            duplicate: false,
+            responseStatus: 200
+          };
+
+      if (!result.duplicate) {
+        await repo.createAuditEvent({
+          actor: auditActor(req),
+          action: "task.chat.approved",
+          target: result.resource.session.id,
+          metadata: {
+            task_id: result.resource.task.id,
+            contract_id: result.resource.contract.id,
+            idempotency_key: idempotencyKey
+          }
+        });
+      }
+
+      return reply.status(result.responseStatus).send({
+        session_id: result.resource.session.id,
+        task: result.resource.task,
+        contract: result.resource.contract
+      });
+    } catch (error) {
+      const message = (error as Error).message;
+      if (message.includes("Idempotency key already used") || message.includes("already in progress")) {
+        return reply.status(409).send({ error: message });
+      }
+      if (message.includes("Task chat session not found")) {
+        return reply.status(404).send({ error: message });
+      }
+      return reply.status(400).send({ error: message });
+    }
   });
 
   app.post<{

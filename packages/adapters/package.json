@@ -8,13 +8,15 @@
   },
   "scripts": {
     "build": "tsc --project tsconfig.json",
-    "typecheck": "tsc --project tsconfig.json --noEmit"
+    "typecheck": "tsc --project tsconfig.json --noEmit",
+    "test": "tsx --test test/*.test.ts"
   },
   "dependencies": {
     "@salvo/core": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^22.15.2",
+    "tsx": "^4.19.3",
     "typescript": "^5.8.2"
   }
 }
