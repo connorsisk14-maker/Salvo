@@ -17,9 +17,22 @@
     "ux:up": "pnpm --filter @salvo/shared exec tsx ../../scripts/ux-stack.mjs up",
     "ux:down": "pnpm --filter @salvo/shared exec tsx ../../scripts/ux-stack.mjs down",
     "ux:status": "pnpm --filter @salvo/shared exec tsx ../../scripts/ux-stack.mjs status",
+    "prod:preflight": "node scripts/prod-preflight.mjs",
+    "prod:up": "node scripts/prod-up.mjs",
+    "prod:down": "node scripts/prod-down.mjs",
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
+    "lint": "pnpm exec eslint . --max-warnings=0",
     "test": "pnpm -r --if-present test",
-    "test:e2e": "node scripts/e2e-smoke.mjs"
+    "test:coverage": "c8 --reporter=text-summary --reporter=lcov --check-coverage --lines 45 --functions 45 --branches 65 --statements 45 pnpm test",
+    "audit:security": "pnpm audit --audit-level=high",
+    "test:e2e": "node scripts/e2e-smoke.mjs",
+    "test:load": "SALVO_LOAD_CONCURRENCY=3 node scripts/load-test.mjs",
+    "test:load:5": "SALVO_LOAD_CONCURRENCY=5 node scripts/load-test.mjs"
+  },
+  "devDependencies": {
+    "@typescript-eslint/parser": "^8.29.1",
+    "c8": "^10.1.3",
+    "eslint": "^9.23.0"
   }
 }
