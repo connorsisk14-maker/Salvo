@@ -238,9 +238,48 @@ const BASE_TOOL_DEFINITIONS = {
   }
 } satisfies Record<string, LlmToolDefinition>;
 
+type SkillTool = {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+};
+
+type SkillRegistryLike = {
+  list(): SkillTool[];
+};
+
 export type BuildToolDefinitionsOptions = {
   completionToolName?: string;
+  skillRegistry?: SkillRegistryLike;
 };
+
+function appendSkillDefinitions(
+  definitions: LlmToolDefinition[],
+  options: BuildToolDefinitionsOptions,
+  completionToolName: string
+): void {
+  const listedSkills = options.skillRegistry?.list() ?? [];
+  if (listedSkills.length === 0) {
+    return;
+  }
+
+  const reservedNames = new Set(definitions.map((definition) => definition.name));
+  reservedNames.add(completionToolName);
+
+  for (const skill of listedSkills) {
+    const name = skill.name.trim();
+    if (name.length === 0 || reservedNames.has(name)) {
+      continue;
+    }
+
+    definitions.push({
+      name,
+      description: skill.description,
+      inputSchema: skill.inputSchema
+    });
+    reservedNames.add(name);
+  }
+}
 
 export function buildToolDefinitions(
   contract: ContractV1,
@@ -260,6 +299,8 @@ export function buildToolDefinitions(
   if (contract.capabilities.run_tests) {
     definitions.push(BASE_TOOL_DEFINITIONS.run_command);
   }
+
+  appendSkillDefinitions(definitions, options, completionToolName);
 
   definitions.push({
     ...BASE_TOOL_DEFINITIONS.salvo_complete,

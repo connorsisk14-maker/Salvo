@@ -335,6 +335,191 @@ test("executeToolUse returns the completion payload without side effects", async
   );
 });
 
+test("executeToolUse dispatches registered skill tools and persists skill artifacts/events", async () => {
+  const harness = createHarness();
+  const context = {
+    workspacePath: "/tmp/salvo",
+    runId: "run-42",
+    adapters: {
+      queue: true
+    },
+    repo: {
+      persistence: true
+    }
+  };
+  let capturedContext: Record<string, unknown> | undefined;
+  let capturedInput: Record<string, unknown> | undefined;
+
+  const outcome = await executeToolUse({
+    block: {
+      type: "tool_use",
+      id: "skill-1",
+      name: "generate_summary",
+      input: {
+        prompt: "Summarize the run."
+      }
+    },
+    workspaceRoot: "/tmp/salvo",
+    skillRegistry: {
+      get(name) {
+        if (name !== "generate_summary") {
+          return undefined;
+        }
+
+        return {
+          name,
+          async execute(input, skillContext) {
+            capturedInput = input;
+            capturedContext = skillContext;
+
+            return {
+              ok: true,
+              output: {
+                summary: "done"
+              },
+              artifacts: [
+                {
+                  path: "artifacts/summary.md",
+                  artifactType: "markdown",
+                  metadata: {
+                    label: "summary"
+                  }
+                }
+              ],
+              events: [
+                {
+                  type: "summary.started",
+                  level: "info",
+                  payload: {
+                    phase: "start"
+                  }
+                },
+                {
+                  type: "summary.completed",
+                  level: "error",
+                  payload: {
+                    phase: "end"
+                  }
+                }
+              ]
+            };
+          }
+        };
+      }
+    },
+    skillExecutionContext: context,
+    deps: harness.deps,
+    persistence: harness.persistence
+  });
+
+  assert.equal(outcome.policyDenied, false);
+  assert.equal(outcome.toolResult.isError, undefined);
+  assert.equal(outcome.artifactPath, "/tmp/salvo/artifacts/summary.md");
+  assert.deepEqual(capturedInput, { prompt: "Summarize the run." });
+  assert.deepEqual(capturedContext, context);
+  assert.deepEqual(harness.artifacts, [
+    {
+      artifactType: "markdown",
+      path: "/tmp/salvo/artifacts/summary.md",
+      metadataJson: {
+        label: "summary"
+      }
+    }
+  ]);
+  assert.equal(
+    harness.events.some(
+      (event) => event.eventType === "tool.result" && event.payload.skill_event_type === "summary.started"
+    ),
+    true
+  );
+  assert.equal(
+    harness.events.some(
+      (event) =>
+        event.eventType === "tool.result" &&
+        event.payload.skill_event_type === "summary.completed" &&
+        event.level === "warn"
+    ),
+    true
+  );
+  assert.equal(harness.events.some((event) => event.eventType === "artifact.created"), true);
+  assert.deepEqual(JSON.parse(outcome.toolResult.content), {
+    ok: true,
+    tool: "generate_summary",
+    output: {
+      summary: "done"
+    },
+    artifacts: [
+      {
+        path: "/tmp/salvo/artifacts/summary.md",
+        artifact_type: "markdown",
+        metadata: {
+          label: "summary"
+        }
+      }
+    ],
+    events: [
+      {
+        type: "summary.started",
+        level: "info",
+        payload: {
+          phase: "start"
+        }
+      },
+      {
+        type: "summary.completed",
+        level: "error",
+        payload: {
+          phase: "end"
+        }
+      }
+    ]
+  });
+});
+
+test("executeToolUse returns an error when a registered skill throws", async () => {
+  const harness = createHarness();
+
+  const outcome = await executeToolUse({
+    block: {
+      type: "tool_use",
+      id: "skill-2",
+      name: "explode",
+      input: {}
+    },
+    workspaceRoot: "/tmp/salvo",
+    skillRegistry: {
+      get(name) {
+        if (name !== "explode") {
+          return undefined;
+        }
+
+        return {
+          name,
+          async execute() {
+            throw new Error("boom");
+          }
+        };
+      }
+    },
+    deps: harness.deps,
+    persistence: harness.persistence
+  });
+
+  assert.equal(outcome.policyDenied, false);
+  assert.equal(outcome.toolResult.isError, true);
+  assert.deepEqual(JSON.parse(outcome.toolResult.content), {
+    ok: false,
+    error: "skill_execution_failed",
+    tool: "explode",
+    message: "boom"
+  });
+  assert.equal(harness.artifacts.length, 0);
+  assert.deepEqual(
+    harness.events.map((event) => event.eventType),
+    ["tool.called", "tool.result"]
+  );
+});
+
 test("executeToolUse returns an error for unsupported tools", async () => {
   const harness = createHarness();
   const outcome = await executeToolUse({

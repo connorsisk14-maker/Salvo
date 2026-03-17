@@ -205,3 +205,64 @@ test("buildToolDefinitions allows overriding the completion tool name", () => {
 
   assert.equal(definitions.at(-1)?.name, "submit_result");
 });
+
+test("buildToolDefinitions appends registered skills before completion", () => {
+  const definitions = buildToolDefinitions(buildContract(), {
+    skillRegistry: {
+      list() {
+        return [
+          {
+            name: "generate_summary",
+            description: "Generate summary output.",
+            inputSchema: {
+              type: "object",
+              properties: {
+                prompt: {
+                  type: "string"
+                }
+              },
+              required: ["prompt"]
+            }
+          }
+        ];
+      }
+    }
+  });
+
+  assert.deepEqual(
+    definitions.map((tool) => tool.name),
+    ["read_file", "list_directory", "write_file", "run_command", "generate_summary", "salvo_complete"]
+  );
+});
+
+test("buildToolDefinitions skips skill names that collide with reserved tools", () => {
+  const definitions = buildToolDefinitions(buildContract(), {
+    completionToolName: "submit_result",
+    skillRegistry: {
+      list() {
+        return [
+          {
+            name: "run_command",
+            description: "duplicate built-in",
+            inputSchema: { type: "object" }
+          },
+          {
+            name: "submit_result",
+            description: "duplicate completion",
+            inputSchema: { type: "object" }
+          },
+          {
+            name: "team_sync",
+            description: "sync team status",
+            inputSchema: { type: "object" }
+          }
+        ];
+      }
+    }
+  });
+
+  assert.deepEqual(
+    definitions.map((tool) => tool.name),
+    ["read_file", "list_directory", "write_file", "run_command", "team_sync", "submit_result"]
+  );
+});

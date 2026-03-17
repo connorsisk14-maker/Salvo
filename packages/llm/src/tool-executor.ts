@@ -47,6 +47,44 @@ type CommandFailure = {
   durationMs?: number;
 };
 
+type SkillArtifactLike = {
+  path: string;
+  artifactType?: string;
+  metadata?: Record<string, unknown>;
+};
+
+type SkillEventLike = {
+  type: string;
+  level?: "debug" | "info" | "warn" | "error";
+  payload?: Record<string, unknown>;
+};
+
+type SkillResultLike = {
+  ok: boolean;
+  output: Record<string, unknown>;
+  artifacts: SkillArtifactLike[];
+  events: SkillEventLike[];
+};
+
+type SkillExecutionContextLike = {
+  workspacePath: string;
+  runId: string;
+  adapters: Record<string, unknown>;
+  repo: Record<string, unknown>;
+};
+
+type SkillLike = {
+  name: string;
+  execute(
+    input: Record<string, unknown>,
+    context: SkillExecutionContextLike
+  ): Promise<SkillResultLike> | SkillResultLike;
+};
+
+type SkillRegistryLike = {
+  get(name: string): SkillLike | undefined;
+};
+
 export type SalvoCompletionPayload = {
   status: "completed" | "blocked" | "failed";
   summary: string;
@@ -90,6 +128,8 @@ export type ExecuteToolUseInput = {
   workspaceRoot: string;
   requiredTestCommands?: Set<string>;
   completionToolName?: string;
+  skillRegistry?: SkillRegistryLike;
+  skillExecutionContext?: SkillExecutionContextLike;
   deps: ToolExecutorDeps;
   persistence: ToolExecutorPersistence;
 };
@@ -116,6 +156,14 @@ function buildToolResult(toolUseId: string, content: Record<string, unknown>, is
 
 function inferArtifactType(targetPath: string): string {
   return targetPath.endsWith(".json") ? "json" : "markdown";
+}
+
+function resolveArtifactPath(workspaceRoot: string, artifactPath: string): string {
+  return path.isAbsolute(artifactPath) ? artifactPath : path.resolve(workspaceRoot, artifactPath);
+}
+
+function mapSkillEventLevel(level?: SkillEventLike["level"]): "info" | "warn" {
+  return level === "warn" || level === "error" ? "warn" : "info";
 }
 
 function canonicalizeCommand(command: string, args: string[]): string {
@@ -244,6 +292,62 @@ async function emitPolicyDenied(
   payload: Record<string, unknown>
 ): Promise<void> {
   await persistence.appendRunEvent("policy.denied", "warn", payload);
+}
+
+function normalizeSkillResult(result: SkillResultLike): SkillResultLike {
+  return {
+    ok: result.ok,
+    output: isRecord(result.output) ? result.output : {},
+    artifacts: Array.isArray(result.artifacts) ? result.artifacts : [],
+    events: Array.isArray(result.events) ? result.events : []
+  };
+}
+
+async function persistSkillArtifacts(
+  input: ExecuteToolUseInput,
+  skillName: string,
+  artifacts: SkillArtifactLike[]
+): Promise<Array<{ path: string; artifact_type: string; metadata: Record<string, unknown> | undefined }>> {
+  const persistedArtifacts: Array<{ path: string; artifact_type: string; metadata: Record<string, unknown> | undefined }> = [];
+
+  for (const artifact of artifacts) {
+    const absolutePath = resolveArtifactPath(input.workspaceRoot, artifact.path);
+    const artifactType = artifact.artifactType?.trim() || inferArtifactType(absolutePath);
+    await input.persistence.createArtifact({
+      artifactType,
+      path: absolutePath,
+      metadataJson: artifact.metadata
+    });
+    await input.persistence.appendRunEvent("artifact.created", "info", {
+      tool: skillName,
+      tool_use_id: input.block.id,
+      path: absolutePath,
+      artifact_type: artifactType
+    });
+
+    persistedArtifacts.push({
+      path: absolutePath,
+      artifact_type: artifactType,
+      metadata: artifact.metadata
+    });
+  }
+
+  return persistedArtifacts;
+}
+
+async function persistSkillEvents(
+  input: ExecuteToolUseInput,
+  skillName: string,
+  events: SkillEventLike[]
+): Promise<void> {
+  for (const event of events) {
+    await input.persistence.appendRunEvent("tool.result", mapSkillEventLevel(event.level), {
+      tool: skillName,
+      tool_use_id: input.block.id,
+      skill_event_type: event.type,
+      ...(event.payload ? { payload: event.payload } : {})
+    });
+  }
 }
 
 function invalidInputOutcome(block: ToolUseBlock, message: string): ToolExecutionOutcome {
@@ -512,6 +616,60 @@ export async function executeToolUse(input: ExecuteToolUseInput): Promise<ToolEx
       completionPayload: input.block.input,
       policyDenied: false
     };
+  }
+
+  const skill = input.skillRegistry?.get(input.block.name);
+  if (skill) {
+    try {
+      const baseContext = input.skillExecutionContext ?? {
+        workspacePath: input.workspaceRoot,
+        runId: input.block.id,
+        adapters: {},
+        repo: {}
+      };
+      const skillResult = normalizeSkillResult(await skill.execute(input.block.input, baseContext));
+      const persistedArtifacts = await persistSkillArtifacts(input, skill.name, skillResult.artifacts);
+      await persistSkillEvents(input, skill.name, skillResult.events);
+
+      await emitToolResult(input.persistence, {
+        tool: skill.name,
+        tool_use_id: input.block.id,
+        ok: skillResult.ok,
+        artifact_count: persistedArtifacts.length,
+        event_count: skillResult.events.length
+      });
+
+      return {
+        toolResult: buildToolResult(input.block.id, {
+          ok: skillResult.ok,
+          tool: skill.name,
+          output: skillResult.output,
+          artifacts: persistedArtifacts,
+          events: skillResult.events
+        }, !skillResult.ok),
+        artifactPath: persistedArtifacts[0]?.path,
+        policyDenied: false
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Skill execution failed.";
+
+      await emitToolResult(input.persistence, {
+        tool: input.block.name,
+        tool_use_id: input.block.id,
+        error: "skill_execution_failed",
+        message
+      });
+
+      return {
+        toolResult: buildToolResult(input.block.id, {
+          ok: false,
+          error: "skill_execution_failed",
+          tool: input.block.name,
+          message
+        }, true),
+        policyDenied: false
+      };
+    }
   }
 
   const unsupportedResult = buildToolResult(input.block.id, {
