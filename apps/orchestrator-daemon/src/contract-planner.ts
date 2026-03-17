@@ -8,6 +8,7 @@ import {
   type LlmResponse
 } from "@salvo/llm";
 import { resolveLlmProviderAndModel } from "@salvo/shared";
+import { buildOrchestratorSoulPrompt } from "./soul";
 
 const MAX_WORKSPACE_ENTRIES = 12;
 const MAX_MEMORY_BODY_CHARS = 600;
@@ -73,19 +74,28 @@ export function buildContractPlanningPrompts(input: {
   baseContract: ContractV1;
   workspaceEntries: string[];
   memories: DbContractMemoryPrompt[];
+  recentRunHistory?: Array<{ runId: string }>;
+  activeResearchFindings?: Array<{ id: string; confidence: number }>;
 }): {
   system: string;
   user: string;
 } {
-  const system = [
-    "You are the Salvo orchestrator.",
-    "Return only a valid JSON object that fully satisfies the ContractV1 schema.",
-    "Use the provided contract_id, task_id, workspace_id, and created_at exactly as given.",
-    "Derive risk, scope, capabilities, constraints, deliverables, and success criteria from the task rather than generic defaults.",
-    "Keep family_key unchanged when the task matches the provided family memory.",
-    "Use task-specific read_paths, write_paths, forbidden_paths, and required_test_commands.",
-    "If memory excerpts are relevant, include their ids in context.memory_excerpt_ids and related source runs in context.recent_runs."
-  ].join(" ");
+  const system = buildOrchestratorSoulPrompt({
+    workspace: {
+      id: input.workspace.id,
+      name: input.workspace.name,
+      localPath: input.workspace.local_path,
+      topLevelEntries: input.workspaceEntries
+    },
+    contractFamilies: [
+      {
+        familyKey: input.baseContract.family_key,
+        memoryIds: input.memories.map((memory) => memory.id)
+      }
+    ],
+    recentRunHistory: input.recentRunHistory,
+    activeResearchFindings: input.activeResearchFindings
+  });
 
   const user = JSON.stringify(
     {
@@ -109,6 +119,8 @@ export function buildContractPlanningPrompts(input: {
         confidence: memory.confidence,
         source_run_ids: memory.source_run_ids
       })),
+      recent_run_history: input.recentRunHistory ?? [],
+      active_research_findings: input.activeResearchFindings ?? [],
       base_contract: input.baseContract
     },
     null,
@@ -162,6 +174,8 @@ export async function planContract(input: {
   baseContract: ContractV1;
   workspaceEntries: string[];
   memories: DbContractMemoryPrompt[];
+  recentRunHistory?: Array<{ runId: string }>;
+  activeResearchFindings?: Array<{ id: string; confidence: number }>;
   llmConfig: LlmConfig | null;
   client?: ContractPlanningClient;
 }): Promise<ContractPlanningResult> {

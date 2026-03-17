@@ -7,6 +7,7 @@ import {
   planContract,
   resolveContractPlannerConfig
 } from "../src/contract-planner";
+import { buildOrchestratorSoulPrompt } from "../src/soul";
 
 const baseTask = {
   id: "11111111-1111-4111-8111-111111111111",
@@ -35,6 +36,13 @@ test("buildContractPlanningPrompts includes workspace context and family memory"
     workspace: baseWorkspace,
     baseContract,
     workspaceEntries: ["dir:apps", "dir:packages", "file:README.md"],
+    recentRunHistory: [{ runId: "66666666-6666-4666-8666-666666666666" }],
+    activeResearchFindings: [
+      {
+        id: "77777777-7777-4777-8777-777777777777",
+        confidence: 0.82
+      }
+    ],
     memories: [
       {
         id: "44444444-4444-4444-8444-444444444444",
@@ -48,11 +56,45 @@ test("buildContractPlanningPrompts includes workspace context and family memory"
     ]
   });
 
-  assert.ok(prompts.system.includes("ContractV1"));
+  assert.ok(prompts.system.includes("Salvo Orchestrator Soul Prompt"));
+  assert.ok(prompts.system.includes("autonomy inside structural safety"));
+  assert.ok(prompts.system.includes("66666666-6666-4666-8666-666666666666"));
+  assert.ok(prompts.system.includes("77777777-7777-4777-8777-777777777777"));
   assert.ok(prompts.user.includes("/repo/salvo"));
   assert.ok(prompts.user.includes("dir:apps"));
   assert.ok(prompts.user.includes("coverage memory"));
   assert.ok(prompts.user.includes(baseContract.family_key));
+  assert.ok(prompts.user.includes("active_research_findings"));
+});
+
+test("buildOrchestratorSoulPrompt renders workspace, run, and research context", () => {
+  const prompt = buildOrchestratorSoulPrompt({
+    workspace: {
+      id: baseWorkspace.id,
+      name: baseWorkspace.name,
+      localPath: baseWorkspace.local_path,
+      topLevelEntries: ["dir:apps", "file:README.md"]
+    },
+    contractFamilies: [
+      {
+        familyKey: "family_test",
+        memoryIds: ["memory-1"]
+      }
+    ],
+    recentRunHistory: [{ runId: "run-1" }],
+    activeResearchFindings: [
+      {
+        id: "research-1",
+        confidence: 0.91
+      }
+    ]
+  });
+
+  assert.ok(prompt.includes("autonomy inside structural safety"));
+  assert.ok(prompt.includes("Bias toward action over deliberation"));
+  assert.ok(prompt.includes("family_test"));
+  assert.ok(prompt.includes("run-1"));
+  assert.ok(prompt.includes("research-1"));
 });
 
 test("planContract returns validated LLM contract when response is well formed", async () => {
@@ -98,6 +140,8 @@ test("planContract returns validated LLM contract when response is well formed",
     baseContract,
     workspaceEntries: ["dir:apps"],
     memories: [],
+    recentRunHistory: [],
+    activeResearchFindings: [],
     llmConfig: {
       provider: "anthropic",
       apiKey: "key",
@@ -137,6 +181,8 @@ test("planContract falls back to heuristic contract for malformed LLM output", a
     baseContract,
     workspaceEntries: [],
     memories: [],
+    recentRunHistory: [],
+    activeResearchFindings: [],
     llmConfig: {
       provider: "anthropic",
       apiKey: "key",

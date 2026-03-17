@@ -150,13 +150,14 @@ class OrchestratorDaemon {
       request: task.original_request,
       taskTitle: task.title
     });
-    const [workspace, memoryContext, integrationConfigs] = await Promise.all([
+    const [workspace, memoryContext, researchContext, integrationConfigs] = await Promise.all([
       this.repo.getWorkspace(task.workspace_id),
       this.repo.listContractMemoryPromptContext(
         task.workspace_id,
         heuristicContract.family_key,
         5
       ),
+      this.repo.listResearchContext(task.workspace_id, 5),
       this.repo.listIntegrationConfigs()
     ]);
     const workspaceContext = workspace ?? {
@@ -171,6 +172,16 @@ class OrchestratorDaemon {
       baseContract: heuristicContract,
       workspaceEntries,
       memories: memoryContext,
+      recentRunHistory: [
+        ...new Set([
+          ...memoryContext.flatMap((entry) => entry.source_run_ids),
+          ...researchContext.flatMap((entry) => entry.source_run_ids)
+        ])
+      ].map((runId) => ({ runId })),
+      activeResearchFindings: researchContext.map((entry) => ({
+        id: entry.id,
+        confidence: entry.confidence
+      })),
       llmConfig: resolveContractPlannerConfig({
         integrationConfigs,
         env: process.env
