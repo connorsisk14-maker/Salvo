@@ -17,6 +17,12 @@ import {
   planContract,
   resolveContractPlannerConfig
 } from "./contract-planner";
+import {
+  resolvePlannerHour,
+  runEveningPlannerCycle,
+  shouldRunEveningPlanner,
+  toLocalDateKey
+} from "./planner";
 import { applyTrustTierPolicy } from "./trust-tier";
 
 await initializeSecrets();
@@ -51,6 +57,14 @@ class OrchestratorDaemon {
   private cancellationTimer?: NodeJS.Timeout;
   private heartbeatTimer?: NodeJS.Timeout;
   private backupTimer?: NodeJS.Timeout;
+  private plannerTimer?: NodeJS.Timeout;
+  private plannerInFlight = false;
+  private lastPlannerDateKey?: string;
+  private readonly plannerHour = resolvePlannerHour(process.env.SALVO_PLANNER_HOUR);
+  private readonly plannerMaxDraftsPerWorkspace = readPositiveIntegerEnv(
+    "SALVO_PLANNER_MAX_DRAFTS_PER_WORKSPACE",
+    3
+  );
   private stopped = false;
 
   constructor(repo: SalvoRepository) {
@@ -88,11 +102,16 @@ class OrchestratorDaemon {
       void this.backupLoop();
     }, 60_000);
 
+    this.plannerTimer = setInterval(() => {
+      void this.plannerLoop();
+    }, 60_000);
+
     await this.claimLoop();
     await this.staleLoop();
     await this.recoverOrphanedTasksLoop();
     await this.cancellationLoop();
     await this.backupLoop();
+    await this.plannerLoop();
   }
 
   async stop(): Promise<void> {
@@ -118,6 +137,9 @@ class OrchestratorDaemon {
     }
     if (this.backupTimer) {
       clearInterval(this.backupTimer);
+    }
+    if (this.plannerTimer) {
+      clearInterval(this.plannerTimer);
     }
     await this.publishHeartbeat({ state: "stopping" });
     logger.info("daemon stopping", {
@@ -452,6 +474,70 @@ class OrchestratorDaemon {
       logger.error("scheduled backup failed", {
         error
       });
+    }
+  }
+
+  private async plannerLoop(): Promise<void> {
+    if (this.plannerInFlight) {
+      return;
+    }
+
+    const now = new Date();
+    if (
+      !shouldRunEveningPlanner({
+        now,
+        plannerHour: this.plannerHour,
+        lastPlannedDateKey: this.lastPlannerDateKey
+      })
+    ) {
+      return;
+    }
+
+    this.plannerInFlight = true;
+    try {
+      const result = await runEveningPlannerCycle({
+        repo: this.repo,
+        workerId,
+        now,
+        plannerHour: this.plannerHour,
+        env: process.env,
+        maxDraftsPerWorkspace: this.plannerMaxDraftsPerWorkspace
+      });
+      this.lastPlannerDateKey = result.dateKey;
+      logger.info("evening planner cycle completed", {
+        planning_date: result.dateKey,
+        target_date: result.targetDateKey,
+        planner_hour: this.plannerHour,
+        workspace_count: result.workspaceCount,
+        created_draft_count: result.createdDraftCount,
+        skipped_duplicate_count: result.skippedDuplicateCount
+      });
+    } catch (error) {
+      const planningDate = toLocalDateKey(now);
+      logger.error("evening planner cycle failed", {
+        planning_date: planningDate,
+        planner_hour: this.plannerHour,
+        error
+      });
+      try {
+        await this.repo.createAuditEvent({
+          actor: `system:${workerId}`,
+          action: "planning.failed",
+          metadata: {
+            planning_date: planningDate,
+            planner_hour: this.plannerHour,
+            error: error instanceof Error ? error.message : String(error)
+          }
+        });
+      } catch (auditError) {
+        logger.error("planning failure audit emission failed", {
+          planning_date: planningDate,
+          planner_hour: this.plannerHour,
+          error: auditError
+        });
+      }
+    } finally {
+      this.plannerInFlight = false;
     }
   }
 
