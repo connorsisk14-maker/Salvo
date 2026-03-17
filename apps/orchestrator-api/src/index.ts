@@ -1869,6 +1869,22 @@ export async function buildServer() {
     return { ok: true };
   });
 
+  app.post<{
+    Params: { id: string };
+  }>("/research/experiments/:id/publish", async (req, reply) => {
+    const published = await repo.publishAcceptedResearchExperiment(req.params.id);
+    if (!published) {
+      return reply.status(400).send({ error: "Experiment must be accepted and unpublished before it can be published." });
+    }
+    await repo.createAuditEvent({
+      actor: auditActor(req),
+      action: "research.experiment.published",
+      target: req.params.id,
+      metadata: {}
+    });
+    return { ok: true };
+  });
+
   app.get<{
     Querystring: { status?: ReviewStatus };
   }>("/memories", async (req) => {

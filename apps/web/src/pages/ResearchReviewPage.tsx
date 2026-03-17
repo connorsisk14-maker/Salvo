@@ -3,6 +3,7 @@ import {
   listMemories,
   listResearchExperiments,
   listResearch,
+  publishResearchExperiment,
   reviewMemory,
   reviewResearchExperiment,
   reviewResearch,
@@ -82,6 +83,18 @@ export function ResearchReviewPage() {
       await refresh();
     } catch (actionError) {
       setError((actionError as Error).message);
+    } finally {
+      setBusyKey(null);
+    }
+  }
+
+  async function onPublishExperiment(id: string) {
+    setBusyKey(`experiment-${id}-publish`);
+    try {
+      await publishResearchExperiment(id);
+      await refresh();
+    } catch (publishError) {
+      setError((publishError as Error).message);
     } finally {
       setBusyKey(null);
     }
@@ -223,6 +236,18 @@ export function ResearchReviewPage() {
                   >
                     Reject
                   </button>
+                  {experiment.review_status === "accepted" && !experiment.published_at ? (
+                    <button
+                      type="button"
+                      className="button-link"
+                      disabled={busyKey === `experiment-${experiment.id}-publish`}
+                      onClick={() => {
+                        void onPublishExperiment(experiment.id);
+                      }}
+                    >
+                      Publish memory
+                    </button>
+                  ) : null}
                 </td>
               </tr>
             ))}

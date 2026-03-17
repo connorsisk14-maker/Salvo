@@ -295,6 +295,10 @@ export type ApiTaskChatApproveResponse = {
 const baseUrl = import.meta.env.VITE_SALVO_API_URL ?? "http://localhost:8787";
 export const controlPlaneBaseUrl = baseUrl;
 
+export function createRunEventStream(runId: string): EventSource {
+  return new EventSource(`${controlPlaneBaseUrl}/stream/runs/${runId}`);
+}
+
 function buildHeaders(init: RequestInit | undefined): Headers {
   const headers = new Headers(init?.headers ?? {});
   if (init?.body && !headers.has("content-type")) {
@@ -577,6 +581,12 @@ export function reviewResearchExperiment(
   return request<ApiActionResponse>(`/research/experiments/${id}/review`, {
     method: "POST",
     body: JSON.stringify({ status })
+  });
+}
+
+export function publishResearchExperiment(id: string): Promise<ApiActionResponse> {
+  return request<ApiActionResponse>(`/research/experiments/${id}/publish`, {
+    method: "POST"
   });
 }
 
