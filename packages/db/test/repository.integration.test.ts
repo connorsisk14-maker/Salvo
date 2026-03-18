@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Pool } from "pg";
 import { randomUUID } from "node:crypto";
+import type { TaskPriority } from "@salvo/shared";
 import { SalvoRepository } from "../src/repository";
 
 const databaseUrl = process.env.SALVO_TEST_DATABASE_URL ?? process.env.SALVO_DATABASE_URL;
@@ -98,13 +99,15 @@ if (!databaseUrl) {
     await repo.close();
   });
 
+
   test("claim semantics: two workers cannot claim the same queued task", async () => {
     const workspace = await repo.ensureWorkspace(`claim-${randomUUID()}`, process.cwd());
     const task = await repo.createTask({
       workspaceId: workspace.id,
       title: "only once",
       request: "claim me",
-      requiresApproval: false
+      requiresApproval: false,
+      priority: "urgent"
     });
 
     const [workerA, workerB] = await Promise.all([
@@ -115,6 +118,39 @@ if (!databaseUrl) {
     const claimed = [workerA, workerB].filter(Boolean);
     assert.equal(claimed.length, 1);
     assert.equal(claimed[0]?.id, task.id);
+    assert.equal(claimed[0]?.priority, "urgent");
+  });
+
+  test("claimNextTask honors priority order before created_at", async () => {
+    const workspace = await repo.ensureWorkspace(`priority-${randomUUID()}`, process.cwd());
+    const priorities: Array<{ label: string; priority: TaskPriority }> = [
+      { label: "task-low", priority: "low" },
+      { label: "task-med", priority: "medium" },
+      { label: "task-high", priority: "high" },
+      { label: "task-urgent", priority: "urgent" }
+    ];
+
+    await Promise.all(
+      priorities.map(({ label, priority }) =>
+        repo.createTask({
+          workspaceId: workspace.id,
+          title: `priority ${label}`,
+          request: `run ${label}`,
+          priority
+        })
+      )
+    );
+
+    const expected = ["urgent", "high", "medium", "low"];
+    const actual: string[] = [];
+
+    for (let i = 0; i < expected.length; i += 1) {
+      const claimed = await repo.claimNextTask(`worker-priority-${i}`);
+      assert.ok(claimed, "expected a task to be claimed");
+      actual.push(claimed?.priority ?? "");
+    }
+
+    assert.deepEqual(actual, expected);
   });
 
   test("tasks with pending dependencies block with the provided reason", async () => {

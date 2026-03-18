@@ -19,6 +19,7 @@ import {
   BackupManager,
   DFW_LEAD_ZONE_CONFIG,
   SALVO_LEAD_PIPELINE_SHEET_ID,
+  TASK_PRIORITIES,
   initializeSecrets
 } from "@salvo/shared";
 import { z } from "zod";
@@ -54,7 +55,8 @@ const taskCreateSchema = z.object({
   title: z.string().trim().min(1, "Title is required.").max(taskTitleMaxLength, `Title must be ${taskTitleMaxLength} characters or fewer.`),
   request: z.string().trim().min(1, "Request is required.").max(taskRequestMaxLength, `Request must be ${taskRequestMaxLength} characters or fewer.`),
   workspaceId: z.string().uuid("workspaceId must be a valid UUID.").optional(),
-  requiresApproval: z.boolean().optional()
+  requiresApproval: z.boolean().optional(),
+  priority: z.enum(TASK_PRIORITIES).optional()
 }).strict();
 
 const taskChatSchema = z.object({
@@ -1863,6 +1865,7 @@ export async function buildServer() {
       request: string;
       workspaceId?: string;
       requiresApproval?: boolean;
+      priority?: (typeof TASK_PRIORITIES)[number];
     };
   }>("/tasks", async (req, reply) => {
     const parsedBody = parseRequestBody(taskCreateSchema, req.body ?? {});
@@ -1889,7 +1892,8 @@ export async function buildServer() {
               title: body.title,
               request: body.request,
               workspaceId: body.workspaceId,
-              requiresApproval: body.requiresApproval
+              requiresApproval: body.requiresApproval,
+              priority: body.priority
             },
             {
               idempotencyKey,
@@ -1902,7 +1906,8 @@ export async function buildServer() {
               title: body.title,
               request: body.request,
               workspaceId: body.workspaceId,
-              requiresApproval: body.requiresApproval
+              requiresApproval: body.requiresApproval,
+              priority: body.priority
             }),
             duplicate: false,
             responseStatus: 201

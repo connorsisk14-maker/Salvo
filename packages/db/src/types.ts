@@ -6,6 +6,7 @@ import type {
   RunEventLevel,
   RunEventType,
   RunStatus,
+  TaskPriority,
   TaskStatus
 } from "@salvo/shared";
 
@@ -52,6 +53,7 @@ export type DbTask = {
   updated_at: string;
   dependency_block_reason: string | null;
   dependency_blocked_at: string | null;
+  priority: TaskPriority;
 };
 
 export type TaskChatSessionStatus = "active" | "approved";
@@ -332,6 +334,7 @@ export type CreateTaskInput = {
   requiresApproval?: boolean;
   dependencies?: TaskDependencyInput[];
   preferredAgentProfile?: AgentProfile;
+  priority?: TaskPriority;
 };
 
 export type TaskDependencyInput = {

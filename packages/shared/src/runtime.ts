@@ -11,6 +11,12 @@ export const TASK_STATUSES = [
 
 export type TaskStatus = (typeof TASK_STATUSES)[number];
 
+export const TASK_PRIORITIES = ["urgent", "high", "medium", "low"] as const;
+
+export type TaskPriority = (typeof TASK_PRIORITIES)[number];
+
+export const DEFAULT_TASK_PRIORITY: TaskPriority = "medium";
+
 export const CONTRACT_STATUSES = [
   "draft",
   "approved",

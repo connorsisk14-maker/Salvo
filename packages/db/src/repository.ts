@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { Pool, PoolClient, QueryResultRow } from "pg";
 import {
   AGENT_PROFILES,
+  DEFAULT_TASK_PRIORITY,
   DEFAULT_AGENT_TRUST_TIER_BY_PROFILE,
   assertRunTransition,
   assertTaskTransition,
@@ -75,6 +76,14 @@ const CANCELLABLE_RUN_STATUSES = new Set<RunStatus>([
 ]);
 
 const LEAD_AGENT_PROFILES: AgentProfile[] = ["lead_scraper", "lead_strategist"];
+
+const TASK_PRIORITY_ORDER_SQL = `case priority
+    when 'urgent' then 1
+    when 'high' then 2
+    when 'medium' then 3
+    when 'low' then 4
+    else 5
+  end`;
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -445,9 +454,10 @@ export class SalvoRepository {
          normalized_request,
          status,
          requires_approval,
-         preferred_agent_profile
+         preferred_agent_profile,
+         priority
        )
-       values ($1, $2, $3, $4, 'queued', $5, $6)
+       values ($1, $2, $3, $4, 'queued', $5, $6, $7)
        returning *`,
       [
         workspaceId,
@@ -455,7 +465,8 @@ export class SalvoRepository {
         request,
         normalized,
         input.requiresApproval ?? false,
-        input.preferredAgentProfile ?? null
+        input.preferredAgentProfile ?? null,
+        input.priority ?? DEFAULT_TASK_PRIORITY
       ]
     );
 
@@ -836,12 +847,24 @@ export class SalvoRepository {
     const result = await this.pool.query<DbTask>(
       `select *
        from public.salvo_tasks
-       order by created_at desc
+       order by ${TASK_PRIORITY_ORDER_SQL}, created_at desc
        limit $1`,
       [limit]
     );
 
     return result.rows;
+  }
+
+  async countClaimableTasks(): Promise<number> {
+    const result = await this.pool.query<{ count: string }>(
+      `select count(*)::text as count
+       from public.salvo_tasks
+       where status = 'queued'
+         and cancelled_at is null
+         and (requires_approval = false or approved_at is not null)`
+    );
+
+    return Number(result.rows[0]?.count ?? "0");
   }
 
   async getTask(taskId: string): Promise<DbTask | null> {
@@ -1281,7 +1304,7 @@ export class SalvoRepository {
              where status = 'queued'
                and cancelled_at is null
                and (requires_approval = false or approved_at is not null)
-             order by created_at asc
+             order by ${TASK_PRIORITY_ORDER_SQL}, created_at asc
              for update skip locked
              limit 1
            )

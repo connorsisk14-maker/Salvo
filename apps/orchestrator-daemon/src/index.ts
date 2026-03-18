@@ -63,8 +63,9 @@ function readPositiveIntegerEnv(name: string, fallback: number): number {
 export class OrchestratorDaemon {
   private readonly repo: SalvoRepository;
   private readonly backupManager = new BackupManager();
-  private readonly activeRuns = new Map<string, ChildProcess>();
+  protected readonly activeRuns = new Map<string, ChildProcess>();
   private readonly checkpointResumeAttempts = new Map<string, number>();
+  private readonly maxConcurrentRunners = readPositiveIntegerEnv("SALVO_MAX_CONCURRENT_RUNNERS", 4);
   private claimTimer?: NodeJS.Timeout;
   private staleTimer?: NodeJS.Timeout;
   private recoveryTimer?: NodeJS.Timeout;
@@ -79,6 +80,7 @@ export class OrchestratorDaemon {
     "SALVO_PLANNER_MAX_DRAFTS_PER_WORKSPACE",
     3
   );
+  private claimInFlight = false;
   private stopped = false;
 
   constructor(repo: SalvoRepository) {
@@ -162,23 +164,71 @@ export class OrchestratorDaemon {
     await this.repo.close();
   }
 
+  private async readQueueDepth(): Promise<number | null> {
+    const maybeRepo = this.repo as SalvoRepository & {
+      countClaimableTasks?: () => Promise<number>;
+    };
+    if (typeof maybeRepo.countClaimableTasks !== "function") {
+      return null;
+    }
+    return maybeRepo.countClaimableTasks();
+  }
+
+  private canClaimTasks(): boolean {
+    const maybeRepo = this.repo as SalvoRepository & {
+      claimNextTask?: (workerId: string) => Promise<DbTask | null>;
+    };
+    return typeof maybeRepo.claimNextTask === "function";
+  }
+
+  private triggerClaimRefill(): void {
+    if (!this.canClaimTasks()) {
+      return;
+    }
+    void this.claimLoop().catch((error) => {
+      logger.error("claim loop refill failed", {
+        error
+      });
+    });
+  }
+
   private async publishHeartbeat(extra?: Record<string, unknown>): Promise<void> {
+    const queueDepth = await this.readQueueDepth();
     await this.repo.upsertDaemonHeartbeat("orchestrator", workerId, {
       active_runs: this.activeRuns.size,
+      max_concurrent_runs: this.maxConcurrentRunners,
+      available_runner_slots: Math.max(this.maxConcurrentRunners - this.activeRuns.size, 0),
+      queue_depth: queueDepth,
       ...extra
     });
   }
 
-  private async claimLoop(): Promise<void> {
-    const task = await this.repo.claimNextTask(workerId);
-    if (!task) {
+  protected async claimLoop(): Promise<void> {
+    if (this.claimInFlight || this.stopped) {
       return;
     }
-    logger.info("task claimed", {
-      task_id: task.id,
-      workspace_id: task.workspace_id
-    });
+    this.claimInFlight = true;
+    try {
+      while (this.activeRuns.size < this.maxConcurrentRunners) {
+        const task = await this.repo.claimNextTask(workerId);
+        if (!task) {
+          return;
+        }
+        logger.info("task claimed", {
+          task_id: task.id,
+          workspace_id: task.workspace_id,
+          priority: task.priority,
+          active_runs: this.activeRuns.size,
+          max_concurrent_runs: this.maxConcurrentRunners
+        });
+        await this.processClaimedTask(task);
+      }
+    } finally {
+      this.claimInFlight = false;
+    }
+  }
 
+  protected async processClaimedTask(task: DbTask): Promise<void> {
     const heuristicContract = buildHeuristicContract({
       contractId: randomUUID(),
       taskId: task.id,
@@ -641,6 +691,12 @@ export class OrchestratorDaemon {
 
     const child = this.spawnRunnerProcess(run);
     this.activeRuns.set(run.id, child);
+    void this.publishHeartbeat().catch((error) => {
+      logger.warn("failed to publish heartbeat after runner spawn", {
+        run_id: run.id,
+        error
+      });
+    });
     logger.info("runner spawned", {
       run_id: run.id,
       task_id: run.task_id,
@@ -649,6 +705,8 @@ export class OrchestratorDaemon {
 
     child.on("error", async (error) => {
       this.activeRuns.delete(run.id);
+      void this.publishHeartbeat().catch(() => {});
+      this.triggerClaimRefill();
       logger.error("runner process error", {
         run_id: run.id,
         task_id: run.task_id,
@@ -671,6 +729,8 @@ export class OrchestratorDaemon {
 
     child.on("close", async (code, signal) => {
       this.activeRuns.delete(run.id);
+      void this.publishHeartbeat().catch(() => {});
+      this.triggerClaimRefill();
       logger.info("runner process closed", {
         run_id: run.id,
         task_id: run.task_id,

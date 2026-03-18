@@ -1,5 +1,7 @@
 import { clearStoredApiToken, getStoredApiToken } from "./auth";
 
+export type ApiTaskPriority = "urgent" | "high" | "medium" | "low";
+
 export type ApiTask = {
   id: string;
   title: string;
@@ -11,6 +13,7 @@ export type ApiTask = {
   dependency_block_reason: string | null;
   dependency_blocked_at: string | null;
   dependencies: ApiTaskDependency[];
+  priority?: ApiTaskPriority | null;
 };
 
 export type ApiContract = {
@@ -505,13 +508,15 @@ export function createTask(input: {
   title: string;
   request: string;
   requiresApproval: boolean;
+  priority?: ApiTaskPriority;
 }): Promise<ApiTask> {
   return request<ApiTask>("/tasks", {
     method: "POST",
     body: JSON.stringify({
       title: input.title,
       request: input.request,
-      requiresApproval: input.requiresApproval
+      requiresApproval: input.requiresApproval,
+      priority: input.priority
     })
   });
 }

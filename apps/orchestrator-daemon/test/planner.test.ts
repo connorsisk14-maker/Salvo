@@ -43,6 +43,7 @@ function buildTask(overrides?: Partial<DbTask>): DbTask {
     original_request: "Task request",
     normalized_request: "Task request",
     status: "completed",
+    priority: "medium",
     requires_approval: false,
     approved_at: null,
     cancelled_at: null,

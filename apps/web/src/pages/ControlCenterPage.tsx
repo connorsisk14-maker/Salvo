@@ -21,6 +21,7 @@ import {
   type ApiRestartTarget,
   type ApiRun,
   type ApiTask,
+  type ApiTaskPriority,
   type ApiTrustTier,
   type ApiTrustTierOverview
 } from "../api/control-plane";
@@ -59,6 +60,18 @@ const TRUST_TIER_OPTIONS: ApiTrustTier["trust_tier"][] = [
   "probation"
 ];
 
+const TASK_PRIORITY_OPTIONS: Array<{ value: ApiTaskPriority; label: string }> = [
+  { value: "urgent", label: "Urgent" },
+  { value: "high", label: "High" },
+  { value: "medium", label: "Medium" },
+  { value: "low", label: "Low" }
+];
+
+function formatTaskPriority(priority?: ApiTaskPriority | null): string {
+  const option = TASK_PRIORITY_OPTIONS.find((entry) => entry.value === priority);
+  return option?.label ?? "Medium";
+}
+
 export function ControlCenterPage() {
   const [title, setTitle] = useState("Create run summary scaffolding");
   const [request, setRequest] = useState(
@@ -86,6 +99,7 @@ export function ControlCenterPage() {
   const [budgetLimitUsd, setBudgetLimitUsd] = useState("25");
   const [trustTierEdits, setTrustTierEdits] = useState<Record<string, ApiTrustTier["trust_tier"]>>({});
   const [error, setError] = useState<string | null>(null);
+  const [taskPriority, setTaskPriority] = useState<ApiTaskPriority>("medium");
 
   const sortedRuns = useMemo(
     () => [...runs].sort((a, b) => b.created_at.localeCompare(a.created_at)),
@@ -175,9 +189,11 @@ export function ControlCenterPage() {
       await createTask({
         title,
         request,
-        requiresApproval
+        requiresApproval,
+        priority: taskPriority
       });
       setRequest("");
+      setTaskPriority("medium");
       await refresh();
       setError(null);
     } catch (submitError) {
@@ -317,6 +333,15 @@ export function ControlCenterPage() {
             <p className="muted">Age: {orchestratorHealth?.age_seconds ?? "-"}s</p>
             <p className="muted">
               Active runs: {(orchestratorHealth?.metadata?.active_runs as number | undefined) ?? "-"}
+            </p>
+            <p className="muted">
+              Capacity: {(orchestratorHealth?.metadata?.max_concurrent_runs as number | undefined) ?? "-"}
+            </p>
+            <p className="muted">
+              Available slots: {(orchestratorHealth?.metadata?.available_runner_slots as number | undefined) ?? "-"}
+            </p>
+            <p className="muted">
+              Queue depth: {(orchestratorHealth?.metadata?.queue_depth as number | undefined) ?? "-"}
             </p>
           </article>
 
@@ -677,6 +702,20 @@ export function ControlCenterPage() {
             />
             Require manual approval before daemon claim
           </label>
+          <label>
+            Queue priority
+            <select
+              value={taskPriority}
+              onChange={(event) => setTaskPriority(event.target.value as ApiTaskPriority)}
+            >
+              {TASK_PRIORITY_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+            <small className="muted">Urgent tasks are claimed before high, medium, and low work.</small>
+          </label>
           <button className="button-link" disabled={submitting} type="submit">
             {submitting ? "Submitting..." : "Submit task"}
           </button>
@@ -689,6 +728,7 @@ export function ControlCenterPage() {
           <thead>
             <tr>
               <th>Task</th>
+              <th>Priority</th>
               <th>Status</th>
               <th>Approval</th>
               <th>Actions</th>
@@ -701,6 +741,7 @@ export function ControlCenterPage() {
                   <strong>{task.title}</strong>
                   <div className="muted mono">{task.id}</div>
                 </td>
+                <td>{formatTaskPriority(task.priority)}</td>
                 <td>{task.status}</td>
                 <td>
                   {task.requires_approval

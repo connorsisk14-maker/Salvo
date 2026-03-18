@@ -51,6 +51,23 @@ class TestDaemon extends OrchestratorDaemon {
   }
 }
 
+class CapacityTestDaemon extends OrchestratorDaemon {
+  public claimedTaskIds: string[] = [];
+
+  constructor(repo: SalvoRepository) {
+    super(repo);
+  }
+
+  protected async processClaimedTask(task: DbTask): Promise<void> {
+    this.claimedTaskIds.push(task.id);
+    this.activeRuns.set(task.id, new FakeChildProcess() as unknown as ChildProcess);
+  }
+
+  public async runClaimLoop(): Promise<void> {
+    await this.claimLoop();
+  }
+}
+
 function createRunStub(status: DbRun["status"]): { run: DbRun; task: DbTask; repo: Record<string, unknown> } {
   const run: DbRun = {
     id: `run-${status}`,
@@ -79,6 +96,7 @@ function createRunStub(status: DbRun["status"]): { run: DbRun; task: DbTask; rep
     original_request: "Do something",
     normalized_request: "do something",
     status: "queued",
+    priority: "medium",
     requires_approval: false,
     approved_at: null,
     cancelled_at: null,
@@ -100,6 +118,9 @@ function createRunStub(status: DbRun["status"]): { run: DbRun; task: DbTask; rep
     getRun: async (id: string) => runs.get(id) ?? null,
     loadRunCheckpoint: async (id: string) => checkpoints.get(id) ?? null,
     getRunFinalPayload: async (id: string) => finalPayloads.get(id) ?? null,
+    claimNextTask: async () => null,
+    countClaimableTasks: async () => 0,
+    upsertDaemonHeartbeat: async () => null,
     transitionRunStatus: async (id: string, status: DbRun["status"]) => {
       const entry = runs.get(id);
       if (entry) {
@@ -133,6 +154,48 @@ test("runner close during starting fails run without evaluation", async () => {
   assert.equal(lookedUpRun?.status, "failed");
   assert.equal(task.status, "failed");
   assert.equal(daemon.evaluatedRuns.length, 0);
+});
+
+test("claim loop fills available runner capacity", async () => {
+  const previous = process.env.SALVO_MAX_CONCURRENT_RUNNERS;
+  process.env.SALVO_MAX_CONCURRENT_RUNNERS = "2";
+
+  try {
+    const tasks: DbTask[] = ["task-a", "task-b", "task-c"].map((id) => ({
+      id,
+      workspace_id: "workspace-1",
+      title: id,
+      original_request: `request ${id}`,
+      normalized_request: `request ${id}`,
+      status: "queued",
+      priority: "medium",
+      requires_approval: false,
+      approved_at: null,
+      cancelled_at: null,
+      claimed_by: null,
+      claimed_at: null,
+      preferred_agent_profile: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      dependency_block_reason: null,
+      dependency_blocked_at: null
+    }));
+
+    const repo = {
+      claimNextTask: async () => tasks.shift() ?? null
+    };
+
+    const daemon = new CapacityTestDaemon(repo as unknown as SalvoRepository);
+    await daemon.runClaimLoop();
+
+    assert.deepEqual(daemon.claimedTaskIds, ["task-a", "task-b"]);
+  } finally {
+    if (previous === undefined) {
+      delete process.env.SALVO_MAX_CONCURRENT_RUNNERS;
+    } else {
+      process.env.SALVO_MAX_CONCURRENT_RUNNERS = previous;
+    }
+  }
 });
 
 test("runner close after terminal status skips evaluation", async () => {
@@ -176,6 +239,18 @@ test("runner close during running evaluates when no checkpoint exists", async ()
   assert.deepEqual(daemon.evaluatedRuns, [run.id]);
 });
 
+test("launchRun does not spawn the same run twice locally", async () => {
+  const { run, repo } = createRunStub("running");
+  const daemon = new TestDaemon(repo as unknown as SalvoRepository);
+  await daemon.launch(run);
+  const firstChild = daemon.child;
+  assert(firstChild, "first child should exist");
+
+  await daemon.launch(run);
+
+  assert.equal(daemon.child, firstChild);
+});
+
 test("budget check failure marks task as failed", async () => {
   const auditEvents: unknown[] = [];
   const transitions: Array<{ id: string; status: DbTask["status"] }> = [];
@@ -196,6 +271,7 @@ test("budget check failure marks task as failed", async () => {
     original_request: "Budget",
     normalized_request: "budget",
     status: "queued",
+    priority: "medium",
     requires_approval: false,
     approved_at: null,
     cancelled_at: null,
