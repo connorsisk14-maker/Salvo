@@ -214,6 +214,82 @@ test("runAgentLoop blocks when the tool call limit is exceeded", async () => {
   assert.equal(result.exitReason, "tool_call_limit");
 });
 
+test("runAgentLoop blocks when cumulative input token usage exceeds the run budget", async () => {
+  const contract = buildContract();
+  contract.constraints.max_total_input_tokens = 150;
+
+  const responses: LlmResponse[] = [
+    {
+      provider: "anthropic",
+      model: "claude-sonnet-4",
+      stopReason: "tool_use",
+      usage: { inputTokens: 100, outputTokens: 10 },
+      content: [
+        {
+          type: "tool_use",
+          id: "tool-1",
+          name: "read_file",
+          input: { path: "README.md" }
+        }
+      ],
+      raw: {}
+    },
+    {
+      provider: "anthropic",
+      model: "claude-sonnet-4",
+      stopReason: "tool_use",
+      usage: { inputTokens: 60, outputTokens: 10 },
+      content: [
+        {
+          type: "tool_use",
+          id: "tool-2",
+          name: "write_file",
+          input: { path: "run-summary.md", content: "# blocked" }
+        }
+      ],
+      raw: {}
+    }
+  ];
+  const executedTools: string[] = [];
+  const events: Array<{ eventType: string; payload: Record<string, unknown> }> = [];
+
+  const result = await runAgentLoop({
+    provider: "anthropic",
+    model: "claude-sonnet-4",
+    systemPrompt: "system",
+    userPrompt: "user",
+    contract,
+    workspaceRoot: "/tmp/workspace",
+    createMessage: async () => {
+      const next = responses.shift();
+      if (!next) {
+        throw new Error("Unexpected extra LLM call.");
+      }
+      return next;
+    },
+    executeToolUse: async (block) => {
+      executedTools.push(block.name);
+      return {
+        toolResult: {
+          type: "tool_result",
+          toolUseId: block.id,
+          content: JSON.stringify({ ok: true })
+        },
+        policyDenied: false
+      };
+    },
+    appendRunEvent: async (eventType, _level, payload) => {
+      events.push({ eventType, payload });
+    }
+  });
+
+  assert.equal(result.finalPayload.status, "blocked");
+  assert.equal(result.exitReason, "max_total_input_tokens");
+  assert.deepEqual(executedTools, ["read_file"]);
+  assert.equal(events.some((event) => event.eventType === "resource.limit_reached"), true);
+  assert.equal(events.at(-1)?.payload.limit_name, "max_total_input_tokens");
+});
+
 test("runAgentLoop blocks on policy denial when the contract requires it", async () => {
   const contract = buildContract();
   contract.failure_handling.stop_on_policy_denial = true;

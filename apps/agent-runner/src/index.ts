@@ -9,6 +9,7 @@ import {
   buildRunnerPrompts,
   collectPromptContext,
   commandEvidence,
+  type RunnerUsage,
   normalizeArtifacts,
   parseContractPolicy,
   reserveToolCall,
@@ -43,6 +44,53 @@ function readIntegrationStringList(config: Record<string, unknown>, key: string)
   return value.flatMap((entry) =>
     typeof entry === "string" && entry.trim().length > 0 ? [entry.trim()] : []
   );
+}
+
+function detectUsageLimitViolation(
+  usage: RunnerUsage,
+  constraints: {
+    max_total_input_tokens: number;
+    max_total_output_tokens: number;
+    max_total_cost_usd: number;
+  }
+): { reason: string; message: string; payload: Record<string, unknown> } | null {
+  if (usage.input_tokens > constraints.max_total_input_tokens) {
+    return {
+      reason: "max_total_input_tokens",
+      message: `Run exceeded the input token limit of ${constraints.max_total_input_tokens}.`,
+      payload: {
+        limit_name: "max_total_input_tokens",
+        limit: constraints.max_total_input_tokens,
+        observed: usage.input_tokens
+      }
+    };
+  }
+
+  if (usage.output_tokens > constraints.max_total_output_tokens) {
+    return {
+      reason: "max_total_output_tokens",
+      message: `Run exceeded the output token limit of ${constraints.max_total_output_tokens}.`,
+      payload: {
+        limit_name: "max_total_output_tokens",
+        limit: constraints.max_total_output_tokens,
+        observed: usage.output_tokens
+      }
+    };
+  }
+
+  if (usage.cost_usd > constraints.max_total_cost_usd) {
+    return {
+      reason: "max_total_cost_usd",
+      message: `Run exceeded the cost limit of $${constraints.max_total_cost_usd.toFixed(2)}.`,
+      payload: {
+        limit_name: "max_total_cost_usd",
+        limit: constraints.max_total_cost_usd,
+        observed: Number(usage.cost_usd.toFixed(6))
+      }
+    };
+  }
+
+  return null;
 }
 
 async function main(): Promise<void> {
@@ -269,6 +317,33 @@ async function main(): Promise<void> {
 
     await repo.appendRunEvent(run.id, "usage.reported", "info", llmResult.usage);
     logger.info("usage reported", llmResult.usage);
+
+    const usageLimitViolation = detectUsageLimitViolation(llmResult.usage, contractJson.constraints);
+    if (usageLimitViolation) {
+      await repo.appendRunEvent(run.id, "resource.limit_reached", "warn", usageLimitViolation.payload);
+      await repo.appendRunEvent(run.id, "run.final_payload", "error", {
+        status: "blocked",
+        summary: "Agent run stopped before completion.",
+        deliverables: [],
+        evidence: {
+          tests_run: [],
+          command_results: [],
+          files_changed: 0
+        },
+        roadblocks: [
+          {
+            type: "resource_limit",
+            description: usageLimitViolation.message
+          }
+        ],
+        learnings: []
+      });
+      await repo.appendRunEvent(run.id, "run.failed", "error", {
+        reason: usageLimitViolation.reason
+      });
+      process.exitCode = 1;
+      return;
+    }
 
     const artifacts = normalizeArtifacts(llmResult.output, contractJson);
     const createdArtifacts: string[] = [];

@@ -44,6 +44,12 @@ type RequiredTestRun = {
   denied?: boolean;
 };
 
+type ResourceLimitViolation = {
+  reason: "max_total_input_tokens" | "max_total_output_tokens" | "max_total_cost_usd";
+  description: string;
+  payload: Record<string, unknown>;
+};
+
 function buildUsage(response: LlmResponse): RunnerUsage {
   return {
     provider: response.provider,
@@ -77,6 +83,49 @@ function aggregateUsage(total: RunnerUsage, delta: RunnerUsage): RunnerUsage {
     output_tokens: total.output_tokens + delta.output_tokens,
     cost_usd: Number((total.cost_usd + delta.cost_usd).toFixed(6))
   };
+}
+
+function detectResourceLimitViolation(
+  contract: ContractV1,
+  usage: RunnerUsage
+): ResourceLimitViolation | null {
+  if (usage.input_tokens > contract.constraints.max_total_input_tokens) {
+    return {
+      reason: "max_total_input_tokens",
+      description: `Run exceeded the input token limit of ${contract.constraints.max_total_input_tokens}.`,
+      payload: {
+        limit_name: "max_total_input_tokens",
+        limit: contract.constraints.max_total_input_tokens,
+        observed: usage.input_tokens
+      }
+    };
+  }
+
+  if (usage.output_tokens > contract.constraints.max_total_output_tokens) {
+    return {
+      reason: "max_total_output_tokens",
+      description: `Run exceeded the output token limit of ${contract.constraints.max_total_output_tokens}.`,
+      payload: {
+        limit_name: "max_total_output_tokens",
+        limit: contract.constraints.max_total_output_tokens,
+        observed: usage.output_tokens
+      }
+    };
+  }
+
+  if (usage.cost_usd > contract.constraints.max_total_cost_usd) {
+    return {
+      reason: "max_total_cost_usd",
+      description: `Run exceeded the cost limit of $${contract.constraints.max_total_cost_usd.toFixed(2)}.`,
+      payload: {
+        limit_name: "max_total_cost_usd",
+        limit: contract.constraints.max_total_cost_usd,
+        observed: Number(usage.cost_usd.toFixed(6))
+      }
+    };
+  }
+
+  return null;
 }
 
 function buildBlockedPayload(input: {
@@ -308,6 +357,20 @@ export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResu
     turn += 1;
     const response = await input.createMessage(input.systemPrompt, messages, tools);
     Object.assign(usage, aggregateUsage(usage, await appendLlmEvents(input, turn, response)));
+
+    const resourceLimitViolation = detectResourceLimitViolation(input.contract, usage);
+    if (resourceLimitViolation) {
+      await input.appendRunEvent("resource.limit_reached", "warn", resourceLimitViolation.payload);
+      return {
+        finalPayload: buildBlockedPayload({
+          summary: "Agent loop stopped before completion.",
+          reason: "resource_limit",
+          description: resourceLimitViolation.description
+        }),
+        usage,
+        exitReason: resourceLimitViolation.reason
+      };
+    }
 
     if (response.content.length > 0) {
       messages.push({

@@ -57,6 +57,9 @@ export const ContractV1Schema = z.object({
   constraints: z.object({
     max_runtime_minutes: z.number().int().positive().default(25),
     max_tool_calls: z.number().int().positive().default(200),
+    max_total_input_tokens: z.number().int().positive().default(60_000),
+    max_total_output_tokens: z.number().int().positive().default(20_000),
+    max_total_cost_usd: z.number().positive().default(3),
     no_destructive_commands: z.boolean().default(true),
     approval_required_for: z.array(z.string()).default([])
   }),
@@ -257,6 +260,9 @@ export function buildContractV1(input: BuildContractInput): ContractV1 {
     constraints: {
       max_runtime_minutes: 25,
       max_tool_calls: 200,
+      max_total_input_tokens: 60_000,
+      max_total_output_tokens: 20_000,
+      max_total_cost_usd: 3,
       no_destructive_commands: true,
       approval_required_for: approvalRequired
         ? ["schema_change", "dependency_install"]

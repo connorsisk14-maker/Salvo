@@ -74,6 +74,9 @@ test("normalizeArtifacts ensures required contract deliverables exist", () => {
     constraints: {
       max_runtime_minutes: 25,
       max_tool_calls: 20,
+      max_total_input_tokens: 60_000,
+      max_total_output_tokens: 20_000,
+      max_total_cost_usd: 3,
       no_destructive_commands: true,
       approval_required_for: []
     },
@@ -131,6 +134,9 @@ test("buildRunnerPrompts includes contract and workspace context", () => {
     constraints: {
       max_runtime_minutes: 25,
       max_tool_calls: 20,
+      max_total_input_tokens: 60_000,
+      max_total_output_tokens: 20_000,
+      max_total_cost_usd: 3,
       no_destructive_commands: true,
       approval_required_for: []
     },

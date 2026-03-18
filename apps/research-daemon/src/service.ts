@@ -3,6 +3,7 @@ import { ResearchRepository } from "@salvo/db";
 import {
   buildExperimentMarkdown,
   deriveExperimentConfidence,
+  deriveExperimentInsights,
   deriveExperimentMetrics,
   normalizeExperimentSamples
 } from "./analysis";
@@ -55,13 +56,15 @@ export class ResearchAnalysisService {
       const sorted = normalizeExperimentSamples(ingestions);
       const metrics = deriveExperimentMetrics(sorted);
       const confidence = deriveExperimentConfidence(metrics);
+      const insights = deriveExperimentInsights(sorted, metrics);
       const sourceRunIds = sorted.map((item) => item.run_id);
       const sourceDigest = this.buildSourceDigest(sourceRunIds);
       const markdown = buildExperimentMarkdown({
         familyKey: family.contract_family_key,
         category: family.contract_category,
         subcategory: family.contract_subcategory,
-        metrics
+        metrics,
+        insights
       });
 
       const createResult = await this.repo.createResearchExperiment({
