@@ -1,6 +1,6 @@
 import { after, before, beforeEach, test } from "node:test";
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
@@ -25,15 +25,8 @@ if (!enableIntegration || !databaseUrl) {
 
   async function runMigrations(): Promise<void> {
     const migrationDir = path.resolve(rootDir, "supabase/migrations");
-    for (const fileName of [
-      "0001_bootstrap.sql",
-      "0002_runtime_contract.sql",
-      "0003_daemon_heartbeats.sql",
-      "0004_run_cancellation.sql",
-      "0005_integration_configs.sql",
-      "0006_llm_api_integration_cutover.sql",
-      "0007_research_analysis_pipeline.sql"
-    ]) {
+    const files = (await readdir(migrationDir)).filter((name) => name.endsWith(".sql"));
+    for (const fileName of files.sort()) {
       const sql = await readFile(path.join(migrationDir, fileName), "utf8");
       await pool.query(sql);
     }
