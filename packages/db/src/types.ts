@@ -189,6 +189,23 @@ export type DbIntegrationConfig = {
   updated_at: string;
 };
 
+export type DbSkillSetting = {
+  id: string;
+  workspace_id: string;
+  skill_name: string;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+export type DbSkillUsage = {
+  skill_name: string;
+  call_count: number;
+  success_count: number;
+  failure_count: number;
+  last_used_at: string | null;
+};
+
 export type DbAgentTrustTier = {
   workspace_id: string;
   workspace_name: string;

@@ -14,10 +14,12 @@ import {
   initializeSecrets
 } from "@salvo/shared";
 import { z } from "zod";
+import { builtinSkillMetadata } from "@salvo/skills";
 
 await initializeSecrets();
 
 const apiPort = Number(process.env.SALVO_API_PORT ?? 8787);
+const workspaceRoot = process.env.SALVO_WORKSPACE_ROOT ?? process.cwd();
 const orchestratorThresholdSeconds = Number(
   process.env.SALVO_HEALTH_ORCHESTRATOR_STALE_SECONDS ?? 15
 );
@@ -71,6 +73,15 @@ const trustTierSchema = z.object({
   workspaceId: z.string().uuid("workspaceId must be a valid UUID."),
   agentProfile: z.enum(AGENT_PROFILES),
   trustTier: z.enum(AGENT_TRUST_TIERS)
+}).strict();
+
+const skillWorkspaceQuerySchema = z.object({
+  workspaceId: z.string().uuid("workspaceId must be a valid UUID.").optional()
+}).strict();
+
+const skillConfigSchema = z.object({
+  workspaceId: z.string().uuid("workspaceId must be a valid UUID."),
+  enabled: z.boolean()
 }).strict();
 
 const googleSheetsConfigSchema = z.object({
@@ -174,6 +185,8 @@ const TEXT_EXTENSIONS = new Set([
   ".html"
 ]);
 const MAX_TEXT_PREVIEW_BYTES = 64_000;
+const SKILL_NAMES = builtinSkillMetadata.map((skill) => skill.name);
+const SKILL_METADATA_BY_NAME = new Map(builtinSkillMetadata.map((skill) => [skill.name, skill]));
 
 type RestartResult = {
   daemon: RestartTarget;
@@ -215,7 +228,6 @@ function runPkill(pattern: string): Promise<{ killed: boolean; note: string }> {
 }
 
 function startDaemonDetached(target: RestartTarget): { pid?: number } {
-  const workspaceRoot = process.env.SALVO_WORKSPACE_ROOT ?? process.cwd();
   const baseEnv = {
     ...process.env,
     SALVO_WORKSPACE_ROOT: workspaceRoot
@@ -981,6 +993,75 @@ export async function buildServer() {
       }
     ];
   });
+
+  app.get("/skills", async (req) => {
+    const query = skillWorkspaceQuerySchema.parse(req.query);
+    let workspaces = await repo.listWorkspaces();
+    if (workspaces.length === 0) {
+      const workspace = await repo.ensureWorkspace("default", workspaceRoot);
+      workspaces = [workspace];
+    }
+
+    const availableWorkspaceIds = new Set(workspaces.map((workspace) => workspace.id));
+    const selectedWorkspaceId =
+      query.workspaceId && availableWorkspaceIds.has(query.workspaceId)
+        ? query.workspaceId
+        : workspaces[0].id;
+
+    const [skillSettings, skillUsage] = await Promise.all([
+      repo.listSkillSettings(selectedWorkspaceId),
+      repo.listSkillUsage(selectedWorkspaceId, SKILL_NAMES)
+    ]);
+
+    const settingsMap = new Map(skillSettings.map((setting) => [setting.skill_name, setting.enabled]));
+    const usageMap = new Map(skillUsage.map((usage) => [usage.skill_name, usage]));
+
+    return {
+      workspaces: workspaces.map((workspace) => ({
+        id: workspace.id,
+        name: workspace.name
+      })),
+      selected_workspace_id: selectedWorkspaceId,
+      skills: builtinSkillMetadata.map((metadata) => ({
+        name: metadata.name,
+        label: metadata.label,
+        description: metadata.description,
+        example: metadata.example ?? null,
+        inputSchema: metadata.inputSchema,
+        enabled: settingsMap.get(metadata.name) ?? true,
+        usage: usageMap.get(metadata.name) ?? {
+          skill_name: metadata.name,
+          call_count: 0,
+          success_count: 0,
+          failure_count: 0,
+          last_used_at: null
+        }
+      }))
+    };
+  });
+
+  app.post<{ Params: { skillName: string }; Body: { workspaceId: string; enabled: boolean } }>(
+    "/skills/:skillName/config",
+    async (req) => {
+      const skillName = req.params.skillName;
+      if (!SKILL_METADATA_BY_NAME.has(skillName)) {
+        throw new Error(`Unknown skill: ${skillName}`);
+      }
+
+      const payload = skillConfigSchema.parse(req.body);
+      const workspace = await repo.getWorkspace(payload.workspaceId);
+      if (!workspace) {
+        throw new Error("Workspace not found.");
+      }
+
+      const updated = await repo.upsertSkillSetting(payload.workspaceId, skillName, payload.enabled);
+      return {
+        ok: true,
+        skill_name: updated.skill_name,
+        enabled: updated.enabled
+      };
+    }
+  );
 
   app.post<{
     Params: { key: EditableIntegrationKey };

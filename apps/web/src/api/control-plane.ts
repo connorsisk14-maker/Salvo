@@ -200,6 +200,33 @@ export type ApiBudgetOverview = {
   budgets: ApiBudgetStatus[];
 };
 
+export type ApiSkillUsage = {
+  skill_name: string;
+  call_count: number;
+  success_count: number;
+  failure_count: number;
+  last_used_at: string | null;
+};
+
+export type ApiSkill = {
+  name: string;
+  label: string;
+  description: string;
+  example: Record<string, unknown> | string | null;
+  inputSchema: Record<string, unknown>;
+  enabled: boolean;
+  usage: ApiSkillUsage;
+};
+
+export type ApiSkillsOverview = {
+  workspaces: Array<{
+    id: string;
+    name: string;
+  }>;
+  selected_workspace_id: string;
+  skills: ApiSkill[];
+};
+
 export type ApiTrustTier = {
   workspace_id: string;
   workspace_name: string;
@@ -477,6 +504,21 @@ export function getBackupStatus(): Promise<ApiBackupStatus> {
 
 export function listIntegrations(): Promise<ApiIntegration[]> {
   return request<ApiIntegration[]>("/integrations");
+}
+
+export function listSkills(workspaceId?: string): Promise<ApiSkillsOverview> {
+  const query = workspaceId ? `?workspaceId=${encodeURIComponent(workspaceId)}` : "";
+  return request<ApiSkillsOverview>(`/skills${query}`);
+}
+
+export function setSkillConfig(skillName: string, workspaceId: string, enabled: boolean): Promise<ApiActionResponse> {
+  return request<ApiActionResponse>(`/skills/${skillName}/config`, {
+    method: "POST",
+    body: JSON.stringify({
+      workspaceId,
+      enabled
+    })
+  });
 }
 
 export function getCostMetrics(): Promise<ApiCostMetrics> {

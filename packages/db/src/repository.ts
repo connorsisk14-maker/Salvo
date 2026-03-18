@@ -33,6 +33,8 @@ import type {
   DbAgentTrustTier,
   DbBudgetLimit,
   DbBudgetStatus,
+  DbSkillSetting,
+  DbSkillUsage,
   DbContractMemoryContext,
   DbContractMemoryPrompt,
   DbIntegrationConfig,
@@ -2591,6 +2593,67 @@ export class SalvoRepository {
     );
 
     return result.rows;
+  }
+
+  async listSkillSettings(workspaceId: string): Promise<DbSkillSetting[]> {
+    const result = await this.pool.query<DbSkillSetting>(
+      `select *
+       from public.salvo_skill_settings
+       where workspace_id = $1
+       order by skill_name asc`,
+      [workspaceId]
+    );
+
+    return result.rows;
+  }
+
+  async upsertSkillSetting(workspaceId: string, skillName: string, enabled: boolean): Promise<DbSkillSetting> {
+    const result = await this.pool.query<DbSkillSetting>(
+      `insert into public.salvo_skill_settings (
+         workspace_id,
+         skill_name,
+         enabled
+       )
+       values ($1, $2, $3)
+       on conflict (workspace_id, skill_name)
+       do update
+         set enabled = excluded.enabled,
+             updated_at = now()
+       returning *`,
+      [workspaceId, skillName, enabled]
+    );
+
+    return this.singleOrThrow(result.rows, "Failed to upsert skill setting.");
+  }
+
+  async listSkillUsage(workspaceId: string, skillNames: string[]): Promise<DbSkillUsage[]> {
+    if (skillNames.length === 0) {
+      return [];
+    }
+
+    const result = await this.pool.query<DbSkillUsage>(
+      `select
+         payload_json ->> 'tool' as skill_name,
+         count(*) filter (where event_type = 'tool.called') as call_count,
+         count(*) filter (where event_type = 'tool.result' and (payload_json ->> 'ok') = 'true') as success_count,
+         count(*) filter (where event_type = 'tool.result' and (payload_json ->> 'ok') = 'false') as failure_count,
+         max(created_at) as last_used_at
+       from public.salvo_run_events
+       join public.salvo_runs on salvo_run_events.run_id = salvo_runs.id
+       join public.salvo_tasks on salvo_runs.task_id = salvo_tasks.id
+       where salvo_tasks.workspace_id = $1
+         and coalesce(payload_json ->> 'tool', '') = any($2)
+       group by skill_name`,
+      [workspaceId, skillNames]
+    );
+
+    return result.rows.map((row) => ({
+      skill_name: row.skill_name,
+      call_count: Number(row.call_count ?? 0),
+      success_count: Number(row.success_count ?? 0),
+      failure_count: Number(row.failure_count ?? 0),
+      last_used_at: row.last_used_at ?? null
+    }));
   }
 
   async upsertIntegrationConfig(
