@@ -85,7 +85,8 @@ export const AGENT_PROFILES = [
   "researcher",
   "debugger",
   "documenter",
-  "lead_scraper"
+  "lead_scraper",
+  "lead_strategist"
 ] as const;
 
 export type AgentProfile = (typeof AGENT_PROFILES)[number];
@@ -116,6 +117,8 @@ export const DEFAULT_AGENT_TRUST_TIER_BY_PROFILE: Record<AgentProfile, AgentTrus
   debugger: "restricted",
   documenter: "restricted",
   lead_scraper: "scraper"
+  ,
+  lead_strategist: "scraper"
 };
 
 export const AGENT_TRUST_TIER_POLICIES: Record<AgentTrustTier, AgentTrustTierPolicy> = {
@@ -154,8 +157,7 @@ export const AGENT_TRUST_TIER_POLICIES: Record<AgentTrustTier, AgentTrustTierPol
     installPackages: false,
     runTests: true,
     dbWrite: false
-  }
-,
+  },
   scraper: {
     requiresApproval: false,
     maxRuntimeMinutes: 20,
@@ -322,6 +324,33 @@ export const AGENT_PROFILE_DEFINITIONS: Record<AgentProfile, AgentProfileDefinit
       },
       successCriteriaNote:
         "Deliver structured lead rows and persistence proof in the configured Google Sheet every time."
+    }
+  },
+  lead_strategist: {
+    displayName: "Lead Strategist",
+    description:
+      "Scores HVAC/professional-services leads, defines qualification tiers, and enriches outreach-ready data via the approved connectors.",
+    prompt:
+      "You are the Lead Strategist agent. Score each DFW HVAC/professional-services lead, document tiered qualification criteria, enrich the approved spreadsheet or HTTP endpoint, and keep all runtime work within the policy bounds.",
+    skillHints: ["search_codebase", "expand_zones"],
+    contractDefaults: {
+      category: "operations",
+      capabilities: {
+        filesystem_read: false,
+        filesystem_write: false,
+        run_tests: false,
+        install_packages: false,
+        network_access: true,
+        db_read: true,
+        db_write: false
+      },
+      constraints: {
+        max_runtime_minutes: 22,
+        max_tool_calls: 140,
+        forbidden_paths: ["/etc", "/usr/local/bin"]
+      },
+      successCriteriaNote:
+        "Output tiered scores, enrichment metadata, and outreach-ready fields for every lead you process."
     }
   }
 };
