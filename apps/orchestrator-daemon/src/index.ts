@@ -796,9 +796,11 @@ class OrchestratorDaemon {
       strategistTaskId: strategistTask.id,
       rowContext
     });
+    const rowSummaryLabel = this.formatLeadRowContextSummary(rowContext);
     logger.info("lead strategist follow-up created", {
       scraper_run_id: detail.run.id,
-      strategist_task_id: strategistTask.id
+      strategist_task_id: strategistTask.id,
+      row_summary: rowSummaryLabel
     });
   }
 
@@ -829,12 +831,13 @@ class OrchestratorDaemon {
       typeof detail.contract.contract_json.family_key === "string"
         ? detail.contract.contract_json.family_key
         : detail.contract.id;
+    const taskTitle = detail.task.title;
     const sheetId = process.env.SALVO_LEAD_PIPELINE_SHEET_ID?.trim();
     const sheetNote = sheetId
       ? `Reference Google Sheet ${sheetId} for redistribution updates.`
       : "Capture follow-up notes in the primary lead tracking destination.";
     return [
-      `Lead Strategist follow-up for run ${detail.run.id} (family ${familyKey}).`,
+      `Lead Strategist follow-up for \"${taskTitle}\" (run ${detail.run.id}, family ${familyKey}).`,
       `Row summary: ${summary}`,
       `Detailed row snapshot (truncated):\n${snippet}`,
       sheetNote,
