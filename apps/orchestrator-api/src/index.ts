@@ -1446,10 +1446,18 @@ export async function buildServer() {
     );
 
     const range = parsedQuery.ok ? parsedQuery.value : {};
-    return repo.getCostAnalytics({
+    const analytics = await repo.getCostAnalytics({
       from: range.from,
       to: range.to
     });
+
+    return {
+      summary: analytics.summary,
+      byDay: analytics.byDay,
+      byModel: analytics.byModel,
+      byAgentProfile: analytics.byAgent,
+      byCategory: analytics.byCategory
+    };
   });
 
   app.post<{

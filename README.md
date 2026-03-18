@@ -12,6 +12,8 @@ Local-first agentic harness with a strict runtime contract, policy-enforced adap
 ## Lead Pipeline
 
 The DFW lead pipeline relies on `docs/LEAD_PIPELINE_TEMPLATE.md`, which describes the raw intake, enrichment, zone tracking, and run history tabs plus the seeded zone priorities and creation steps. After copying the template into your workspace, target the copy by setting `SALVO_LEAD_PIPELINE_SHEET_ID` with the new spreadsheet ID in your environment or orchestration layer. Update `packages/shared/src/lead-pipeline.ts` whenever the template layout or zone list changes so automation code and docs stay in sync.
+
+Dashboard polish currently emphasizes the light, high-contrast feel used across the Control Center; dark mode has been deferred until after the remaining panels are fully wired.
 - `apps/research-daemon`: analysis-only learning daemon (ingest, experiment, accepted-only publish)
 
 ## Packages
