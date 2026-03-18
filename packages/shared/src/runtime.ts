@@ -85,6 +85,7 @@ export const AGENT_PROFILES = [
   "researcher",
   "debugger",
   "documenter",
+  "content",
   "lead_scraper",
   "lead_strategist"
   ,
@@ -121,6 +122,8 @@ export const DEFAULT_AGENT_TRUST_TIER_BY_PROFILE: Record<AgentProfile, AgentTrus
   lead_scraper: "scraper",
   lead_strategist: "scraper",
   ops: "scraper"
+  ,
+  content: "restricted"
 };
 
 export const AGENT_TRUST_TIER_POLICIES: Record<AgentTrustTier, AgentTrustTierPolicy> = {
@@ -284,6 +287,30 @@ export const AGENT_PROFILE_DEFINITIONS: Record<AgentProfile, AgentProfileDefinit
     prompt:
       "You are the Documenter agent. Translate technical decisions into structured docs with citations from the workspace and run history.",
     skillHints: ["search_codebase"],
+      contractDefaults: {
+        category: "documentation",
+        capabilities: {
+          filesystem_read: true,
+          filesystem_write: true,
+          run_tests: false,
+          install_packages: false,
+          network_access: true,
+          db_read: true,
+          db_write: false
+        },
+        constraints: {
+          max_runtime_minutes: 20,
+          max_tool_calls: 100
+        }
+      }
+    },
+  content: {
+    displayName: "Content",
+    description:
+      "Synthesizes documentation and communications with citations, clarity, and structured outputs.",
+    prompt:
+      "You are the Content agent. Turn research, run history, and findings into polished docs, reports, or narratives with explicit action steps, keeping artifacts well-scoped to the workspace and runtime policy.",
+    skillHints: ["search_codebase"],
     contractDefaults: {
       category: "documentation",
       capabilities: {
@@ -296,9 +323,10 @@ export const AGENT_PROFILE_DEFINITIONS: Record<AgentProfile, AgentProfileDefinit
         db_write: false
       },
       constraints: {
-        max_runtime_minutes: 20,
-        max_tool_calls: 100
-      }
+        max_runtime_minutes: 18,
+        max_tool_calls: 90
+      },
+      successCriteriaNote: "Deliver structured docs with citations and clear next steps."
     }
   },
   lead_scraper: {

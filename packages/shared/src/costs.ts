@@ -13,6 +13,8 @@ const MODEL_BY_PROVIDER_AND_PROFILE = {
     lead_strategist: "gpt-5-nano"
     ,
     ops: "gpt-5"
+    ,
+    content: "gpt-5-nano"
   },
   custom: {
     builder: "gpt-5-mini",
@@ -23,6 +25,8 @@ const MODEL_BY_PROVIDER_AND_PROFILE = {
     lead_strategist: "gpt-5-nano"
     ,
     ops: "gpt-5"
+    ,
+    content: "gpt-5-nano"
   },
   anthropic: {
     builder: "claude-3-5-sonnet-latest",
@@ -33,6 +37,8 @@ const MODEL_BY_PROVIDER_AND_PROFILE = {
     lead_strategist: "claude-3-5-sonnet-latest"
     ,
     ops: "claude-3-5-sonnet-latest"
+    ,
+    content: "claude-3-5-sonnet-latest"
   }
 } as const satisfies Record<LlmProvider, Record<AgentProfile, string>>;
 
@@ -46,6 +52,8 @@ const OUTPUT_TOKEN_ESTIMATE_BY_PROFILE = {
   lead_strategist: 1_600
   ,
   ops: 1_600
+  ,
+  content: 1_400
 } as const satisfies Record<AgentProfile, number>;
 
 function readString(config: Record<string, unknown>, key: string, fallback = ""): string {
