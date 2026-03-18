@@ -87,6 +87,8 @@ export const AGENT_PROFILES = [
   "documenter",
   "lead_scraper",
   "lead_strategist"
+  ,
+  "ops"
 ] as const;
 
 export type AgentProfile = (typeof AGENT_PROFILES)[number];
@@ -116,9 +118,9 @@ export const DEFAULT_AGENT_TRUST_TIER_BY_PROFILE: Record<AgentProfile, AgentTrus
   researcher: "restricted",
   debugger: "restricted",
   documenter: "restricted",
-  lead_scraper: "scraper"
-  ,
-  lead_strategist: "scraper"
+  lead_scraper: "scraper",
+  lead_strategist: "scraper",
+  ops: "scraper"
 };
 
 export const AGENT_TRUST_TIER_POLICIES: Record<AgentTrustTier, AgentTrustTierPolicy> = {
@@ -351,6 +353,33 @@ export const AGENT_PROFILE_DEFINITIONS: Record<AgentProfile, AgentProfileDefinit
       },
       successCriteriaNote:
         "Output tiered scores, enrichment metadata, and outreach-ready fields for every lead you process."
+    }
+  },
+  ops: {
+    displayName: "Ops",
+    description:
+      "Monitors daemon health, surfaces incidents, and reports anomalies with conservative tooling.",
+    prompt:
+      "You are the Ops agent. Continuously check daemon heartbeats, evaluate run history, and escalate issues with clear evidence while respecting the runtime contract. Favor read-only insights, HTTP queries, and avoid filesystem writes.",
+    skillHints: ["search_codebase"],
+    contractDefaults: {
+      category: "operations",
+      capabilities: {
+        filesystem_read: true,
+        filesystem_write: false,
+        run_tests: false,
+        install_packages: false,
+        network_access: true,
+        db_read: true,
+        db_write: false
+      },
+      constraints: {
+        max_runtime_minutes: 15,
+        max_tool_calls: 80,
+        forbidden_paths: ["/etc", "/usr/local/bin"]
+      },
+      successCriteriaNote:
+        "Report daemon/run health states and policy anomalies with timestamped context and mitigation suggestions."
     }
   }
 };
