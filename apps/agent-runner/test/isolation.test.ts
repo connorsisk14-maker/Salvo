@@ -19,3 +19,7 @@ test("agent-runner uses policy-enforced adapters", () => {
   assert.equal(source.includes("CommandAdapter"), true);
   assert.equal(source.includes("FilesystemAdapter"), true);
 });
+
+test("agent-runner delegates iterative execution through agent-loop", () => {
+  assert.equal(source.includes("runAgentLoop"), true);
+});

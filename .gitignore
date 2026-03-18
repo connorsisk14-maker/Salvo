@@ -4,3 +4,6 @@ dist
 .vite
 .env
 .env.*
+.salvo-workspace/runs
+.salvo-workspace/logs
+.salvo-workspace/dev
