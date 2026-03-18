@@ -1,4 +1,12 @@
-import { buildToolDefinitions, type LlmMessage, type LlmResponse, type SalvoCompletionPayload, type ToolUseBlock, type ToolExecutionOutcome } from "@salvo/llm";
+import {
+  buildToolDefinitions,
+  type LlmMessage,
+  type LlmResponse,
+  type SalvoCompletionPayload,
+  type ToolResultBlock,
+  type ToolUseBlock,
+  type ToolExecutionOutcome
+} from "@salvo/llm";
 import { usageCostUsd } from "@salvo/shared";
 import type { ContractV1 } from "@salvo/contracts";
 import {
@@ -18,6 +26,7 @@ export type AgentLoopInput = {
   contract: ContractV1;
   workspaceRoot: string;
   completionToolName?: string;
+  startedAtMs?: number;
   now?: () => number;
   createMessage: (
     systemPrompt: string,
@@ -30,6 +39,9 @@ export type AgentLoopInput = {
     level: AgentLoopEventLevel,
     payload: Record<string, unknown>
   ) => Promise<void>;
+  loadCheckpoint?: () => Promise<AgentLoopCheckpointState | null>;
+  saveCheckpoint?: (state: AgentLoopCheckpointState) => Promise<void>;
+  deleteCheckpoint?: () => Promise<void>;
 };
 
 export type AgentLoopResult = {
@@ -50,6 +62,25 @@ type ResourceLimitViolation = {
   payload: Record<string, unknown>;
 };
 
+type PendingToolState = {
+  assistantContent: LlmResponse["content"];
+  toolUses: ToolUseBlock[];
+  nextToolIndex: number;
+  toolResults: ToolResultBlock[];
+  testsRun: RequiredTestRun[];
+  commandResults: Record<string, unknown>[];
+};
+
+export type AgentLoopCheckpointState = {
+  schemaVersion: 1;
+  messages: LlmMessage[];
+  usage: RunnerUsage;
+  toolCallsUsed: number;
+  turn: number;
+  maxTokensRetries: number;
+  pendingToolState: PendingToolState | null;
+};
+
 function buildUsage(response: LlmResponse): RunnerUsage {
   return {
     provider: response.provider,
@@ -60,6 +91,14 @@ function buildUsage(response: LlmResponse): RunnerUsage {
     estimated: false,
     pricing_unit: "usd_per_1m_tokens"
   };
+}
+
+function cloneCheckpointState(state: AgentLoopCheckpointState): AgentLoopCheckpointState {
+  return JSON.parse(JSON.stringify(state)) as AgentLoopCheckpointState;
+}
+
+function clonePendingToolState(state: PendingToolState): PendingToolState {
+  return JSON.parse(JSON.stringify(state)) as PendingToolState;
 }
 
 function emptyUsage(provider: string, model: string): RunnerUsage {
@@ -323,26 +362,149 @@ async function materializeTextFallback(input: {
 
 export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResult> {
   const now = input.now ?? Date.now;
-  const startedAt = now();
+  const startedAt = input.startedAtMs ?? now();
   const completionToolName = input.completionToolName?.trim() || "salvo_complete";
   const tools = buildToolDefinitions(input.contract, {
     completionToolName
   });
   const requiredTestCommands = new Set(input.contract.success_criteria.required_test_commands);
-  const messages: LlmMessage[] = [
-    {
-      role: "user",
-      content: input.userPrompt
-    }
-  ];
+  const checkpoint = await input.loadCheckpoint?.();
+  const messages: LlmMessage[] =
+    checkpoint?.messages ?? [
+      {
+        role: "user",
+        content: input.userPrompt
+      }
+    ];
 
-  const usage = emptyUsage(input.provider, input.model);
-  let toolCallsUsed = 0;
-  let turn = 0;
-  let maxTokensRetries = 0;
+  const usage = checkpoint?.usage ?? emptyUsage(input.provider, input.model);
+  let toolCallsUsed = checkpoint?.toolCallsUsed ?? 0;
+  let turn = checkpoint?.turn ?? 0;
+  let maxTokensRetries = checkpoint?.maxTokensRetries ?? 0;
+  let pendingToolState = checkpoint?.pendingToolState ?? null;
+
+  const persistCheckpoint = async (): Promise<void> => {
+    if (!input.saveCheckpoint) {
+      return;
+    }
+    await input.saveCheckpoint(
+      cloneCheckpointState({
+        schemaVersion: 1,
+        messages,
+        usage,
+        toolCallsUsed,
+        turn,
+        maxTokensRetries,
+        pendingToolState
+      })
+    );
+  };
+
+  const clearCheckpoint = async (): Promise<void> => {
+    pendingToolState = null;
+    if (input.deleteCheckpoint) {
+      await input.deleteCheckpoint();
+    }
+  };
+
+  const executeToolBatch = async (state: PendingToolState): Promise<AgentLoopResult | null> => {
+    const toolResults = [...state.toolResults];
+    const testsRun = [...state.testsRun];
+    const commandResults = [...state.commandResults];
+
+    for (let index = state.nextToolIndex; index < state.toolUses.length; index += 1) {
+      const block = state.toolUses[index];
+      try {
+        toolCallsUsed = reserveToolCall(
+          toolCallsUsed,
+          input.contract.constraints.max_tool_calls,
+          block.name
+        );
+      } catch (error) {
+        await input.appendRunEvent("policy.denied", "warn", {
+          reason: "tool_call_limit",
+          message: (error as Error).message,
+          max_tool_calls: input.contract.constraints.max_tool_calls,
+          tool_calls_used: toolCallsUsed,
+          tool: block.name
+        });
+        await clearCheckpoint();
+        return {
+          finalPayload: buildBlockedPayload({
+            summary: "Agent loop stopped before completion.",
+            reason: "tool_call_limit",
+            description: (error as Error).message
+          }),
+          usage,
+          exitReason: "tool_call_limit"
+        };
+      }
+
+      const outcome = await input.executeToolUse(block);
+      toolResults.push(outcome.toolResult);
+
+      if (outcome.requiredTestCommandResult) {
+        commandResults.push(outcome.requiredTestCommandResult.evidence);
+        testsRun.push(
+          testsRunEntry(outcome.requiredTestCommandResult.command, outcome.requiredTestCommandResult.evidence)
+        );
+      }
+
+      pendingToolState = {
+        assistantContent: clonePendingToolState(state).assistantContent,
+        toolUses: clonePendingToolState(state).toolUses,
+        nextToolIndex: index + 1,
+        toolResults: [...toolResults],
+        testsRun: [...testsRun],
+        commandResults: [...commandResults]
+      };
+      await persistCheckpoint();
+
+      if (outcome.policyDenied && input.contract.failure_handling.stop_on_policy_denial) {
+        await clearCheckpoint();
+        return {
+          finalPayload: buildBlockedPayload({
+            summary: "Agent loop stopped before completion.",
+            reason: "policy_denied",
+            description: `Tool execution was denied for ${block.name}.`,
+            testsRun,
+            commandResults
+          }),
+          usage,
+          exitReason: "policy_denied"
+        };
+      }
+
+      if (outcome.completionPayload) {
+        await clearCheckpoint();
+        return {
+          finalPayload: outcome.completionPayload,
+          usage,
+          exitReason: "salvo_complete"
+        };
+      }
+    }
+
+    messages.push({
+      role: "assistant",
+      content: state.assistantContent
+    });
+
+    if (toolResults.length > 0) {
+      messages.push({
+        role: "tool",
+        content: toolResults
+      });
+    }
+
+    pendingToolState = null;
+    await persistCheckpoint();
+    return null;
+  };
 
   while (true) {
     if (now() - startedAt > input.contract.constraints.max_runtime_minutes * 60_000) {
+      await clearCheckpoint();
       return {
         finalPayload: buildBlockedPayload({
           summary: "Agent loop stopped before completion.",
@@ -354,6 +516,14 @@ export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResu
       };
     }
 
+    if (pendingToolState) {
+      const resumedResult = await executeToolBatch(pendingToolState);
+      if (resumedResult) {
+        return resumedResult;
+      }
+      continue;
+    }
+
     turn += 1;
     const response = await input.createMessage(input.systemPrompt, messages, tools);
     Object.assign(usage, aggregateUsage(usage, await appendLlmEvents(input, turn, response)));
@@ -361,6 +531,7 @@ export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResu
     const resourceLimitViolation = detectResourceLimitViolation(input.contract, usage);
     if (resourceLimitViolation) {
       await input.appendRunEvent("resource.limit_reached", "warn", resourceLimitViolation.payload);
+      await clearCheckpoint();
       return {
         finalPayload: buildBlockedPayload({
           summary: "Agent loop stopped before completion.",
@@ -372,89 +543,33 @@ export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResu
       };
     }
 
-    if (response.content.length > 0) {
-      messages.push({
-        role: "assistant",
-        content: response.content
-      });
-    }
-
     const toolUses = response.content.filter(
       (block): block is ToolUseBlock => block.type === "tool_use"
     );
 
     if (toolUses.length > 0) {
-      const toolResults = [];
-      const testsRun: RequiredTestRun[] = [];
-      const commandResults: Record<string, unknown>[] = [];
+      pendingToolState = {
+        assistantContent: response.content,
+        toolUses: toolUses.map((block) => JSON.parse(JSON.stringify(block)) as ToolUseBlock),
+        nextToolIndex: 0,
+        toolResults: [],
+        testsRun: [],
+        commandResults: []
+      };
+      await persistCheckpoint();
 
-      for (const block of toolUses) {
-        try {
-          toolCallsUsed = reserveToolCall(
-            toolCallsUsed,
-            input.contract.constraints.max_tool_calls,
-            block.name
-          );
-        } catch (error) {
-          await input.appendRunEvent("policy.denied", "warn", {
-            reason: "tool_call_limit",
-            message: (error as Error).message,
-            max_tool_calls: input.contract.constraints.max_tool_calls,
-            tool_calls_used: toolCallsUsed,
-            tool: block.name
-          });
-
-          return {
-            finalPayload: buildBlockedPayload({
-              summary: "Agent loop stopped before completion.",
-              reason: "tool_call_limit",
-              description: (error as Error).message
-            }),
-            usage,
-            exitReason: "tool_call_limit"
-          };
-        }
-
-        const outcome = await input.executeToolUse(block);
-        toolResults.push(outcome.toolResult);
-
-        if (outcome.requiredTestCommandResult) {
-          commandResults.push(outcome.requiredTestCommandResult.evidence);
-          testsRun.push(
-            testsRunEntry(outcome.requiredTestCommandResult.command, outcome.requiredTestCommandResult.evidence)
-          );
-        }
-
-        if (outcome.policyDenied && input.contract.failure_handling.stop_on_policy_denial) {
-          return {
-            finalPayload: buildBlockedPayload({
-              summary: "Agent loop stopped before completion.",
-              reason: "policy_denied",
-              description: `Tool execution was denied for ${block.name}.`,
-              testsRun,
-              commandResults
-            }),
-            usage,
-            exitReason: "policy_denied"
-          };
-        }
-
-        if (outcome.completionPayload) {
-          return {
-            finalPayload: outcome.completionPayload,
-            usage,
-            exitReason: "salvo_complete"
-          };
-        }
-      }
-
-      if (toolResults.length > 0) {
-        messages.push({
-          role: "tool",
-          content: toolResults
-        });
+      const batchResult = await executeToolBatch(pendingToolState);
+      if (batchResult) {
+        return batchResult;
       }
     } else {
+      if (response.content.length > 0) {
+        messages.push({
+          role: "assistant",
+          content: response.content
+        });
+      }
+
       const rawText = textContent(response);
       if (rawText) {
         try {
@@ -477,6 +592,7 @@ export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResu
           });
 
           toolCallsUsed = fallback.toolCallsUsed;
+          await clearCheckpoint();
           return {
             finalPayload: fallback.finalPayload,
             usage,
@@ -489,6 +605,7 @@ export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResu
               role: "user",
               content: "Continue from the prior response without repeating finished content."
             });
+            await persistCheckpoint();
             continue;
           }
         }
@@ -497,6 +614,7 @@ export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResu
 
     if (response.stopReason === "max_tokens") {
       if (maxTokensRetries >= 2) {
+        await clearCheckpoint();
         return {
           finalPayload: buildBlockedPayload({
             summary: "Agent loop stopped before completion.",
@@ -513,12 +631,14 @@ export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResu
         role: "user",
         content: "Continue from the prior response without repeating finished content."
       });
+      await persistCheckpoint();
       continue;
     }
 
     maxTokensRetries = 0;
 
     if (response.stopReason === "end_turn") {
+      await clearCheckpoint();
       return {
         finalPayload: buildBlockedPayload({
           summary: "Agent loop ended without a completion payload.",

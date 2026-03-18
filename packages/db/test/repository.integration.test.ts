@@ -34,10 +34,11 @@ if (!databaseUrl) {
         public.salvo_research_experiments,
         public.salvo_research_ingestions,
         public.salvo_research_documents,
-        public.salvo_evaluations,
-        public.salvo_artifacts,
-        public.salvo_run_events,
-        public.salvo_runs,
+      public.salvo_evaluations,
+      public.salvo_artifacts,
+      public.salvo_run_events,
+      public.salvo_run_checkpoints,
+      public.salvo_runs,
         public.salvo_contracts,
         public.salvo_task_chat_messages,
         public.salvo_task_chat_sessions,
@@ -1074,5 +1075,26 @@ if (!databaseUrl) {
     assert.equal(rows.rows[0].config_json.apiKey, "new-key");
     assert.equal(rows.rows[0].config_json.defaultModel, "gpt-5");
     assert.equal(rows.rows[0].config_json.baseUrl, "https://legacy.example/v1");
+  });
+
+  test("run checkpoint lifecycle persists state and cleans up", async () => {
+    const { run } = await createBasicRun();
+    const checkpoint = { step: "planning", updated_by: "runner" };
+
+    const saved = await repo.saveRunCheckpoint(run.id, "progress", checkpoint);
+    assert.equal(saved.run_id, run.id);
+    assert.equal(saved.checkpoint_key, "progress");
+
+    const loaded = await repo.loadRunCheckpoint(run.id, "progress");
+    assert.deepEqual(loaded, checkpoint);
+
+    const updatedCheckpoint = { step: "complete", updated_by: "orchestrator" };
+    await repo.saveRunCheckpoint(run.id, "progress", updatedCheckpoint);
+    const refreshed = await repo.loadRunCheckpoint(run.id, "progress");
+    assert.deepEqual(refreshed, updatedCheckpoint);
+
+    await repo.deleteRunCheckpoint(run.id, "progress");
+    const removed = await repo.loadRunCheckpoint(run.id, "progress");
+    assert.equal(removed, null);
   });
 }

@@ -131,6 +131,14 @@ export type DbRunSummary = DbRun & {
   lead_chain_row_context: Record<string, unknown> | null;
 };
 
+export type DbRunCheckpoint = {
+  run_id: string;
+  checkpoint_key: string;
+  checkpoint_state: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+};
+
 export type DbLeadRunChain = {
   id: string;
   scraper_run_id: string;

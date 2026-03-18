@@ -45,6 +45,7 @@ import type {
   DbIntegrationKey,
   DbRun,
   DbRunSummary,
+  DbRunCheckpoint,
   DbLeadRunChain,
   DbRunEvent,
   DbTask,
@@ -1531,6 +1532,29 @@ export class SalvoRepository {
     );
   }
 
+  async updateRunExecutionState(
+    runId: string,
+    updates: {
+      runnerPid?: number;
+      heartbeatAt?: Date;
+      startedAt?: Date;
+    }
+  ): Promise<void> {
+    await this.pool.query(
+      `update public.salvo_runs
+       set runner_pid = coalesce($2, runner_pid),
+           heartbeat_at = coalesce($3, heartbeat_at),
+           started_at = coalesce($4, started_at)
+       where id = $1`,
+      [
+        runId,
+        updates.runnerPid ?? null,
+        updates.heartbeatAt?.toISOString() ?? null,
+        updates.startedAt?.toISOString() ?? null
+      ]
+    );
+  }
+
   async appendRunEvent(
     runId: string,
     eventType: RunEventType,
@@ -2474,6 +2498,52 @@ export class SalvoRepository {
     );
 
     return this.singleOrThrow(result.rows, "Failed to record evaluation.");
+  }
+
+  async saveRunCheckpoint(
+    runId: string,
+    checkpointKey: string,
+    checkpointState: Record<string, unknown>
+  ): Promise<DbRunCheckpoint> {
+    const result = await this.pool.query<DbRunCheckpoint>(
+      `insert into public.salvo_run_checkpoints (
+         run_id,
+         checkpoint_key,
+         checkpoint_state
+       )
+       values ($1, $2, $3::jsonb)
+       on conflict (run_id, checkpoint_key)
+       do update
+         set checkpoint_state = excluded.checkpoint_state,
+             updated_at = now()
+       returning *`,
+      [runId, checkpointKey, JSON.stringify(checkpointState)]
+    );
+
+    return this.singleOrThrow(result.rows, "Failed to save run checkpoint.");
+  }
+
+  async loadRunCheckpoint(
+    runId: string,
+    checkpointKey: string
+  ): Promise<Record<string, unknown> | null> {
+    const result = await this.pool.query<{ checkpoint_state: Record<string, unknown> }>(
+      `select checkpoint_state
+       from public.salvo_run_checkpoints
+       where run_id = $1
+         and checkpoint_key = $2`,
+      [runId, checkpointKey]
+    );
+    return result.rows[0]?.checkpoint_state ?? null;
+  }
+
+  async deleteRunCheckpoint(runId: string, checkpointKey: string): Promise<void> {
+    await this.pool.query(
+      `delete from public.salvo_run_checkpoints
+       where run_id = $1
+         and checkpoint_key = $2`,
+      [runId, checkpointKey]
+    );
   }
 
   async getRunFinalPayload(runId: string): Promise<Record<string, unknown> | null> {

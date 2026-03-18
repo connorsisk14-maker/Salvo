@@ -451,6 +451,7 @@ export const RUN_EVENT_TYPES = [
   "artifact.created",
   "roadblock.detected",
   "run.cancel_requested",
+  "run.resumed",
   "evaluation.completed",
   "run.retry_requested",
   "run.final_payload",

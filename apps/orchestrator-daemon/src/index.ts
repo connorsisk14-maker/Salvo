@@ -45,6 +45,11 @@ const orphanTaskThresholdSeconds = readPositiveIntegerEnv(
   120
 );
 const recoveryMaxAttempts = readPositiveIntegerEnv("SALVO_RECOVERY_MAX_RUN_ATTEMPTS", 2);
+const checkpointResumeMaxAttempts = readPositiveIntegerEnv(
+  "SALVO_RECOVERY_MAX_CHECKPOINT_RESUMES",
+  2
+);
+const agentLoopCheckpointKey = "agent_loop_v1";
 const logger = createLogger({
   component: "orchestrator-daemon",
   daemon_id: workerId
@@ -59,6 +64,7 @@ export class OrchestratorDaemon {
   private readonly repo: SalvoRepository;
   private readonly backupManager = new BackupManager();
   private readonly activeRuns = new Map<string, ChildProcess>();
+  private readonly checkpointResumeAttempts = new Map<string, number>();
   private claimTimer?: NodeJS.Timeout;
   private staleTimer?: NodeJS.Timeout;
   private recoveryTimer?: NodeJS.Timeout;
@@ -683,6 +689,10 @@ export class OrchestratorDaemon {
           return;
         }
 
+        if (await this.resumeRunFromCheckpoint(current, code ?? null, signal ?? null)) {
+          return;
+        }
+
         await this.evaluateRun(run.id);
       } catch (error) {
         logger.error("runner close handling failed", {
@@ -723,6 +733,57 @@ export class OrchestratorDaemon {
     await this.repo.transitionTaskStatus(run.task_id, "failed");
   }
 
+  protected async resumeRunFromCheckpoint(
+    run: DbRun,
+    code: number | null,
+    signal: NodeJS.Signals | null
+  ): Promise<boolean> {
+    if (run.status !== "running") {
+      return false;
+    }
+
+    const finalPayload = await this.repo.getRunFinalPayload(run.id);
+    if (finalPayload) {
+      this.checkpointResumeAttempts.delete(run.id);
+      return false;
+    }
+
+    const checkpoint = await this.repo.loadRunCheckpoint(run.id, agentLoopCheckpointKey);
+    if (!checkpoint) {
+      this.checkpointResumeAttempts.delete(run.id);
+      return false;
+    }
+
+    const nextAttempt = (this.checkpointResumeAttempts.get(run.id) ?? 0) + 1;
+    if (nextAttempt > checkpointResumeMaxAttempts) {
+      this.checkpointResumeAttempts.delete(run.id);
+      await this.repo.appendRunEvent(run.id, "run.failed", "error", {
+        reason: "checkpoint_resume_exhausted",
+        exit_code: code,
+        signal
+      });
+      await this.repo.transitionRunStatus(run.id, "failed", {
+        exitReason: "runner_crash",
+        outcomeSummary: "Runner crashed repeatedly while attempting to resume from checkpoint.",
+        endedAt: new Date(),
+        heartbeatAt: new Date()
+      });
+      await this.repo.transitionTaskStatus(run.task_id, "failed");
+      return true;
+    }
+
+    this.checkpointResumeAttempts.set(run.id, nextAttempt);
+    await this.repo.appendRunEvent(run.id, "run.resumed", "warn", {
+      reason: "runner_relaunch_from_checkpoint",
+      checkpoint_key: agentLoopCheckpointKey,
+      resume_attempt: nextAttempt,
+      exit_code: code,
+      signal
+    });
+    await this.launchRun(run);
+    return true;
+  }
+
   private findPolicyDeniedCount(events: DbRunEvent[]): number {
     return events.filter((event) => event.event_type === "policy.denied").length;
   }
@@ -734,6 +795,7 @@ export class OrchestratorDaemon {
     }
 
     if (isTerminalRunStatus(detail.run.status)) {
+      this.checkpointResumeAttempts.delete(runId);
       return;
     }
 
@@ -807,6 +869,7 @@ export class OrchestratorDaemon {
     });
 
     await this.repo.transitionTaskStatus(detail.task.id, evaluation.passed ? "completed" : "failed");
+    this.checkpointResumeAttempts.delete(runId);
     const trustTierOutcome = await this.repo.recordAgentTrustTierOutcome(
       detail.task.workspace_id,
       detail.run.agent_profile,

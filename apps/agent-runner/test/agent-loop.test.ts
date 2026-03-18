@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { buildContractV1 } from "@salvo/contracts";
 import type { LlmResponse, ToolUseBlock, ToolExecutionOutcome } from "@salvo/llm";
-import { runAgentLoop } from "../src/agent-loop";
+import { runAgentLoop, type AgentLoopCheckpointState } from "../src/agent-loop";
 
 function buildContract() {
   return buildContractV1({
@@ -165,6 +165,119 @@ test("runAgentLoop executes multiple tool calls from a single assistant turn", a
 
   assert.equal(result.finalPayload.status, "completed");
   assert.deepEqual(executedTools, ["read_file", "salvo_complete"]);
+});
+
+test("runAgentLoop resumes from a saved partial tool batch checkpoint", async () => {
+  const contract = buildContract();
+  const executedTools: string[] = [];
+  let savedCheckpoint: AgentLoopCheckpointState | null = null;
+
+  const result = await runAgentLoop({
+    provider: "anthropic",
+    model: "claude-sonnet-4",
+    systemPrompt: "system",
+    userPrompt: "user",
+    contract,
+    workspaceRoot: "/tmp/workspace",
+    createMessage: async () => {
+      throw new Error("LLM should not be called when resuming pending tool work.");
+    },
+    executeToolUse: async (block): Promise<ToolExecutionOutcome> => {
+      executedTools.push(block.name);
+      if (block.name === "salvo_complete") {
+        return {
+          toolResult: {
+            type: "tool_result",
+            toolUseId: block.id,
+            content: JSON.stringify({ ok: true })
+          },
+          completionPayload: completionPayload(),
+          policyDenied: false
+        };
+      }
+
+      return {
+        toolResult: {
+          type: "tool_result",
+          toolUseId: block.id,
+          content: JSON.stringify({ ok: true })
+        },
+        policyDenied: false
+      };
+    },
+    appendRunEvent: async () => {},
+    loadCheckpoint: async () => ({
+      schemaVersion: 1,
+      messages: [
+        {
+          role: "user",
+          content: "user"
+        }
+      ],
+      usage: {
+        provider: "anthropic",
+        model: "claude-sonnet-4",
+        input_tokens: 100,
+        output_tokens: 25,
+        cost_usd: 0.000675,
+        estimated: false,
+        pricing_unit: "usd_per_1m_tokens"
+      },
+      toolCallsUsed: 1,
+      turn: 1,
+      maxTokensRetries: 0,
+      pendingToolState: {
+        assistantContent: [
+          {
+            type: "tool_use",
+            id: "tool-1",
+            name: "read_file",
+            input: { path: "README.md" }
+          },
+          {
+            type: "tool_use",
+            id: "tool-2",
+            name: "salvo_complete",
+            input: completionPayload()
+          }
+        ],
+        toolUses: [
+          {
+            type: "tool_use",
+            id: "tool-1",
+            name: "read_file",
+            input: { path: "README.md" }
+          },
+          {
+            type: "tool_use",
+            id: "tool-2",
+            name: "salvo_complete",
+            input: completionPayload()
+          }
+        ],
+        nextToolIndex: 1,
+        toolResults: [
+          {
+            type: "tool_result",
+            toolUseId: "tool-1",
+            content: JSON.stringify({ ok: true, content: "# Readme" })
+          }
+        ],
+        testsRun: [],
+        commandResults: []
+      }
+    }),
+    saveCheckpoint: async (state) => {
+      savedCheckpoint = state;
+    },
+    deleteCheckpoint: async () => {
+      savedCheckpoint = null;
+    }
+  });
+
+  assert.equal(result.finalPayload.status, "completed");
+  assert.deepEqual(executedTools, ["salvo_complete"]);
+  assert.equal(savedCheckpoint, null);
 });
 
 test("runAgentLoop blocks when the tool call limit is exceeded", async () => {

@@ -93,9 +93,13 @@ function createRunStub(status: DbRun["status"]): { run: DbRun; task: DbTask; rep
 
   const runs = new Map<string, DbRun>([[run.id, run]]);
   const tasks = new Map<string, DbTask>([[task.id, task]]);
+  const checkpoints = new Map<string, Record<string, unknown>>();
+  const finalPayloads = new Map<string, Record<string, unknown>>();
 
   const repo = {
     getRun: async (id: string) => runs.get(id) ?? null,
+    loadRunCheckpoint: async (id: string) => checkpoints.get(id) ?? null,
+    getRunFinalPayload: async (id: string) => finalPayloads.get(id) ?? null,
     transitionRunStatus: async (id: string, status: DbRun["status"]) => {
       const entry = runs.get(id);
       if (entry) {
@@ -142,6 +146,34 @@ test("runner close after terminal status skips evaluation", async () => {
   assert.equal(daemon.evaluatedRuns.length, 0);
   assert.equal(run.status, "completed");
   assert.equal(task.status, "queued");
+});
+
+test("runner close during running relaunches from checkpoint before evaluation", async () => {
+  const { run, repo } = createRunStub("running");
+  (repo as any).loadRunCheckpoint = async () => ({ turn: 2, pendingToolState: { nextToolIndex: 1 } });
+  (repo as any).getRunFinalPayload = async () => null;
+  const daemon = new TestDaemon(repo as unknown as SalvoRepository);
+  await daemon.launch(run);
+  const firstChild = daemon.child;
+  assert(firstChild, "first child should exist");
+  firstChild.emit("close", 1, null);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.notEqual(daemon.child, firstChild);
+  assert.equal(daemon.evaluatedRuns.length, 0);
+  assert.equal(run.status, "running");
+});
+
+test("runner close during running evaluates when no checkpoint exists", async () => {
+  const { run, repo } = createRunStub("running");
+  const daemon = new TestDaemon(repo as unknown as SalvoRepository);
+  await daemon.launch(run);
+  const child = daemon.child;
+  assert(child, "child should exist");
+  child.emit("close", 0, null);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(daemon.evaluatedRuns, [run.id]);
 });
 
 test("budget check failure marks task as failed", async () => {

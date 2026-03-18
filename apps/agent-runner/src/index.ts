@@ -22,6 +22,7 @@ import { runAgentLoop } from "./agent-loop";
 await initializeSecrets();
 
 const defaultEmailSendLimit = Number(process.env.SALVO_EMAIL_MAX_SENDS_PER_RUN ?? 3);
+const agentLoopCheckpointKey = "agent_loop_v1";
 
 function parseArg(flag: string): string | undefined {
   const idx = process.argv.indexOf(flag);
@@ -114,6 +115,8 @@ async function main(): Promise<void> {
 
   const { run, task, contract } = context;
   const contractJson = validateRunnerContract(contract.contract_json);
+  const resumeCheckpoint = await repo.loadRunCheckpoint(run.id, agentLoopCheckpointKey);
+  const resumeFromCheckpoint = run.status === "running" && resumeCheckpoint !== null;
   const integrationConfigs = await repo.listIntegrationConfigs();
   const llmConfig = resolveRunnerLlmConfig({
     integrationConfigs,
@@ -160,27 +163,46 @@ async function main(): Promise<void> {
     context: promptContext
   });
 
-  await repo.transitionRunStatus(run.id, "running", {
-    runnerPid: process.pid,
-    startedAt: new Date(),
-    heartbeatAt: new Date()
-  });
-  await repo.transitionTaskStatus(task.id, "running");
-  await repo.appendRunEvent(run.id, "run.started", "info", {
-    run_id: run.id,
-    task_id: task.id,
-    workspace: workspaceRoot,
-    agent_profile: run.agent_profile,
-    model: llmConfig.model,
-    provider: llmConfig.provider
-  });
-  logger.info("run started", {
-    task_id: task.id,
-    agent_profile: run.agent_profile,
-    workspace: workspaceRoot,
-    model: llmConfig.model,
-    provider: llmConfig.provider
-  });
+  if (resumeFromCheckpoint) {
+    await repo.updateRunExecutionState(run.id, {
+      runnerPid: process.pid,
+      heartbeatAt: new Date()
+    });
+    await repo.appendRunEvent(run.id, "run.resumed", "info", {
+      run_id: run.id,
+      task_id: task.id,
+      workspace: workspaceRoot,
+      checkpoint_key: agentLoopCheckpointKey
+    });
+    logger.info("run resumed from checkpoint", {
+      task_id: task.id,
+      agent_profile: run.agent_profile,
+      workspace: workspaceRoot,
+      checkpoint_key: agentLoopCheckpointKey
+    });
+  } else {
+    await repo.transitionRunStatus(run.id, "running", {
+      runnerPid: process.pid,
+      startedAt: new Date(),
+      heartbeatAt: new Date()
+    });
+    await repo.transitionTaskStatus(task.id, "running");
+    await repo.appendRunEvent(run.id, "run.started", "info", {
+      run_id: run.id,
+      task_id: task.id,
+      workspace: workspaceRoot,
+      agent_profile: run.agent_profile,
+      model: llmConfig.model,
+      provider: llmConfig.provider
+    });
+    logger.info("run started", {
+      task_id: task.id,
+      agent_profile: run.agent_profile,
+      workspace: workspaceRoot,
+      model: llmConfig.model,
+      provider: llmConfig.provider
+    });
+  }
 
   const heartbeatTimer = setInterval(async () => {
     await repo.recordHeartbeat(run.id);
@@ -228,6 +250,7 @@ async function main(): Promise<void> {
         userPrompt: prompts.userPrompt,
         contract: contractJson,
         workspaceRoot,
+        startedAtMs: run.started_at ? Date.parse(run.started_at) : undefined,
         createMessage: (systemPrompt, messages) =>
           llmClient.createMessage(
             systemPrompt,
@@ -272,10 +295,19 @@ async function main(): Promise<void> {
             eventType as RunEventType,
             level,
             payload
-          ).then(() => undefined)
+          ).then(() => undefined),
+        loadCheckpoint: async () => {
+          const state = await repo.loadRunCheckpoint(run.id, agentLoopCheckpointKey);
+          return state as import("./agent-loop").AgentLoopCheckpointState | null;
+        },
+        saveCheckpoint: (state) =>
+          repo.saveRunCheckpoint(run.id, agentLoopCheckpointKey, state).then(() => undefined),
+        deleteCheckpoint: () =>
+          repo.deleteRunCheckpoint(run.id, agentLoopCheckpointKey)
       });
 
       const finalLevel = loopResult.finalPayload.status === "completed" ? "info" : "error";
+      await repo.deleteRunCheckpoint(run.id, agentLoopCheckpointKey);
       await repo.appendRunEvent(run.id, "run.final_payload", finalLevel, loopResult.finalPayload);
       if (loopResult.finalPayload.status !== "completed") {
         await repo.appendRunEvent(run.id, "run.failed", "error", {
@@ -303,6 +335,7 @@ async function main(): Promise<void> {
       userPrompt: prompts.userPrompt
     });
 
+    await repo.deleteRunCheckpoint(run.id, agentLoopCheckpointKey);
     await repo.appendRunEvent(run.id, "tool.result", "info", {
       tool: "llm",
       provider: llmConfig.provider,
