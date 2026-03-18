@@ -268,7 +268,7 @@ export function IntegrationsPage() {
               <input
                 value={llmDefaultModel}
                 onChange={(event) => setLlmDefaultModel(event.target.value)}
-                placeholder="gpt-5 or claude-3-7-sonnet"
+                placeholder="e.g. gpt-4o, claude-3-5-sonnet-latest, mistral-large"
               />
             </label>
             <p className="muted">

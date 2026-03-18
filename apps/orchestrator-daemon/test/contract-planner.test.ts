@@ -223,14 +223,16 @@ test("planContract falls back to heuristic contract for malformed LLM output", a
   assert.ok(result.reason?.length);
 });
 
-test("resolveContractPlannerConfig returns null when anthropic is unavailable", () => {
+test("resolveContractPlannerConfig returns null when no API key is configured", () => {
   const none = resolveContractPlannerConfig({
     integrationConfigs: [],
     env: {}
   });
   assert.equal(none, null);
+});
 
-  const openAiOnly = resolveContractPlannerConfig({
+test("resolveContractPlannerConfig returns a config for openai provider", () => {
+  const result = resolveContractPlannerConfig({
     integrationConfigs: [
       {
         integration_key: "llm_api",
@@ -244,5 +246,9 @@ test("resolveContractPlannerConfig returns null when anthropic is unavailable", 
     ],
     env: {}
   });
-  assert.equal(openAiOnly, null);
+  assert.ok(result !== null);
+  assert.equal(result?.provider, "openai");
+  assert.equal(result?.apiKey, "key");
+  assert.equal(result?.model, "gpt-5");
+  assert.equal(result?.baseUrl, "https://api.openai.com");
 });

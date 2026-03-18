@@ -106,6 +106,22 @@ export type LlmResponse = {
   raw: Record<string, unknown>;
 };
 
+export type LlmStreamChunk =
+  | {
+      type: "response.started";
+      provider: LlmProvider;
+      model: string;
+      responseId?: string;
+    }
+  | {
+      type: "text_delta";
+      text: string;
+    }
+  | {
+      type: "response.completed";
+      response: LlmResponse;
+    };
+
 export function resolveModelPricing(model: string): LlmPricing | null {
   const normalizedModel = model.toLowerCase();
 
@@ -118,13 +134,15 @@ export function resolveModelPricing(model: string): LlmPricing | null {
   return null;
 }
 
-export type AnthropicToolDefinition = {
+/** Wire format for tool definitions sent to Anthropic-compatible endpoints. */
+export type ProviderToolDefinition = {
   name: string;
   description: string;
   input_schema: Record<string, unknown>;
 };
 
-export type AnthropicMessageRequest = {
+/** Wire format for requests sent to Anthropic-compatible endpoints. */
+export type ProviderMessageRequest = {
   model: string;
   max_tokens: number;
   temperature?: number;
@@ -136,5 +154,53 @@ export type AnthropicMessageRequest = {
       | { type: "tool_result"; tool_use_id: string; content: string; is_error?: boolean }
     >;
   }>;
-  tools?: AnthropicToolDefinition[];
+  tools?: ProviderToolDefinition[];
+};
+
+// Backward-compatible aliases.
+export type AnthropicToolDefinition = ProviderToolDefinition;
+export type AnthropicMessageRequest = ProviderMessageRequest;
+
+export type OpenAiToolDefinition = {
+  type: "function";
+  function: {
+    name: string;
+    description: string;
+    parameters: Record<string, unknown>;
+  };
+};
+
+export type OpenAiChatMessage =
+  | {
+      role: "system" | "user";
+      content: string;
+    }
+  | {
+      role: "assistant";
+      content: string | null;
+      tool_calls?: Array<{
+        id: string;
+        type: "function";
+        function: {
+          name: string;
+          arguments: string;
+        };
+      }>;
+    }
+  | {
+      role: "tool";
+      tool_call_id: string;
+      content: string;
+    };
+
+export type OpenAiChatCompletionRequest = {
+  model: string;
+  max_tokens?: number;
+  temperature?: number;
+  messages: OpenAiChatMessage[];
+  tools?: OpenAiToolDefinition[];
+  stream?: boolean;
+  stream_options?: {
+    include_usage?: boolean;
+  };
 };

@@ -134,7 +134,7 @@ export function resolveRunnerLlmConfig(input: {
   const configuredBaseUrl = readString(llmConfig, "baseUrl", input.env.SALVO_LLM_BASE_URL);
   const baseUrl =
     configuredBaseUrl ||
-    (routing.provider === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com/v1");
+    (routing.provider === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com");
   const model = routing.model;
 
   if (!apiKey) {
@@ -294,7 +294,7 @@ function parseOpenAiResponse(responseJson: Record<string, unknown>, config: Runn
   };
 }
 
-function parseAnthropicResponse(responseJson: Record<string, unknown>, config: RunnerLlmConfig): RunnerLlmResult {
+function parseAnthropicStyleResponse(responseJson: Record<string, unknown>, config: RunnerLlmConfig): RunnerLlmResult {
   const contentBlocks = Array.isArray(responseJson.content) ? responseJson.content : [];
   const text = contentBlocks
     .map((block) => (typeof (block as { text?: unknown }).text === "string" ? (block as { text: string }).text : ""))
@@ -302,7 +302,7 @@ function parseAnthropicResponse(responseJson: Record<string, unknown>, config: R
     .trim();
 
   if (!text) {
-    throw new Error("Anthropic response did not include text content.");
+    throw new Error("LLM response did not include text content.");
   }
 
   const usage = (responseJson.usage ?? {}) as {
@@ -354,13 +354,18 @@ export async function runLlmGeneration(input: {
     });
 
     if (!response.ok) {
-      throw new Error(`Anthropic request failed: ${response.status} ${await response.text()}`);
+      throw new Error(`LLM request failed: ${response.status} ${await response.text()}`);
     }
 
-    return parseAnthropicResponse((await response.json()) as Record<string, unknown>, input.config);
+    return parseAnthropicStyleResponse((await response.json()) as Record<string, unknown>, input.config);
   }
 
-  const response = await fetch(`${input.config.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+  const baseUrl = input.config.baseUrl.replace(/\/$/, "");
+  const chatCompletionsUrl = baseUrl.endsWith("/v1")
+    ? `${baseUrl}/chat/completions`
+    : `${baseUrl}/v1/chat/completions`;
+
+  const response = await fetch(chatCompletionsUrl, {
     method: "POST",
     headers: {
       "content-type": "application/json",

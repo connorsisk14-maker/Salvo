@@ -167,6 +167,196 @@ test("runAgentLoop executes multiple tool calls from a single assistant turn", a
   assert.deepEqual(executedTools, ["read_file", "salvo_complete"]);
 });
 
+test("runAgentLoop generates a plan and emits per-step events before completion", async () => {
+  const contract = buildContract();
+  const responses: LlmResponse[] = [
+    {
+      provider: "openai",
+      model: "gpt-4o",
+      stopReason: "end_turn",
+      usage: { inputTokens: 40, outputTokens: 20 },
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            summary: "Plan the run.",
+            steps: [
+              {
+                id: "step-1",
+                title: "Inspect the workspace",
+                expected_inputs: ["README.md"],
+                expected_outputs: ["workspace notes"]
+              },
+              {
+                id: "step-2",
+                title: "Finish the run",
+                expected_inputs: ["workspace notes"],
+                expected_outputs: ["run-summary.md"]
+              }
+            ]
+          })
+        }
+      ],
+      raw: {}
+    },
+    {
+      provider: "openai",
+      model: "gpt-4o",
+      stopReason: "tool_calls",
+      usage: { inputTokens: 25, outputTokens: 10 },
+      content: [
+        {
+          type: "tool_use",
+          id: "complete-step-1",
+          name: "plan_step_complete",
+          input: {
+            step_id: "step-1",
+            summary: "Inspected the workspace.",
+            outputs: ["workspace notes"]
+          }
+        }
+      ],
+      raw: {}
+    },
+    {
+      provider: "openai",
+      model: "gpt-4o",
+      stopReason: "tool_calls",
+      usage: { inputTokens: 30, outputTokens: 12 },
+      content: [
+        {
+          type: "tool_use",
+          id: "complete-step-2",
+          name: "plan_step_complete",
+          input: {
+            step_id: "step-2",
+            summary: "Prepared the final payload.",
+            outputs: ["run-summary.md"]
+          }
+        },
+        {
+          type: "tool_use",
+          id: "tool-complete",
+          name: "salvo_complete",
+          input: completionPayload()
+        }
+      ],
+      raw: {}
+    }
+  ];
+  const events: string[] = [];
+
+  const result = await runAgentLoop({
+    provider: "openai",
+    model: "gpt-4o",
+    systemPrompt: "system",
+    userPrompt: "user",
+    contract,
+    workspaceRoot: "/tmp/workspace",
+    createMessage: async () => {
+      const next = responses.shift();
+      if (!next) {
+        throw new Error("Unexpected extra LLM call.");
+      }
+      return next;
+    },
+    executeToolUse: async (block): Promise<ToolExecutionOutcome> => ({
+      toolResult: {
+        type: "tool_result",
+        toolUseId: block.id,
+        content: JSON.stringify({ ok: true })
+      },
+      completionPayload: block.name === "salvo_complete" ? completionPayload() : undefined,
+      policyDenied: false
+    }),
+    appendRunEvent: async (eventType) => {
+      events.push(eventType);
+    }
+  });
+
+  assert.equal(result.finalPayload.status, "completed");
+  assert.deepEqual(events.filter((event) => event === "plan.generated"), ["plan.generated"]);
+  assert.deepEqual(events.filter((event) => event === "plan.step.started"), [
+    "plan.step.started",
+    "plan.step.started"
+  ]);
+  assert.deepEqual(events.filter((event) => event === "plan.step.completed"), [
+    "plan.step.completed",
+    "plan.step.completed"
+  ]);
+});
+
+test("runAgentLoop blocks completion before the active plan step is complete", async () => {
+  const contract = buildContract();
+  const responses: LlmResponse[] = [
+    {
+      provider: "anthropic",
+      model: "claude-sonnet-4",
+      stopReason: "end_turn",
+      usage: { inputTokens: 20, outputTokens: 10 },
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            summary: "Plan the run.",
+            steps: [
+              {
+                id: "step-1",
+                title: "Inspect the workspace",
+                expected_inputs: ["README.md"],
+                expected_outputs: ["workspace notes"]
+              }
+            ]
+          })
+        }
+      ],
+      raw: {}
+    },
+    {
+      provider: "anthropic",
+      model: "claude-sonnet-4",
+      stopReason: "tool_use",
+      usage: { inputTokens: 20, outputTokens: 5 },
+      content: [
+        {
+          type: "tool_use",
+          id: "tool-complete",
+          name: "salvo_complete",
+          input: completionPayload()
+        }
+      ],
+      raw: {}
+    }
+  ];
+  const events: string[] = [];
+
+  const result = await runAgentLoop({
+    provider: "anthropic",
+    model: "claude-sonnet-4",
+    systemPrompt: "system",
+    userPrompt: "user",
+    contract,
+    workspaceRoot: "/tmp/workspace",
+    createMessage: async () => {
+      const next = responses.shift();
+      if (!next) {
+        throw new Error("Unexpected extra LLM call.");
+      }
+      return next;
+    },
+    executeToolUse: async () => {
+      throw new Error("Completion tool should not execute before plan completion.");
+    },
+    appendRunEvent: async (eventType) => {
+      events.push(eventType);
+    }
+  });
+
+  assert.equal(result.finalPayload.status, "blocked");
+  assert.equal(result.exitReason, "plan_deviation");
+  assert.equal(events.includes("plan.deviation_detected"), true);
+});
+
 test("runAgentLoop resumes from a saved partial tool batch checkpoint", async () => {
   const contract = buildContract();
   const executedTools: string[] = [];
@@ -480,7 +670,7 @@ test("runAgentLoop blocks after the max_tokens continuation cap is exhausted", a
 
   assert.equal(result.finalPayload.status, "blocked");
   assert.equal(result.exitReason, "max_tokens");
-  assert.equal(calls, 3);
+  assert.equal(calls, 4);
 });
 
 test("runAgentLoop blocks when the runtime budget is exceeded", async () => {

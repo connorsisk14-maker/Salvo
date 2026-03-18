@@ -210,6 +210,32 @@ const COMPLETE_INPUT_SCHEMA = {
   required: ["status", "summary", "deliverables", "evidence", "roadblocks", "learnings"]
 } satisfies Record<string, unknown>;
 
+export const PLAN_STEP_COMPLETE_INPUT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    step_id: {
+      type: "string",
+      minLength: 1,
+      description: "Identifier of the currently active execution-plan step."
+    },
+    summary: {
+      type: "string",
+      minLength: 1,
+      description: "Short summary of what was completed for this step."
+    },
+    outputs: {
+      type: "array",
+      description: "Optional files, commands, or artifacts produced while completing the step.",
+      items: {
+        type: "string",
+        minLength: 1
+      }
+    }
+  },
+  required: ["step_id", "summary"]
+} satisfies Record<string, unknown>;
+
 const SEND_EMAIL_INPUT_SCHEMA = {
   type: "object",
   additionalProperties: false,
@@ -333,6 +359,7 @@ type SkillRegistryLike = {
 export type BuildToolDefinitionsOptions = {
   completionToolName?: string;
   skillRegistry?: SkillRegistryLike;
+  additionalDefinitions?: LlmToolDefinition[];
 };
 
 function appendSkillDefinitions(
@@ -387,6 +414,16 @@ export function buildToolDefinitions(
   }
 
   appendSkillDefinitions(definitions, options, completionToolName);
+
+  for (const definition of options.additionalDefinitions ?? []) {
+    if (
+      definition.name.trim().length > 0 &&
+      !definitions.some((existing) => existing.name === definition.name) &&
+      definition.name !== completionToolName
+    ) {
+      definitions.push(definition);
+    }
+  }
 
   definitions.push({
     ...BASE_TOOL_DEFINITIONS.salvo_complete,

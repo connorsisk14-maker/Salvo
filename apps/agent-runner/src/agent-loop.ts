@@ -1,5 +1,7 @@
 import {
   buildToolDefinitions,
+  PLAN_STEP_COMPLETE_INPUT_SCHEMA,
+  type LlmToolDefinition,
   type LlmMessage,
   type LlmResponse,
   type SalvoCompletionPayload,
@@ -71,14 +73,37 @@ type PendingToolState = {
   commandResults: Record<string, unknown>[];
 };
 
+type ExecutionPlanStep = {
+  id: string;
+  title: string;
+  expectedInputs: string[];
+  expectedOutputs: string[];
+  completionSummary?: string;
+  outputs?: string[];
+};
+
+type ExecutionPlanState = {
+  summary: string;
+  steps: ExecutionPlanStep[];
+  currentStepIndex: number;
+  source: "llm" | "heuristic";
+};
+
 export type AgentLoopCheckpointState = {
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
   messages: LlmMessage[];
   usage: RunnerUsage;
   toolCallsUsed: number;
   turn: number;
   maxTokensRetries: number;
   pendingToolState: PendingToolState | null;
+  planState?: ExecutionPlanState | null;
+};
+
+const PLAN_STEP_COMPLETE_TOOL: LlmToolDefinition = {
+  name: "plan_step_complete",
+  description: "Mark the current execution-plan step as complete after its required work is done.",
+  inputSchema: PLAN_STEP_COMPLETE_INPUT_SCHEMA
 };
 
 function buildUsage(response: LlmResponse): RunnerUsage {
@@ -99,6 +124,178 @@ function cloneCheckpointState(state: AgentLoopCheckpointState): AgentLoopCheckpo
 
 function clonePendingToolState(state: PendingToolState): PendingToolState {
   return JSON.parse(JSON.stringify(state)) as PendingToolState;
+}
+
+function clonePlanState(state: ExecutionPlanState): ExecutionPlanState {
+  return JSON.parse(JSON.stringify(state)) as ExecutionPlanState;
+}
+
+function extractJsonObject(raw: string): string {
+  const trimmed = raw.trim();
+  const fencedMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = fencedMatch?.[1]?.trim() ?? trimmed;
+  const start = candidate.indexOf("{");
+  const end = candidate.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) {
+    throw new Error("LLM response did not contain a JSON object.");
+  }
+  return candidate.slice(start, end + 1);
+}
+
+function normalizePlanStep(raw: unknown, index: number): ExecutionPlanStep | null {
+  if (typeof raw === "string" && raw.trim().length > 0) {
+    return {
+      id: `step-${index + 1}`,
+      title: raw.trim(),
+      expectedInputs: [],
+      expectedOutputs: []
+    };
+  }
+
+  if (typeof raw !== "object" || raw === null) {
+    return null;
+  }
+
+  const rawStep = raw as {
+    id?: unknown;
+    title?: unknown;
+    summary?: unknown;
+    expected_inputs?: unknown;
+    expected_outputs?: unknown;
+  };
+  const title =
+    typeof rawStep.title === "string" && rawStep.title.trim().length > 0
+      ? rawStep.title.trim()
+      : typeof rawStep.summary === "string" && rawStep.summary.trim().length > 0
+        ? rawStep.summary.trim()
+        : "";
+  if (!title) {
+    return null;
+  }
+
+  return {
+    id:
+      typeof rawStep.id === "string" && rawStep.id.trim().length > 0
+        ? rawStep.id.trim()
+        : `step-${index + 1}`,
+    title,
+    expectedInputs: Array.isArray(rawStep.expected_inputs)
+      ? rawStep.expected_inputs.flatMap((value) =>
+          typeof value === "string" && value.trim().length > 0 ? [value.trim()] : []
+        )
+      : [],
+    expectedOutputs: Array.isArray(rawStep.expected_outputs)
+      ? rawStep.expected_outputs.flatMap((value) =>
+          typeof value === "string" && value.trim().length > 0 ? [value.trim()] : []
+        )
+      : []
+  };
+}
+
+function heuristicPlan(contract: ContractV1): ExecutionPlanState {
+  const steps: ExecutionPlanStep[] = [];
+
+  steps.push({
+    id: "step-1",
+    title: "Review the contract scope and inspect the workspace context.",
+    expectedInputs: ["contract", "workspace context"],
+    expectedOutputs: []
+  });
+
+  if (contract.deliverables.required_artifacts.length > 0) {
+    steps.push({
+      id: `step-${steps.length + 1}`,
+      title: "Produce the required artifacts.",
+      expectedInputs: contract.context.relevant_files.slice(0, 5),
+      expectedOutputs: contract.deliverables.required_artifacts.slice(0, 5)
+    });
+  }
+
+  if (contract.success_criteria.required_test_commands.length > 0) {
+    steps.push({
+      id: `step-${steps.length + 1}`,
+      title: "Run the required verification commands.",
+      expectedInputs: contract.success_criteria.required_test_commands.slice(0, 5),
+      expectedOutputs: ["verification evidence"]
+    });
+  }
+
+  if (steps.length === 0) {
+    steps.push({
+      id: "step-1",
+      title: "Complete the task within the contract scope.",
+      expectedInputs: ["task request"],
+      expectedOutputs: []
+    });
+  }
+
+  return {
+    summary: "Heuristic execution plan derived from the contract.",
+    steps,
+    currentStepIndex: 0,
+    source: "heuristic"
+  };
+}
+
+function parseExecutionPlan(rawText: string, contract: ContractV1): ExecutionPlanState {
+  try {
+    const parsed = JSON.parse(extractJsonObject(rawText)) as {
+      summary?: unknown;
+      steps?: unknown;
+      plan_steps?: unknown;
+    };
+    const rawSteps = Array.isArray(parsed.steps)
+      ? parsed.steps
+      : Array.isArray(parsed.plan_steps)
+        ? parsed.plan_steps
+        : [];
+    const steps = rawSteps
+      .map((step, index) => normalizePlanStep(step, index))
+      .filter((step): step is ExecutionPlanStep => step !== null);
+
+    if (steps.length === 0 || steps.length > contract.constraints.max_tool_calls) {
+      return heuristicPlan(contract);
+    }
+
+    return {
+      summary:
+        typeof parsed.summary === "string" && parsed.summary.trim().length > 0
+          ? parsed.summary.trim()
+          : "LLM-generated execution plan.",
+      steps,
+      currentStepIndex: 0,
+      source: "llm"
+    };
+  } catch {
+    return heuristicPlan(contract);
+  }
+}
+
+function currentPlanStep(planState: ExecutionPlanState | null): ExecutionPlanStep | null {
+  if (!planState) {
+    return null;
+  }
+  return planState.steps[planState.currentStepIndex] ?? null;
+}
+
+function buildPlanPrompt(userPrompt: string): string {
+  return [
+    userPrompt,
+    "Before using tools, produce a strict JSON object with keys `summary` and `steps`.",
+    "Each step must include `id`, `title`, `expected_inputs`, and `expected_outputs`.",
+    "Keep the plan concise, ordered, and limited to the contract scope."
+  ].join("\n\n");
+}
+
+function buildPlanExecutionPrompt(planState: ExecutionPlanState): string {
+  const activeStep = currentPlanStep(planState);
+  return [
+    `Approved plan summary: ${planState.summary}`,
+    "Execute the plan in order.",
+    "Call `plan_step_complete` when the current step is complete before moving on.",
+    `Current step: ${activeStep?.id ?? "done"}${activeStep ? ` - ${activeStep.title}` : ""}`,
+    `Plan:\n${JSON.stringify(planState.steps, null, 2)}`
+  ].join("\n\n");
 }
 
 function emptyUsage(provider: string, model: string): RunnerUsage {
@@ -211,6 +408,42 @@ function testsRunEntry(command: string, evidence: Record<string, unknown>): Requ
   };
 }
 
+async function emitPlanGenerated(
+  input: Pick<AgentLoopInput, "appendRunEvent">,
+  planState: ExecutionPlanState
+): Promise<void> {
+  await input.appendRunEvent("plan.generated", "info", {
+    source: planState.source,
+    summary: planState.summary,
+    steps: planState.steps.map((step, index) => ({
+      id: step.id,
+      title: step.title,
+      expected_inputs: step.expectedInputs,
+      expected_outputs: step.expectedOutputs,
+      order: index + 1
+    }))
+  });
+}
+
+async function emitPlanStepStarted(
+  input: Pick<AgentLoopInput, "appendRunEvent">,
+  planState: ExecutionPlanState
+): Promise<void> {
+  const step = currentPlanStep(planState);
+  if (!step) {
+    return;
+  }
+
+  await input.appendRunEvent("plan.step.started", "info", {
+    step_id: step.id,
+    title: step.title,
+    index: planState.currentStepIndex + 1,
+    total: planState.steps.length,
+    expected_inputs: step.expectedInputs,
+    expected_outputs: step.expectedOutputs
+  });
+}
+
 async function appendLlmEvents(
   input: Pick<AgentLoopInput, "appendRunEvent" | "provider" | "model">,
   turn: number,
@@ -241,10 +474,10 @@ async function appendLlmEvents(
 async function materializeTextFallback(input: {
   response: LlmResponse;
   contract: ContractV1;
-  completionToolName: string;
   executeToolUse: AgentLoopInput["executeToolUse"];
   appendRunEvent: AgentLoopInput["appendRunEvent"];
   toolCallsUsed: number;
+  planState: ExecutionPlanState | null;
 }): Promise<{
   finalPayload: SalvoCompletionPayload;
   toolCallsUsed: number;
@@ -257,9 +490,21 @@ async function materializeTextFallback(input: {
   const testsRun: RequiredTestRun[] = [];
   const commandResults: Record<string, unknown>[] = [];
 
-  await input.appendRunEvent("plan.generated", "info", {
-    steps: output.plan_steps
-  });
+  if (input.planState) {
+    for (let index = input.planState.currentStepIndex; index < input.planState.steps.length; index += 1) {
+      const step = input.planState.steps[index];
+      await input.appendRunEvent("plan.step.completed", "info", {
+        step_id: step.id,
+        title: step.title,
+        index: index + 1,
+        total: input.planState.steps.length,
+        summary: output.summary,
+        outputs: output.plan_steps.map((entry) =>
+          typeof entry === "string" ? entry : JSON.stringify(entry)
+        )
+      });
+    }
+  }
 
   for (const artifact of artifacts) {
     input.toolCallsUsed = reserveToolCall(
@@ -365,9 +610,9 @@ export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResu
   const startedAt = input.startedAtMs ?? now();
   const completionToolName = input.completionToolName?.trim() || "salvo_complete";
   const tools = buildToolDefinitions(input.contract, {
-    completionToolName
+    completionToolName,
+    additionalDefinitions: [PLAN_STEP_COMPLETE_TOOL]
   });
-  const requiredTestCommands = new Set(input.contract.success_criteria.required_test_commands);
   const checkpoint = await input.loadCheckpoint?.();
   const messages: LlmMessage[] =
     checkpoint?.messages ?? [
@@ -382,6 +627,7 @@ export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResu
   let turn = checkpoint?.turn ?? 0;
   let maxTokensRetries = checkpoint?.maxTokensRetries ?? 0;
   let pendingToolState = checkpoint?.pendingToolState ?? null;
+  let planState = checkpoint?.planState ?? null;
 
   const persistCheckpoint = async (): Promise<void> => {
     if (!input.saveCheckpoint) {
@@ -389,13 +635,14 @@ export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResu
     }
     await input.saveCheckpoint(
       cloneCheckpointState({
-        schemaVersion: 1,
+        schemaVersion: 2,
         messages,
         usage,
         toolCallsUsed,
         turn,
         maxTokensRetries,
-        pendingToolState
+        pendingToolState,
+        planState
       })
     );
   };
@@ -438,6 +685,101 @@ export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResu
           usage,
           exitReason: "tool_call_limit"
         };
+      }
+
+      if (
+        block.name === completionToolName &&
+        planState?.source === "llm" &&
+        currentPlanStep(planState)
+      ) {
+        const step = currentPlanStep(planState) as ExecutionPlanStep;
+        await input.appendRunEvent("plan.deviation_detected", "warn", {
+          reason: "completion_before_plan_finished",
+          active_step_id: step.id,
+          active_step_title: step.title
+        });
+        await clearCheckpoint();
+        return {
+          finalPayload: buildBlockedPayload({
+            summary: "Agent loop attempted to finish before all plan steps were complete.",
+            reason: "plan_deviation",
+            description: `The active plan step ${step.id} must be completed before ${completionToolName}.`
+          }),
+          usage,
+          exitReason: "plan_deviation"
+        };
+      }
+
+      if (block.name === "plan_step_complete") {
+        const activeStep = currentPlanStep(planState);
+        const requestedStepId =
+          typeof block.input.step_id === "string" ? block.input.step_id.trim() : "";
+        const summary =
+          typeof block.input.summary === "string" ? block.input.summary.trim() : "";
+        const outputs = Array.isArray(block.input.outputs)
+          ? block.input.outputs.flatMap((value) =>
+              typeof value === "string" && value.trim().length > 0 ? [value.trim()] : []
+            )
+          : [];
+
+        if (!activeStep || !requestedStepId || requestedStepId !== activeStep.id || !summary) {
+          await input.appendRunEvent("plan.deviation_detected", "warn", {
+            reason: "invalid_step_completion",
+            requested_step_id: requestedStepId || null,
+            active_step_id: activeStep?.id ?? null
+          });
+          await clearCheckpoint();
+          return {
+            finalPayload: buildBlockedPayload({
+              summary: "Agent loop deviated from the approved execution plan.",
+              reason: "plan_deviation",
+              description: "Step completion must match the currently active plan step."
+            }),
+            usage,
+            exitReason: "plan_deviation"
+          };
+        }
+
+        toolResults.push({
+          type: "tool_result",
+          toolUseId: block.id,
+          content: JSON.stringify({
+            ok: true,
+            step_id: activeStep.id,
+            next_step_id: planState?.steps[planState.currentStepIndex + 1]?.id ?? null
+          })
+        });
+
+        if (planState) {
+          planState.steps[planState.currentStepIndex] = {
+            ...planState.steps[planState.currentStepIndex],
+            completionSummary: summary,
+            outputs
+          };
+          await input.appendRunEvent("plan.step.completed", "info", {
+            step_id: activeStep.id,
+            title: activeStep.title,
+            index: planState.currentStepIndex + 1,
+            total: planState.steps.length,
+            summary,
+            outputs
+          });
+          planState.currentStepIndex += 1;
+          if (currentPlanStep(planState)) {
+            await emitPlanStepStarted(input, planState);
+          }
+        }
+
+        pendingToolState = {
+          assistantContent: clonePendingToolState(state).assistantContent,
+          toolUses: clonePendingToolState(state).toolUses,
+          nextToolIndex: index + 1,
+          toolResults: [...toolResults],
+          testsRun: [...testsRun],
+          commandResults: [...commandResults]
+        };
+        await persistCheckpoint();
+        continue;
       }
 
       const outcome = await input.executeToolUse(block);
@@ -501,6 +843,61 @@ export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResu
     await persistCheckpoint();
     return null;
   };
+
+  if (!planState && !pendingToolState) {
+    turn += 1;
+    const planResponse = await input.createMessage(input.systemPrompt, [
+      {
+        role: "user",
+        content: buildPlanPrompt(input.userPrompt)
+      }
+    ], []);
+    Object.assign(usage, aggregateUsage(usage, await appendLlmEvents(input, turn, planResponse)));
+
+    const resourceLimitViolation = detectResourceLimitViolation(input.contract, usage);
+    if (resourceLimitViolation) {
+      await input.appendRunEvent("resource.limit_reached", "warn", resourceLimitViolation.payload);
+      await clearCheckpoint();
+      return {
+        finalPayload: buildBlockedPayload({
+          summary: "Agent loop stopped before completion.",
+          reason: "resource_limit",
+          description: resourceLimitViolation.description
+        }),
+        usage,
+        exitReason: resourceLimitViolation.reason
+      };
+    }
+
+    const hasToolUses = planResponse.content.some((block) => block.type === "tool_use");
+    planState = parseExecutionPlan(textContent(planResponse), input.contract);
+    await emitPlanGenerated(input, planState);
+    await emitPlanStepStarted(input, planState);
+    if (hasToolUses) {
+      pendingToolState = {
+        assistantContent: planResponse.content,
+        toolUses: planResponse.content
+          .filter((block): block is ToolUseBlock => block.type === "tool_use")
+          .map((block) => JSON.parse(JSON.stringify(block)) as ToolUseBlock),
+        nextToolIndex: 0,
+        toolResults: [],
+        testsRun: [],
+        commandResults: []
+      };
+    } else {
+      messages.push({
+        role: "assistant",
+        content: planResponse.content.length > 0
+          ? planResponse.content
+          : [{ type: "text", text: JSON.stringify(planState) }]
+      });
+      messages.push({
+        role: "user",
+        content: buildPlanExecutionPrompt(planState)
+      });
+    }
+    await persistCheckpoint();
+  }
 
   while (true) {
     if (now() - startedAt > input.contract.constraints.max_runtime_minutes * 60_000) {
@@ -576,7 +973,6 @@ export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResu
           const fallback = await materializeTextFallback({
             response,
             contract: input.contract,
-            completionToolName,
             executeToolUse: async (block) =>
               input.executeToolUse({
                 ...block,
@@ -588,7 +984,8 @@ export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResu
                   : block.input
               }),
             appendRunEvent: input.appendRunEvent,
-            toolCallsUsed
+            toolCallsUsed,
+            planState
           });
 
           toolCallsUsed = fallback.toolCallsUsed;
