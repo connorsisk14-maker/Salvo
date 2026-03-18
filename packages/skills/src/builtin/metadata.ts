@@ -2,6 +2,7 @@ import { scaffoldModuleSkill } from "./scaffold-module";
 import { runTestSuiteSkill } from "./run-test-suite";
 import { searchCodebaseSkill } from "./search-codebase";
 import { expandZonesSkill } from "./expand-zones";
+import { webSearchExtractSkill } from "./web-search-extract";
 
 export type SkillMetadata = {
   name: string;
@@ -54,6 +55,17 @@ export const builtinSkillMetadata: SkillMetadata[] = [
     example: {
       metro: "dfw",
       limit: 5
+    }
+  },
+  {
+    name: webSearchExtractSkill.name,
+    label: "Web Search Extract",
+    description: webSearchExtractSkill.description,
+    inputSchema: webSearchExtractSkill.inputSchema,
+    example: {
+      query: "hvac repair",
+      location: "dallas tx",
+      limit: 10
     }
   }
 ];
