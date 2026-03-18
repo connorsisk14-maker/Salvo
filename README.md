@@ -8,6 +8,10 @@ Local-first agentic harness with a strict runtime contract, policy-enforced adap
 - `apps/orchestrator-api`: control-plane API (`create/read/approve/cancel` + read run/contract/event state)
 - `apps/orchestrator-daemon`: task claim loop, contract generation, runner spawn, evaluation, retry
 - `apps/agent-runner`: bounded runner that only uses policy-enforced adapters
+
+## Lead Pipeline
+
+The DFW lead pipeline relies on `docs/LEAD_PIPELINE_TEMPLATE.md`, which describes the raw intake, enrichment, zone tracking, and run history tabs plus the seeded zone priorities and creation steps. After copying the template into your workspace, target the copy by setting `SALVO_LEAD_PIPELINE_SHEET_ID` with the new spreadsheet ID in your environment or orchestration layer. Update `packages/shared/src/lead-pipeline.ts` whenever the template layout or zone list changes so automation code and docs stay in sync.
 - `apps/research-daemon`: analysis-only learning daemon (ingest, experiment, accepted-only publish)
 
 ## Packages
