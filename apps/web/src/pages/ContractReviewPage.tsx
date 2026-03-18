@@ -21,6 +21,13 @@ const capabilityLabels: Record<string, string> = {
   email_send: "Email sending"
 };
 
+type PolicyDraft = {
+  primary: string;
+  secondary: string;
+  nonGoals: string;
+  capabilities: Record<string, boolean>;
+};
+
 function formatDateTime(value?: string | null): string {
   if (!value) {
     return "-";
@@ -62,6 +69,38 @@ function splitForDiff(value?: string | null): string[] {
     .flatMap((segment) => segment.split(/(?<=[.!?])\s+/))
     .map((segment) => segment.trim())
     .filter((segment) => segment.length > 0);
+}
+
+function splitLines(value: string): string[] {
+  return value
+    .split(/\r?\n/)
+    .map((segment) => segment.trim())
+    .filter((segment) => segment.length > 0);
+}
+
+function getPolicyWarnings(draft: PolicyDraft): string[] {
+  const warnings: string[] = [];
+  const broadTerms = ["all", "every", "any", "always", "never", "each"];
+
+  const inspect = (label: string, text: string, message: (term: string) => string) => {
+    for (const term of broadTerms) {
+      if (new RegExp(`\\b${term}\\b`, "i").test(text)) {
+        warnings.push(message(term));
+      }
+    }
+  };
+
+  if (draft.primary.trim().length > 0) {
+    inspect("Primary", draft.primary, (term) => `Primary objective mentions '${term}', which could be too broad.`);
+  }
+  if (draft.secondary.trim().length > 0) {
+    inspect("Secondary", draft.secondary, (term) => `Secondary goals mention '${term}', making the policy span everything.`);
+  }
+  if (draft.nonGoals.trim().length > 0) {
+    inspect("Non-goals", draft.nonGoals, (term) => `Non-goals include '${term}', which weakens the constraint.`);
+  }
+
+  return warnings;
 }
 
 function computeDiffSegments(baseLines: string[], nextLines: string[]): DiffSegment[] {
@@ -177,6 +216,14 @@ export function ContractReviewPage() {
   const [error, setError] = useState<string | null>(null);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [actionPendingTaskId, setActionPendingTaskId] = useState<string | null>(null);
+  const [policyDraft, setPolicyDraft] = useState<PolicyDraft>(() => ({
+    primary: "",
+    secondary: "",
+    nonGoals: "",
+    capabilities: Object.fromEntries(
+      Object.keys(capabilityLabels).map((key) => [key, false])
+    ) as Record<string, boolean>
+  }));
 
   const needsReviewTasks = useMemo(() => tasks.filter((task) => task.status === "needs_review"), [tasks]);
 
@@ -213,14 +260,33 @@ export function ContractReviewPage() {
     ) as Record<string, boolean>;
   }, [contractDocument]);
 
+  useEffect(() => {
+    setPolicyDraft({
+      primary: typeof contractObjective.primary === "string" ? contractObjective.primary : "",
+      secondary: ensureArray(contractObjective.secondary).join("\n"),
+      nonGoals: ensureArray(contractObjective.non_goals).join("\n"),
+      capabilities: Object.fromEntries(
+        Object.keys(capabilityLabels).map((key) => [key, Boolean(contractCapabilities[key])])
+      ) as Record<string, boolean>
+    });
+  }, [contractObjective, contractCapabilities]);
+
   const contractCategoryLabel =
     contractDocument && typeof contractDocument.category === "string" ? contractDocument.category : "-";
   const contractFamilyLabel =
     contractDocument && typeof contractDocument.family_key === "string" ? contractDocument.family_key : "-";
 
+  const policyObjectiveDocument = useMemo<ContractObjectiveDocument>(() => {
+    return {
+      primary: policyDraft.primary,
+      secondary: splitLines(policyDraft.secondary),
+      non_goals: splitLines(policyDraft.nonGoals)
+    };
+  }, [policyDraft]);
+
   const contractNarrative = useMemo(
-    () => buildContractNarrative(selectedContract, contractObjective, contractCapabilities),
-    [selectedContract, contractObjective, contractCapabilities]
+    () => buildContractNarrative(selectedContract, policyObjectiveDocument, policyDraft.capabilities),
+    [selectedContract, policyObjectiveDocument, policyDraft.capabilities]
   );
 
   const primaryObjectiveText = useMemo(() => {
@@ -230,6 +296,18 @@ export function ContractReviewPage() {
 
   const secondaryObjectives = useMemo(() => ensureArray(contractObjective.secondary), [contractObjective]);
   const nonGoalObjectives = useMemo(() => ensureArray(contractObjective.non_goals), [contractObjective]);
+  const policyWarnings = useMemo(() => getPolicyWarnings(policyDraft), [policyDraft]);
+  const capabilityEntries = useMemo(() => Object.entries(capabilityLabels), []);
+
+  const toggleCapability = (key: string) => {
+    setPolicyDraft((current) => ({
+      ...current,
+      capabilities: {
+        ...current.capabilities,
+        [key]: !current.capabilities[key]
+      }
+    }));
+  };
 
   const diffRows = useMemo(() => {
     if (!selectedTask || !selectedContract) {
@@ -419,13 +497,74 @@ export function ContractReviewPage() {
                   <div className="contract-detail-section contract-meta">
                     <h4>Capabilities & constraints</h4>
                     <div className="contract-capability-grid">
-                      {Object.entries(capabilityLabels).map(([key, label]) => (
+                      {capabilityEntries.map(([key, label]) => (
                         <div key={key} className="capability-row">
                           <span>{label}</span>
-                          <span>{contractCapabilities[key] ? "Allowed" : "Blocked"}</span>
+                          <div className="mono" style={{ fontSize: "0.78rem" }}>
+                            Current: {contractCapabilities[key] ? "Allowed" : "Blocked"}
+                            <br />
+                            Draft: {policyDraft.capabilities[key] ? "Allowed" : "Blocked"}
+                          </div>
                         </div>
                       ))}
                     </div>
+                  </div>
+
+                  <div className="contract-detail-section">
+                    <h4>Policy editor</h4>
+                    <label>
+                      Primary objective
+                      <textarea
+                        value={policyDraft.primary}
+                        onChange={(event) =>
+                          setPolicyDraft((current) => ({ ...current, primary: event.target.value }))
+                        }
+                        rows={2}
+                      />
+                    </label>
+                    <label>
+                      Secondary goals (one per line)
+                      <textarea
+                        value={policyDraft.secondary}
+                        onChange={(event) =>
+                          setPolicyDraft((current) => ({ ...current, secondary: event.target.value }))
+                        }
+                        rows={3}
+                      />
+                    </label>
+                    <label>
+                      Non-goals (one per line)
+                      <textarea
+                        value={policyDraft.nonGoals}
+                        onChange={(event) =>
+                          setPolicyDraft((current) => ({ ...current, nonGoals: event.target.value }))
+                        }
+                        rows={2}
+                      />
+                    </label>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: "0.5rem" }}>
+                      {capabilityEntries.map(([key, label]) => (
+                        <button
+                          key={`policy-${key}`}
+                          type="button"
+                          className={`button-link${policyDraft.capabilities[key] ? "" : " warning"}`}
+                          onClick={() => toggleCapability(key)}
+                          style={{ minWidth: "160px", textAlign: "left" }}
+                        >
+                          {label}: {policyDraft.capabilities[key] ? "Allowed" : "Blocked"}
+                        </button>
+                      ))}
+                    </div>
+                    {policyWarnings.length > 0 ? (
+                      <div style={{ marginTop: "0.5rem" }}>
+                        {policyWarnings.map((warning) => (
+                          <p key={warning} className="muted" style={{ color: "var(--error)", margin: "0.2rem 0" }}>
+                            {warning}
+                          </p>
+                        ))}
+                        <p className="muted">Tightly scope objectives to avoid accidental policy creep.</p>
+                      </div>
+                    ) : null}
                   </div>
 
                   <div className="contract-detail-section">

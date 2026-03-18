@@ -34,6 +34,7 @@ export type ApiRun = {
   id: string;
   task_id: string;
   contract_id: string;
+  agent_profile: string;
   status: string;
   attempt_no: number;
   exit_reason?: string | null;
