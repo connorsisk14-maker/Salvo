@@ -20,6 +20,7 @@
     "prod:preflight": "node scripts/prod-preflight.mjs",
     "prod:up": "node scripts/prod-up.mjs",
     "prod:down": "node scripts/prod-down.mjs",
+    "health:monitor": "node scripts/monitor-health.mjs",
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
     "lint": "pnpm exec eslint . --max-warnings=0",
@@ -29,6 +30,9 @@
     "test:e2e": "node scripts/e2e-smoke.mjs",
     "test:load": "SALVO_LOAD_CONCURRENCY=3 node scripts/load-test.mjs",
     "test:load:5": "SALVO_LOAD_CONCURRENCY=5 node scripts/load-test.mjs"
+  },
+  "dependencies": {
+    "nodemailer": "^8.0.2"
   },
   "devDependencies": {
     "@typescript-eslint/parser": "^8.29.1",

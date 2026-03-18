@@ -117,6 +117,16 @@ export class SalvoRepository {
     await this.pool.end();
   }
 
+  async checkDbHealth(): Promise<{ ok: boolean; latencyMs?: number; error?: string }> {
+    const start = Date.now();
+    try {
+      await this.pool.query("select 1");
+      return { ok: true, latencyMs: Date.now() - start };
+    } catch (error) {
+      return { ok: false, error: (error as Error).message ?? "database error" };
+    }
+  }
+
   private async withTransaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
     const client = await this.pool.connect();
     try {

@@ -92,4 +92,19 @@ By default, launchd service logs go to:
 - `${SALVO_WORKSPACE_ROOT}/logs/prod/orchestrator-daemon.out.log`
 - `${SALVO_WORKSPACE_ROOT}/logs/prod/orchestrator-daemon.err.log`
 - `${SALVO_WORKSPACE_ROOT}/logs/prod/research-daemon.out.log`
-- `${SALVO_WORKSPACE_ROOT}/logs/prod/research-daemon.err.log`
+ - `${SALVO_WORKSPACE_ROOT}/logs/prod/research-daemon.err.log`
+
+## Health Monitoring
+
+The control plane now exposes `GET /health/all`, which reports the health status of `orchestrator`, `research`, and the database connection plus timestamps and thresholds. Configure an external poller to hit that endpoint every 60 seconds and alert when any service is `stale` or `offline`.
+
+Use `pnpm health:monitor` (or run `node scripts/monitor-health.mjs`) for the built-in poller. The script accepts:
+
+- `SALVO_HEALTH_MONITOR_API_URL` (default `http://localhost:8787`)
+- `SALVO_HEALTH_MONITOR_INTERVAL_MS` (default `60000`)
+- `SALVO_HEALTH_ALERT_CHANNELS` (comma-separated: `stdout`, `slack`, `email`)
+- `SALVO_HEALTH_SLACK_WEBHOOK_URL` (required when `slack` is enabled)
+- `SALVO_HEALTH_EMAIL_TRANSPORT_URL`, `SALVO_HEALTH_EMAIL_FROM`, `SALVO_HEALTH_EMAIL_RECIPIENTS` (required when `email` is enabled)
+- `SALVO_HEALTH_RESTART_LOCK_PATH` (create this file prior to a planned restart to suppress alerts during outage windows)
+
+Alerts are emitted when a service degrades from `healthy` or when the overall health becomes non-healthy, with a resolution message when the service recovers.

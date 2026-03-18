@@ -115,6 +115,36 @@ function daemonHealthStatus(heartbeatAt: string, thresholdSeconds: number): "hea
   return ageSeconds <= thresholdSeconds ? "healthy" : "stale";
 }
 
+function buildHeartbeatStatus(
+  heartbeat: { heartbeat_at: string; metadata_json?: Record<string, unknown>; daemon_id?: string } | null,
+  thresholdSeconds: number
+): {
+  status: "healthy" | "stale" | "offline";
+  heartbeat_at: string | null;
+  threshold_seconds: number;
+  daemon_id?: string;
+  metadata?: Record<string, unknown>;
+  detail?: string;
+} {
+  if (!heartbeat) {
+    return {
+      status: "offline",
+      heartbeat_at: null,
+      threshold_seconds: thresholdSeconds
+    };
+  }
+
+  const status = daemonHealthStatus(heartbeat.heartbeat_at, thresholdSeconds);
+  return {
+    status,
+    heartbeat_at: heartbeat.heartbeat_at,
+    threshold_seconds: thresholdSeconds,
+    daemon_id: heartbeat.daemon_id,
+    metadata: heartbeat.metadata_json,
+    detail: typeof heartbeat.metadata_json?.note === "string" ? heartbeat.metadata_json.note : undefined
+  };
+}
+
 function readPositiveIntegerEnv(name: string, fallback: number): number {
   const value = Number(process.env[name] ?? fallback);
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
@@ -863,6 +893,39 @@ export async function buildServer() {
       age_seconds: Number(ageSeconds.toFixed(1)),
       threshold_seconds: researchThresholdSeconds,
       metadata: heartbeat.metadata_json
+    };
+  });
+
+  app.get("/health/all", async () => {
+    const [orchestratorHeartbeat, researchHeartbeat, dbHealth] = await Promise.all([
+      repo.getDaemonHeartbeat("orchestrator"),
+      repo.getDaemonHeartbeat("research"),
+      repo.checkDbHealth()
+    ]);
+
+    const services = {
+      orchestrator: buildHeartbeatStatus(orchestratorHeartbeat, orchestratorThresholdSeconds),
+      research: buildHeartbeatStatus(researchHeartbeat, researchThresholdSeconds),
+      database: {
+        status: dbHealth.ok ? "healthy" : "offline",
+        heartbeat_at: new Date().toISOString(),
+        threshold_seconds: 0,
+        detail: dbHealth.ok
+          ? `sql latency ${dbHealth.latencyMs ?? 0}ms`
+          : dbHealth.error
+      }
+    };
+
+    const overallStatus = Object.values(services).some((service) => service.status === "offline")
+      ? "offline"
+      : Object.values(services).some((service) => service.status === "stale")
+        ? "stale"
+        : "healthy";
+
+    return {
+      status: overallStatus,
+      timestamp: new Date().toISOString(),
+      services
     };
   });
 
