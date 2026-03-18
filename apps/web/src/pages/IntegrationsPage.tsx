@@ -36,6 +36,9 @@ export function IntegrationsPage() {
   const [httpToken, setHttpToken] = useState("");
   const [googleSpreadsheetId, setGoogleSpreadsheetId] = useState("");
   const [googleCredentials, setGoogleCredentials] = useState("");
+  const [emailTransportUrl, setEmailTransportUrl] = useState("");
+  const [emailDefaultFrom, setEmailDefaultFrom] = useState("");
+  const [emailDefaultRecipients, setEmailDefaultRecipients] = useState("");
 
   async function refresh() {
     try {
@@ -72,12 +75,13 @@ export function IntegrationsPage() {
   const processIntegration = integrationMap.get("process");
   const http = integrationMap.get("http");
   const googleSheetsIntegration = integrationMap.get("google_sheets");
+  const email = integrationMap.get("email");
 
   useEffect(() => {
     if (initialized.current) {
       return;
     }
-    if (!supabase && !llmApi && !processIntegration && !http && !googleSheetsIntegration) {
+    if (!supabase && !llmApi && !processIntegration && !http && !googleSheetsIntegration && !email) {
       return;
     }
 
@@ -90,6 +94,10 @@ export function IntegrationsPage() {
     const processConfig = (processIntegration?.config ?? {}) as { command?: string };
     const httpConfig = (http?.config ?? {}) as { base_url?: string };
     const googleConfig = (googleSheetsIntegration?.config ?? {}) as { spreadsheet_id?: string };
+    const emailConfig = (email?.config ?? {}) as {
+      default_from?: string;
+      default_recipients?: string[];
+    };
 
     setSupabaseUrl(supabaseConfig.url ?? "");
     setLlmProvider(llmConfig.provider ?? "anthropic");
@@ -98,11 +106,13 @@ export function IntegrationsPage() {
     setProcessCommand(processConfig.command ?? "");
     setHttpBaseUrl(httpConfig.base_url ?? "");
     setGoogleSpreadsheetId(googleConfig.spreadsheet_id ?? "");
+    setEmailDefaultFrom(emailConfig.default_from ?? "");
+    setEmailDefaultRecipients((emailConfig.default_recipients ?? []).join(", "));
     initialized.current = true;
-  }, [googleSheetsIntegration, http, llmApi, processIntegration, supabase]);
+  }, [email, googleSheetsIntegration, http, llmApi, processIntegration, supabase]);
 
   async function saveConfig(
-    key: "supabase" | "llm_api" | "process" | "http" | "google_sheets",
+    key: "supabase" | "llm_api" | "process" | "http" | "google_sheets" | "email",
     payload: Record<string, unknown>
   ) {
     setBusyKey(key);
@@ -119,6 +129,9 @@ export function IntegrationsPage() {
       }
       if (key === "google_sheets") {
         setGoogleCredentials("");
+      }
+      if (key === "email") {
+        setEmailTransportUrl("");
       }
       await refresh();
     } catch (saveError) {
@@ -372,6 +385,67 @@ export function IntegrationsPage() {
             </p>
             <button className="button-link" type="submit" disabled={busyKey === "google_sheets"}>
               {busyKey === "google_sheets" ? "Saving..." : "Save Google Sheets"}
+            </button>
+          </form>
+
+          <form
+            className="integration-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              const payload: Record<string, unknown> = {};
+              if (emailTransportUrl.trim().length > 0) {
+                payload.transportUrl = emailTransportUrl.trim();
+              }
+              if (emailDefaultFrom.trim().length > 0) {
+                payload.defaultFrom = emailDefaultFrom.trim();
+              }
+              const recipients = emailDefaultRecipients
+                .split(",")
+                .map((entry) => entry.trim())
+                .filter(Boolean);
+              if (recipients.length > 0) {
+                payload.defaultRecipients = recipients;
+              }
+              if (Object.keys(payload).length === 0) {
+                setError("Provide an email transport URL, default sender, or default recipients.");
+                return;
+              }
+              void saveConfig("email", payload);
+            }}
+          >
+            <h3>Email Adapter</h3>
+            <label>
+              Transport URL
+              <input
+                value={emailTransportUrl}
+                onChange={(event) => setEmailTransportUrl(event.target.value)}
+                placeholder="smtp://user:pass@mail.example.com:587"
+              />
+            </label>
+            <label>
+              Default from
+              <input
+                value={emailDefaultFrom}
+                onChange={(event) => setEmailDefaultFrom(event.target.value)}
+                placeholder="ops@example.com"
+              />
+            </label>
+            <label>
+              Default recipients
+              <input
+                value={emailDefaultRecipients}
+                onChange={(event) => setEmailDefaultRecipients(event.target.value)}
+                placeholder="ops@example.com, owner@example.com"
+              />
+            </label>
+            <p className="muted">
+              Transport configured:{" "}
+              {String(
+                ((email?.config ?? {}) as { transport_url_configured?: boolean }).transport_url_configured ?? false
+              )}
+            </p>
+            <button className="button-link" type="submit" disabled={busyKey === "email"}>
+              {busyKey === "email" ? "Saving..." : "Save Email Adapter"}
             </button>
           </form>
         </div>

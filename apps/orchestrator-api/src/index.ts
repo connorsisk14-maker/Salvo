@@ -5,7 +5,13 @@ import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
-import { createDbPool, SalvoRepository, type TaskChatProposal } from "@salvo/db";
+import {
+  createDbPool,
+  SalvoRepository,
+  type DbTask,
+  type TaskChatProposal,
+  type TaskDependencyStatus
+} from "@salvo/db";
 import {
   AGENT_PROFILES,
   AGENT_TRUST_TIERS,
@@ -91,6 +97,12 @@ const googleSheetsConfigSchema = z.object({
   credentialsJson: z.string().trim().min(1, "credentialsJson must not be empty.").optional()
 }).strict();
 
+const emailConfigSchema = z.object({
+  transportUrl: z.string().trim().max(2048, "transportUrl must be 2048 characters or fewer.").optional(),
+  defaultFrom: z.string().trim().max(320, "defaultFrom must be 320 characters or fewer.").optional(),
+  defaultRecipients: z.array(z.string().trim().min(1).max(320)).max(20).optional()
+}).strict();
+
 const integrationConfigSchemas = {
   supabase: z.object({
     url: z.string().trim().max(2048, "url must be 2048 characters or fewer.").optional(),
@@ -109,7 +121,8 @@ const integrationConfigSchemas = {
     baseUrl: z.string().trim().max(2048, "baseUrl must be 2048 characters or fewer.").optional(),
     token: z.string().trim().max(4096, "token must be 4096 characters or fewer.").optional()
   }).strict(),
-  google_sheets: googleSheetsConfigSchema
+  google_sheets: googleSheetsConfigSchema,
+  email: emailConfigSchema
 } as const;
 
 function daemonHealthStatus(heartbeatAt: string, thresholdSeconds: number): "healthy" | "stale" {
@@ -162,7 +175,7 @@ type IntegrationStatus =
   | "healthy"
   | "stale"
   | "offline";
-type EditableIntegrationKey = "supabase" | "llm_api" | "process" | "http" | "google_sheets";
+type EditableIntegrationKey = "supabase" | "llm_api" | "process" | "http" | "google_sheets" | "email";
 type LlmProvider = "anthropic" | "openai" | "custom";
 
 type IntegrationConfigMap = {
@@ -187,6 +200,11 @@ type IntegrationConfigMap = {
     spreadsheetId: string;
     credentialsJson: string;
   };
+  email: {
+    transportUrl: string;
+    defaultFrom: string;
+    defaultRecipients: string[];
+  };
 };
 
 type RateLimitEntry = {
@@ -197,6 +215,10 @@ type RateLimitEntry = {
 type ValidationIssue = {
   path: string;
   message: string;
+};
+
+type TaskWithDependencies = DbTask & {
+  dependencies: TaskDependencyStatus[];
 };
 
 const IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"]);
@@ -413,6 +435,14 @@ function createDefaultConfigMap(): IntegrationConfigMap {
     googleSheets: {
       spreadsheetId: process.env.SALVO_GOOGLE_SHEETS_SPREADSHEET_ID ?? "",
       credentialsJson: process.env.SALVO_GOOGLE_SHEETS_CREDENTIALS_JSON ?? ""
+    },
+    email: {
+      transportUrl: process.env.SALVO_EMAIL_TRANSPORT_URL ?? "",
+      defaultFrom: process.env.SALVO_EMAIL_DEFAULT_FROM ?? "",
+      defaultRecipients: (process.env.SALVO_EMAIL_DEFAULT_RECIPIENTS ?? "")
+        .split(",")
+        .map((entry) => entry.trim())
+        .filter(Boolean)
     }
   };
 }
@@ -469,6 +499,18 @@ function applyStoredConfig(
         "credentialsJson",
         next.googleSheets.credentialsJson
       );
+      continue;
+    }
+
+    if (row.integration_key === "email") {
+      next.email.transportUrl = readString(config, "transportUrl", next.email.transportUrl);
+      next.email.defaultFrom = readString(config, "defaultFrom", next.email.defaultFrom);
+      const recipients = config.defaultRecipients;
+      if (Array.isArray(recipients)) {
+        next.email.defaultRecipients = recipients.flatMap((entry) =>
+          typeof entry === "string" && entry.trim().length > 0 ? [entry.trim()] : []
+        );
+      }
     }
   }
 
@@ -783,6 +825,25 @@ export async function buildServer() {
   });
   await app.register(cors, { origin: true });
 
+  async function includeDependencies(tasks: DbTask[]): Promise<TaskWithDependencies[]> {
+    if (tasks.length === 0) {
+      return [];
+    }
+    const dependencyMap = await repo.listTaskDependencyStatuses(tasks.map((task) => task.id));
+    return tasks.map((task) => ({
+      ...task,
+      dependencies: dependencyMap.get(task.id) ?? []
+    }));
+  }
+
+  async function includeDependencyForTask(task: DbTask | null): Promise<TaskWithDependencies | null> {
+    if (!task) {
+      return null;
+    }
+    const [decorated] = await includeDependencies([task]);
+    return decorated;
+  }
+
   app.setErrorHandler((error, _request, reply) => {
     if ((error as { code?: string }).code === "FST_ERR_CTP_BODY_TOO_LARGE") {
       return reply.status(413).send({
@@ -1033,6 +1094,25 @@ export async function buildServer() {
         }
       },
       {
+        key: "email",
+        label: "Email Adapter",
+        status:
+          hasValue(config.email.transportUrl) && hasValue(config.email.defaultFrom)
+            ? "ready"
+            : "not_configured",
+        detail:
+          hasValue(config.email.transportUrl) && hasValue(config.email.defaultFrom)
+            ? `Default sender ${config.email.defaultFrom} with ${config.email.defaultRecipients.length} default recipient(s).`
+            : "Set an email transport URL and default sender.",
+        updated_at: configUpdatedByKey.get("email") ?? now,
+        editable: true,
+        config: {
+          transport_url_configured: hasValue(config.email.transportUrl),
+          default_from: config.email.defaultFrom,
+          default_recipients: config.email.defaultRecipients
+        }
+      },
+      {
         key: "orchestrator_daemon",
         label: "Orchestrator Daemon",
         status: orchestratorHeartbeat
@@ -1188,6 +1268,19 @@ export async function buildServer() {
         durationSeconds =
           Number.isFinite(start) && Number.isFinite(end) ? Math.max(0, Math.round((end - start) / 1000)) : null;
       }
+      const hasLeadChainData =
+        Boolean(run.lead_chain_scraper_run_id) ||
+        Boolean(run.lead_chain_strategist_task_id) ||
+        Boolean(run.lead_chain_strategist_run_id) ||
+        Boolean(run.lead_chain_row_context);
+      const leadChain = hasLeadChainData
+        ? {
+            scraper_run_id: run.lead_chain_scraper_run_id,
+            strategist_task_id: run.lead_chain_strategist_task_id,
+            strategist_run_id: run.lead_chain_strategist_run_id,
+            row_context: run.lead_chain_row_context
+          }
+        : null;
       return {
         id: run.id,
         agent_profile: run.agent_profile,
@@ -1196,7 +1289,8 @@ export async function buildServer() {
         created_at: run.created_at,
         duration_seconds: durationSeconds,
         outcome_summary: run.outcome_summary,
-        score: run.score
+        score: run.score,
+        lead_chain: leadChain
       };
     });
 
@@ -1214,7 +1308,7 @@ export async function buildServer() {
     Body: Record<string, unknown>;
   }>("/integrations/:key/config", async (req, reply) => {
     const key = req.params.key;
-    if (!["supabase", "llm_api", "process", "http", "google_sheets"].includes(key)) {
+    if (!["supabase", "llm_api", "process", "http", "google_sheets", "email"].includes(key)) {
       return reply.status(400).send({ ok: false, error: "Invalid integration key." });
     }
 
@@ -1331,6 +1425,30 @@ export async function buildServer() {
       }
       if (typeof body.token === "string" && body.token.trim().length > 0) {
         nextConfig.token = body.token.trim();
+      }
+    } else if (key === "email") {
+      const parsedBody = parseRequestBody(integrationConfigSchemas.email, rawBody);
+      if (!parsedBody.ok) {
+        return reply.status(400).send({
+          error: "Invalid request body.",
+          issues: parsedBody.issues
+        });
+      }
+      if (!hasConfigChanges(parsedBody.value)) {
+        return reply.status(400).send({
+          error: "Invalid request body.",
+          issues: [{ path: "body", message: "At least one config field is required." }]
+        });
+      }
+      const body = parsedBody.value;
+      if (typeof body.transportUrl === "string") {
+        nextConfig.transportUrl = body.transportUrl.trim();
+      }
+      if (typeof body.defaultFrom === "string") {
+        nextConfig.defaultFrom = body.defaultFrom.trim();
+      }
+      if (Array.isArray(body.defaultRecipients)) {
+        nextConfig.defaultRecipients = body.defaultRecipients.map((entry) => entry.trim()).filter(Boolean);
       }
     }
 
@@ -1803,7 +1921,8 @@ export async function buildServer() {
         });
       }
 
-      return reply.status(result.responseStatus).send(result.resource);
+      const decorated = (await includeDependencies([result.resource]))[0];
+      return reply.status(result.responseStatus).send(decorated);
     } catch (error) {
       const message = (error as Error).message;
       if (message.includes("Idempotency key already used") || message.includes("already in progress")) {
@@ -1814,7 +1933,8 @@ export async function buildServer() {
   });
 
   app.get("/tasks", async () => {
-    return repo.listTasks(200);
+    const tasks = await repo.listTasks(200);
+    return includeDependencies(tasks);
   });
 
   app.get<{ Params: { id: string } }>("/tasks/:id", async (req, reply) => {
@@ -1822,7 +1942,8 @@ export async function buildServer() {
     if (!task) {
       return reply.status(404).send({ error: "Task not found" });
     }
-    return task;
+    const decorated = await includeDependencyForTask(task);
+    return reply.status(200).send(decorated);
   });
 
   app.post<{ Params: { id: string } }>("/tasks/:id/approve", async (req, reply) => {
@@ -1861,7 +1982,8 @@ export async function buildServer() {
           }
         });
       }
-      return reply.status(result.responseStatus).send(result.resource);
+      const decorated = (await includeDependencies([result.resource]))[0];
+      return reply.status(result.responseStatus).send(decorated);
     } catch (error) {
       const message = (error as Error).message;
       if (message.includes("Idempotency key already used") || message.includes("already in progress")) {
@@ -1873,16 +1995,17 @@ export async function buildServer() {
 
   app.post<{ Params: { id: string } }>("/tasks/:id/reject", async (req, reply) => {
     try {
-      const task = await repo.rejectTask(req.params.id);
-      await repo.createAuditEvent({
-        actor: auditActor(req),
-        action: "task.rejected",
-        target: task.id,
-        metadata: {
-          status: task.status
-        }
-      });
-      return task;
+    const task = await repo.rejectTask(req.params.id);
+    await repo.createAuditEvent({
+      actor: auditActor(req),
+      action: "task.rejected",
+      target: task.id,
+      metadata: {
+        status: task.status
+      }
+    });
+    const decorated = (await includeDependencies([task]))[0];
+    return decorated;
     } catch (error) {
       return reply.status(400).send({ error: (error as Error).message });
     }
@@ -1890,16 +2013,17 @@ export async function buildServer() {
 
   app.post<{ Params: { id: string } }>("/tasks/:id/cancel", async (req, reply) => {
     try {
-      const task = await repo.cancelTask(req.params.id);
-      await repo.createAuditEvent({
-        actor: auditActor(req),
-        action: "task.cancelled",
-        target: task.id,
-        metadata: {
-          status: task.status
-        }
-      });
-      return task;
+    const task = await repo.cancelTask(req.params.id);
+    await repo.createAuditEvent({
+      actor: auditActor(req),
+      action: "task.cancelled",
+      target: task.id,
+      metadata: {
+        status: task.status
+      }
+    });
+    const decorated = (await includeDependencies([task]))[0];
+    return decorated;
     } catch (error) {
       return reply.status(400).send({ error: (error as Error).message });
     }

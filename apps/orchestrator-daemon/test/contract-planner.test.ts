@@ -67,6 +67,19 @@ test("buildContractPlanningPrompts includes workspace context and family memory"
   assert.ok(prompts.user.includes("active_research_findings"));
 });
 
+test("buildHeuristicContract honors an explicit preferred profile", () => {
+  const contract = buildHeuristicContract({
+    contractId: "33333333-3333-4333-8333-333333333333",
+    taskId: baseTask.id,
+    workspaceId: baseTask.workspace_id,
+    request: baseTask.original_request,
+    taskTitle: baseTask.title,
+    preferredProfile: "lead_strategist"
+  });
+
+  assert.equal(contract.agent_profile, "lead_strategist");
+});
+
 test("buildOrchestratorSoulPrompt renders workspace, run, and research context", () => {
   const prompt = buildOrchestratorSoulPrompt({
     workspace: {

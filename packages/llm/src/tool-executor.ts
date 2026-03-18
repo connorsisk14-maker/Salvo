@@ -1,5 +1,6 @@
 import path from "node:path";
 import type { LlmContentBlock } from "./types";
+import type { EmailAdapter } from "@salvo/adapters";
 
 export type ToolUseBlock = Extract<LlmContentBlock, { type: "tool_use" }>;
 export type ToolResultBlock = Extract<LlmContentBlock, { type: "tool_result" }>;
@@ -126,12 +127,18 @@ export type ToolExecutorPersistence = {
 export type ExecuteToolUseInput = {
   block: ToolUseBlock;
   workspaceRoot: string;
+  runId?: string;
   requiredTestCommands?: Set<string>;
   completionToolName?: string;
   skillRegistry?: SkillRegistryLike;
   skillExecutionContext?: SkillExecutionContextLike;
   deps: ToolExecutorDeps;
   persistence: ToolExecutorPersistence;
+  emailAdapter?: EmailAdapter;
+  emailSendPolicy?: {
+    maxSends: number;
+    sendsUsed: number;
+  };
 };
 
 export type ToolExecutionOutcome = {
@@ -589,6 +596,132 @@ export async function executeToolUse(input: ExecuteToolUseInput): Promise<ToolEx
         ...evidence
       }),
       requiredTestCommandResult,
+      policyDenied: false
+    };
+  }
+
+  if (input.block.name === "send_email") {
+    if (!input.emailAdapter) {
+      const message = "Email adapter is not configured.";
+      const toolResult = buildToolResult(
+        input.block.id,
+        {
+          ok: false,
+          error: "email_adapter_unconfigured",
+          tool: input.block.name,
+          message
+        },
+        true
+      );
+      await emitToolResult(input.persistence, {
+        tool: input.block.name,
+        tool_use_id: input.block.id,
+        error: "email_adapter_unconfigured",
+        message
+      });
+      return {
+        toolResult,
+        policyDenied: false
+      };
+    }
+
+    if (
+      input.emailSendPolicy &&
+      input.emailSendPolicy.maxSends > 0 &&
+      input.emailSendPolicy.sendsUsed >= input.emailSendPolicy.maxSends
+    ) {
+      const message = `Email send limit reached for this run (${input.emailSendPolicy.maxSends}).`;
+      const toolResult = buildToolResult(
+        input.block.id,
+        {
+          ok: false,
+          error: "email_send_limit_exceeded",
+          tool: input.block.name,
+          message
+        },
+        true
+      );
+      await emitToolResult(input.persistence, {
+        tool: input.block.name,
+        tool_use_id: input.block.id,
+        error: "email_send_limit_exceeded",
+        message
+      });
+      await input.persistence.appendRunEvent("policy.denied", "warn", {
+        reason: "email_send_limit",
+        message,
+        max_sends: input.emailSendPolicy.maxSends
+      });
+      return {
+        toolResult,
+        policyDenied: true
+      };
+    }
+
+    if (input.emailSendPolicy) {
+      input.emailSendPolicy.sendsUsed += 1;
+    }
+
+    const runId = input.runId ?? input.block.id;
+    const payload = input.block.input ?? {};
+    const result = await input.emailAdapter.run({
+      runId,
+      payload
+    });
+    const emailOutput = isRecord(result.output) ? result.output : {};
+    const metadata = {
+      success: result.ok,
+      detail: result.detail,
+      subject: typeof payload.subject === "string" ? payload.subject : undefined,
+      from: typeof payload.from === "string" ? payload.from : undefined,
+      to: payload.to,
+      cc: payload.cc,
+      bcc: payload.bcc,
+      messageId: typeof emailOutput.messageId === "string" ? emailOutput.messageId : undefined,
+      accepted: Array.isArray(emailOutput.accepted) ? emailOutput.accepted : undefined,
+      rejected: Array.isArray(emailOutput.rejected) ? emailOutput.rejected : undefined
+    };
+
+    await input.persistence.createArtifact({
+      artifactType: "email",
+      path: `email-${input.runId}-${input.block.id}.json`,
+      metadataJson: metadata
+    });
+
+    await emitToolResult(input.persistence, {
+      tool: input.block.name,
+      tool_use_id: input.block.id,
+      ok: result.ok,
+      subject: metadata.subject,
+      message_id: metadata.messageId,
+      accepted: metadata.accepted,
+      rejected: metadata.rejected
+    });
+
+    return {
+      toolResult: buildToolResult(
+        input.block.id,
+        {
+          ok: result.ok,
+          tool: input.block.name,
+          ...(result.ok
+            ? {}
+            : {
+                error: "email_send_failed",
+                message: result.detail
+              }),
+          subject: metadata.subject,
+          from: metadata.from,
+          to: metadata.to,
+          cc: metadata.cc,
+          bcc: metadata.bcc,
+          accepted: metadata.accepted,
+          rejected: metadata.rejected,
+          message_id: metadata.messageId,
+          detail: result.detail
+        },
+        !result.ok
+      ),
       policyDenied: false
     };
   }

@@ -1,5 +1,6 @@
 import path from "node:path";
 import { mkdir } from "node:fs/promises";
+import { EmailAdapter } from "@salvo/adapters";
 import { createDbPool, SalvoRepository } from "@salvo/db";
 import { buildToolDefinitions, executeToolUse, LlmClient } from "@salvo/llm";
 import { CommandAdapter, FilesystemAdapter } from "@salvo/tools";
@@ -19,12 +20,29 @@ import { runAgentLoop } from "./agent-loop";
 
 await initializeSecrets();
 
+const defaultEmailSendLimit = Number(process.env.SALVO_EMAIL_MAX_SENDS_PER_RUN ?? 3);
+
 function parseArg(flag: string): string | undefined {
   const idx = process.argv.indexOf(flag);
   if (idx === -1) {
     return undefined;
   }
   return process.argv[idx + 1];
+}
+
+function readIntegrationString(config: Record<string, unknown>, key: string, fallback = ""): string {
+  const value = config[key];
+  return typeof value === "string" ? value.trim() : fallback;
+}
+
+function readIntegrationStringList(config: Record<string, unknown>, key: string): string[] {
+  const value = config[key];
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.flatMap((entry) =>
+    typeof entry === "string" && entry.trim().length > 0 ? [entry.trim()] : []
+  );
 }
 
 async function main(): Promise<void> {
@@ -65,6 +83,23 @@ async function main(): Promise<void> {
   const policy = parseContractPolicy(workspaceRoot, contractJson);
   const filesystem = new FilesystemAdapter(workspaceRoot, policy);
   const command = new CommandAdapter(policy);
+  const emailConfig =
+    integrationConfigs.find((row) => row.integration_key === "email")?.config_json ?? {};
+  const transportUrl =
+    readIntegrationString(emailConfig, "transportUrl") ||
+    readIntegrationString(emailConfig, "transport_url");
+  const emailAdapter = transportUrl
+    ? new EmailAdapter({
+        transportUrl,
+        defaultFrom:
+          readIntegrationString(emailConfig, "defaultFrom") ||
+          readIntegrationString(emailConfig, "default_from"),
+        defaultRecipients: [
+          ...readIntegrationStringList(emailConfig, "defaultRecipients"),
+          ...readIntegrationStringList(emailConfig, "default_recipients")
+        ]
+      })
+    : undefined;
   const promptContext = await collectPromptContext({
     relevantFiles: contractJson.context.relevant_files,
     listDirectory: (targetPath) => filesystem.listDirectory(targetPath),
@@ -106,6 +141,13 @@ async function main(): Promise<void> {
     });
   }, 10_000);
   let toolCallsUsed = 0;
+  const emailSendPolicy = {
+    maxSends:
+      Number.isFinite(defaultEmailSendLimit) && defaultEmailSendLimit > 0
+        ? Math.floor(defaultEmailSendLimit)
+        : 3,
+    sendsUsed: 0
+  };
 
   const trackToolCall = async (payload: Record<string, unknown>) => {
     try {
@@ -172,7 +214,9 @@ async function main(): Promise<void> {
                   path: params.path,
                   metadataJson: params.metadataJson
                 })
-            }
+            },
+            emailAdapter,
+            emailSendPolicy
           }),
         appendRunEvent: (eventType, level, payload) =>
           repo.appendRunEvent(

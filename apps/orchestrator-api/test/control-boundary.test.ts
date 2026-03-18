@@ -1,6 +1,6 @@
 import { after, before, beforeEach, test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -21,19 +21,8 @@ if (!databaseUrl) {
 
   async function runMigrations(): Promise<void> {
     const migrationDir = path.resolve(rootDir, "supabase/migrations");
-    for (const fileName of [
-      "0001_bootstrap.sql",
-      "0002_runtime_contract.sql",
-      "0003_daemon_heartbeats.sql",
-      "0004_run_cancellation.sql",
-      "0005_integration_configs.sql",
-      "0006_llm_api_integration_cutover.sql",
-      "0007_research_analysis_pipeline.sql",
-      "0008_idempotency_recovery.sql",
-      "0009_budget_caps.sql",
-      "0010_agent_trust_tiers.sql",
-      "0011_contract_review_chat.sql"
-    ]) {
+    const files = (await readdir(migrationDir)).filter((name) => name.endsWith(".sql"));
+    for (const fileName of files.sort()) {
       const sql = await readFile(path.join(migrationDir, fileName), "utf8");
       await pool.query(sql);
     }
@@ -855,6 +844,65 @@ if (!databaseUrl) {
         (entry: { contract_family_key: string | null; remaining_usd: number }) =>
           entry.contract_family_key === "family-budget-api" && entry.remaining_usd === 0.5
       ),
+      true
+    );
+  });
+
+  test("analytics endpoint returns aggregated cost breakdowns", async () => {
+    const workspace = await repo.ensureWorkspace(`analytics-api-${randomUUID()}`, process.cwd());
+    const task = await repo.createTask({
+      workspaceId: workspace.id,
+      title: "analytics task",
+      request: "analytics request",
+      requiresApproval: false
+    });
+    const contract = await repo.createContract({
+      taskId: task.id,
+      risk: "low",
+      status: "active",
+      contractJson: {
+        schema_version: 1,
+        family_key: "family-analytics-api",
+        category: "leadgen"
+      }
+    });
+    const run = await repo.createRun({
+      taskId: task.id,
+      contractId: contract.id,
+      agentProfile: "lead_scraper",
+      workerId: "analytics-worker"
+    });
+    await repo.appendRunEvent(run.id, "usage.reported", "info", {
+      model: "claude-3-5-sonnet",
+      input_tokens: 320,
+      output_tokens: 140,
+      cost_usd: 1.25,
+      estimated: false
+    });
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/analytics/cost"
+    });
+    assert.equal(response.statusCode, 200);
+
+    const payload = response.json();
+    assert.equal(typeof payload.summary.totalCostUsd, "number");
+    assert.equal(payload.summary.totalCostUsd >= 1.25, true);
+    assert.equal(Array.isArray(payload.byDay), true);
+    assert.equal(Array.isArray(payload.byModel), true);
+    assert.equal(Array.isArray(payload.byAgentProfile), true);
+    assert.equal(Array.isArray(payload.byCategory), true);
+    assert.equal(
+      payload.byModel.some((entry: { label: string }) => entry.label === "claude-3-5-sonnet"),
+      true
+    );
+    assert.equal(
+      payload.byAgentProfile.some((entry: { label: string }) => entry.label === "lead_scraper"),
+      true
+    );
+    assert.equal(
+      payload.byCategory.some((entry: { label: string }) => entry.label === "leadgen"),
       true
     );
   });

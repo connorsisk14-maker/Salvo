@@ -47,8 +47,11 @@ export type DbTask = {
   cancelled_at: string | null;
   claimed_by: string | null;
   claimed_at: string | null;
+  preferred_agent_profile: AgentProfile | null;
   created_at: string;
   updated_at: string;
+  dependency_block_reason: string | null;
+  dependency_blocked_at: string | null;
 };
 
 export type TaskChatSessionStatus = "active" | "approved";
@@ -125,6 +128,7 @@ export type DbRunSummary = DbRun & {
   lead_chain_scraper_run_id: string | null;
   lead_chain_strategist_task_id: string | null;
   lead_chain_strategist_run_id: string | null;
+  lead_chain_row_context: Record<string, unknown> | null;
 };
 
 export type DbLeadRunChain = {
@@ -193,7 +197,8 @@ export type DbIntegrationKey =
   | "llm_api"
   | "process"
   | "http"
-  | "google_sheets";
+  | "google_sheets"
+  | "email";
 
 export type DbIntegrationConfig = {
   integration_key: DbIntegrationKey;
@@ -317,6 +322,19 @@ export type CreateTaskInput = {
   title: string;
   request: string;
   requiresApproval?: boolean;
+  dependencies?: TaskDependencyInput[];
+  preferredAgentProfile?: AgentProfile;
+};
+
+export type TaskDependencyInput = {
+  contractId: string;
+  reason?: string;
+};
+
+export type TaskDependencyStatus = {
+  contract_id: string;
+  reason: string | null;
+  status: "pending" | "satisfied" | "failed";
 };
 
 export type IdempotentResult<T> = {

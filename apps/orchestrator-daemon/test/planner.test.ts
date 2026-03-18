@@ -48,6 +48,9 @@ function buildTask(overrides?: Partial<DbTask>): DbTask {
     cancelled_at: null,
     claimed_by: null,
     claimed_at: null,
+    preferred_agent_profile: null,
+    dependency_block_reason: null,
+    dependency_blocked_at: null,
     created_at: new Date(2026, 2, 16, 9, 0, 0).toISOString(),
     updated_at: new Date(2026, 2, 16, 9, 0, 0).toISOString(),
     ...overrides
@@ -79,6 +82,10 @@ function buildRunSummary(overrides?: Partial<DbRunSummary>): DbRunSummary {
     contract_family_key: "family_ops",
     contract_category: "ops",
     contract_subcategory: null,
+    lead_chain_scraper_run_id: null,
+    lead_chain_strategist_task_id: null,
+    lead_chain_strategist_run_id: null,
+    lead_chain_row_context: null,
     ...overrides
   };
 }

@@ -7,6 +7,7 @@ import {
   type ToolExecutorDeps,
   type ToolExecutorPersistence
 } from "../src/index";
+import type { EmailAdapter } from "@salvo/adapters";
 
 function createHarness(
   overrides: Partial<ToolExecutorDeps> = {}
@@ -564,4 +565,59 @@ test("executeToolUse returns an error for invalid tool input", async () => {
     error: "invalid_input",
     message: "write_file requires a non-empty string path and string content."
   });
+});
+
+test("executeToolUse enforces the per-run email send limit", async () => {
+  const harness = createHarness();
+  const emailAdapter = {
+    key: "email",
+    async health() {
+      return {
+        status: "ready",
+        detail: "ok"
+      };
+    },
+    async run() {
+      return {
+        ok: true,
+        detail: "sent",
+        output: {
+          messageId: "msg-1",
+          accepted: ["ops@example.com"],
+          rejected: []
+        }
+      };
+    }
+  } as unknown as EmailAdapter;
+
+  const outcome = await executeToolUse({
+    block: {
+      type: "tool_use",
+      id: "email-1",
+      name: "send_email",
+      input: {
+        subject: "Status",
+        text: "Hello"
+      }
+    },
+    workspaceRoot: "/tmp/salvo",
+    runId: "run-email",
+    deps: harness.deps,
+    persistence: harness.persistence,
+    emailAdapter,
+    emailSendPolicy: {
+      maxSends: 1,
+      sendsUsed: 1
+    }
+  });
+
+  assert.equal(outcome.policyDenied, true);
+  assert.equal(outcome.toolResult.isError, true);
+  assert.equal(
+    harness.events.some(
+      (event) =>
+        event.eventType === "policy.denied" && event.payload.reason === "email_send_limit"
+    ),
+    true
+  );
 });

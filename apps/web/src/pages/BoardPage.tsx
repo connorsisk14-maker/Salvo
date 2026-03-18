@@ -17,7 +17,8 @@ import {
   type ApiRun,
   type ApiRunDetail,
   type ApiRunEvent,
-  type ApiTask
+  type ApiTask,
+  type ApiTaskDependency
 } from "../api/control-plane";
 
 const activeRunStatuses = new Set(["created", "provisioning", "starting", "running", "evaluating"]);
@@ -40,6 +41,33 @@ type BoardItem = {
   priorityLabel: string;
   actionable: boolean;
 };
+
+type DependencySummary = {
+  overallStatus: "pending" | "satisfied" | "failed";
+  counts: {
+    pending: number;
+    satisfied: number;
+    failed: number;
+  };
+};
+
+function summarizeDependencies(dependencies: ApiTaskDependency[]): DependencySummary | null {
+  if (dependencies.length === 0) {
+    return null;
+  }
+  const counts = dependencies.reduce(
+    (acc, dependency) => {
+      acc[dependency.status] += 1;
+      return acc;
+    },
+    { pending: 0, satisfied: 0, failed: 0 }
+  );
+  const overallStatus = counts.failed > 0 ? "failed" : counts.pending > 0 ? "pending" : "satisfied";
+  return {
+    overallStatus,
+    counts
+  };
+}
 
 function missingDeliverables(findings?: string[] | null): string[] {
   if (!findings) {
@@ -186,6 +214,12 @@ function statusTone(value: string | null | undefined): "ready" | "warn" | "error
   }
   if (["completed", "approved", "passed", "ready", "healthy"].includes(value)) {
     return "ready";
+  }
+  if (value === "satisfied") {
+    return "ready";
+  }
+  if (value === "pending") {
+    return "warn";
   }
   if (["failed", "blocked", "cancelled", "rejected", "hard_failed", "error", "offline"].includes(value)) {
     return "error";
@@ -711,6 +745,7 @@ export function BoardPage() {
             <ul className="board-queue-list">
               {visibleItems.map((item) => {
                 const isSelected = selectedItem?.task.id === item.task.id;
+                const dependencySummary = summarizeDependencies(item.task.dependencies);
                 return (
                   <li key={item.task.id}>
                     <button
@@ -746,6 +781,20 @@ export function BoardPage() {
                           </span>
                         ) : null}
                       </div>
+                      {dependencySummary ? (
+                        <div className="board-dependency-row">
+                          <span className={`status-pill board-chip-${statusTone(dependencySummary.overallStatus)}`}>
+                            dependencies {dependencySummary.overallStatus}
+                          </span>
+                          <span className="muted">
+                            {dependencySummary.counts.satisfied} satisfied · {dependencySummary.counts.pending} pending
+                            {dependencySummary.counts.failed > 0 ? ` · ${dependencySummary.counts.failed} failed` : ""}
+                          </span>
+                          {item.task.dependency_block_reason ? (
+                            <span className="muted mono">{item.task.dependency_block_reason}</span>
+                          ) : null}
+                        </div>
+                      ) : null}
                       <div className="muted">Created {formatTimestamp(item.task.created_at)}</div>
                     </button>
                   </li>
@@ -782,6 +831,37 @@ export function BoardPage() {
                   <p>
                     Approval: <strong>{canApproveTask(selectedItem.task) ? "required" : "satisfied"}</strong>
                   </p>
+                </article>
+
+                <article className="board-info-card">
+                  <h3>Dependencies</h3>
+                  {selectedItem.task.dependencies.length === 0 ? (
+                    <p className="muted">No dependencies declared.</p>
+                  ) : (
+                    <ul className="board-dependency-list">
+                      {selectedItem.task.dependencies.map((dependency) => (
+                        <li key={dependency.contract_id} className="board-dependency-entry">
+                          <div className="board-dependency-entry-head">
+                            <span className={`status-pill board-chip-${statusTone(dependency.status)}`}>
+                              {dependency.status}
+                            </span>
+                            <span className="mono">{dependency.contract_id}</span>
+                          </div>
+                          <p className="muted">{dependency.reason ?? "No reason provided."}</p>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                  {selectedItem.task.dependency_block_reason ? (
+                    <p>
+                      Block reason: <span className="mono">{selectedItem.task.dependency_block_reason}</span>
+                    </p>
+                  ) : null}
+                  {selectedItem.task.dependency_blocked_at ? (
+                    <p className="muted">
+                      Blocked at {formatTimestamp(selectedItem.task.dependency_blocked_at)}
+                    </p>
+                  ) : null}
                 </article>
 
                 <article className="board-info-card">

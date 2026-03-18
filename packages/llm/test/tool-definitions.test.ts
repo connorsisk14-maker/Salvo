@@ -48,6 +48,20 @@ test("buildToolDefinitions removes run_command when command execution is denied"
   assert.deepEqual(toolNames(contract), ["read_file", "list_directory", "write_file", "salvo_complete"]);
 });
 
+test("buildToolDefinitions adds send_email when email_send capability is enabled", () => {
+  const contract = buildContract();
+  contract.capabilities.email_send = true;
+
+  assert.deepEqual(toolNames(contract), [
+    "read_file",
+    "list_directory",
+    "write_file",
+    "run_command",
+    "send_email",
+    "salvo_complete"
+  ]);
+});
+
 test("buildToolDefinitions always includes salvo_complete", () => {
   const contract = buildContract();
   contract.capabilities.filesystem_read = false;

@@ -7,7 +7,7 @@ import {
   type LlmMessage,
   type LlmResponse
 } from "@salvo/llm";
-import { resolveLlmProviderAndModel } from "@salvo/shared";
+import { resolveLlmProviderAndModel, type AgentProfile } from "@salvo/shared";
 import { buildOrchestratorSoulPrompt } from "./soul";
 
 const MAX_WORKSPACE_ENTRIES = 12;
@@ -224,6 +224,7 @@ export function buildHeuristicContract(input: {
   workspaceId: string;
   request: string;
   taskTitle: string;
+  preferredProfile?: AgentProfile;
 }): ContractV1 {
   return buildContractV1({
     contractId: input.contractId,
@@ -231,6 +232,6 @@ export function buildHeuristicContract(input: {
     workspaceId: input.workspaceId,
     request: input.request,
     taskTitle: input.taskTitle,
-    preferredProfile: "builder"
+    preferredProfile: input.preferredProfile
   });
 }

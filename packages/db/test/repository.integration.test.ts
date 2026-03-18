@@ -1,6 +1,6 @@
 import { after, before, beforeEach, test } from "node:test";
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Pool } from "pg";
@@ -19,19 +19,8 @@ if (!databaseUrl) {
 
   async function runMigrations(): Promise<void> {
     const migrationDir = path.resolve(rootDir, "supabase/migrations");
-    for (const fileName of [
-      "0001_bootstrap.sql",
-      "0002_runtime_contract.sql",
-      "0003_daemon_heartbeats.sql",
-      "0004_run_cancellation.sql",
-      "0005_integration_configs.sql",
-      "0006_llm_api_integration_cutover.sql",
-      "0007_research_analysis_pipeline.sql",
-      "0008_idempotency_recovery.sql",
-      "0009_budget_caps.sql",
-      "0010_agent_trust_tiers.sql",
-      "0011_contract_review_chat.sql"
-    ]) {
+    const files = (await readdir(migrationDir)).filter((name) => name.endsWith(".sql"));
+    for (const fileName of files.sort()) {
       const sql = await readFile(path.join(migrationDir, fileName), "utf8");
       await pool.query(sql);
     }
@@ -125,6 +114,93 @@ if (!databaseUrl) {
     const claimed = [workerA, workerB].filter(Boolean);
     assert.equal(claimed.length, 1);
     assert.equal(claimed[0]?.id, task.id);
+  });
+
+  test("tasks with pending dependencies block with the provided reason", async () => {
+    const workspace = await repo.ensureWorkspace(`dep-${randomUUID()}`, process.cwd());
+    const dependencyTask = await repo.createTask({
+      workspaceId: workspace.id,
+      title: "dependency source",
+      request: "prepare baseline data",
+      requiresApproval: false
+    });
+
+    const dependencyContract = await repo.createContract({
+      taskId: dependencyTask.id,
+      risk: "low",
+      status: "active",
+      contractJson: {
+        schema_version: 1
+      }
+    });
+
+    const dependentTask = await repo.createTask({
+      workspaceId: workspace.id,
+      title: "dependent work",
+      request: "build on dependency",
+      requiresApproval: false,
+      dependencies: [
+        {
+          contractId: dependencyContract.id,
+          reason: "awaiting baseline contract"
+        }
+      ]
+    });
+
+    assert.equal(dependentTask.status, "blocked");
+    assert.equal(dependentTask.dependency_block_reason, "awaiting baseline contract");
+    assert.ok(dependentTask.dependency_blocked_at);
+  });
+
+  test("completing a dependency run wakes blocked tasks", async () => {
+    const workspace = await repo.ensureWorkspace(`dep-${randomUUID()}`, process.cwd());
+    const dependencyTask = await repo.createTask({
+      workspaceId: workspace.id,
+      title: "dependency source",
+      request: "prepare baseline data",
+      requiresApproval: false
+    });
+
+    const dependencyContract = await repo.createContract({
+      taskId: dependencyTask.id,
+      risk: "low",
+      status: "active",
+      contractJson: {
+        schema_version: 1
+      }
+    });
+
+    const dependentTask = await repo.createTask({
+      workspaceId: workspace.id,
+      title: "dependent work",
+      request: "build on dependency",
+      requiresApproval: false,
+      dependencies: [
+        {
+          contractId: dependencyContract.id,
+          reason: "awaiting baseline contract"
+        }
+      ]
+    });
+
+    const dependencyRun = await repo.createRun({
+      taskId: dependencyTask.id,
+      contractId: dependencyContract.id,
+      agentProfile: "builder",
+      workerId: "worker-dep"
+    });
+
+    await repo.transitionRunStatus(dependencyRun.id, "provisioning");
+    await repo.transitionRunStatus(dependencyRun.id, "starting");
+    await repo.transitionRunStatus(dependencyRun.id, "running");
+    await repo.transitionRunStatus(dependencyRun.id, "evaluating");
+    await repo.transitionRunStatus(dependencyRun.id, "completed");
+
+    const refreshed = await repo.getTask(dependentTask.id);
+    assert.ok(refreshed);
+    assert.equal(refreshed?.status, "queued");
+    assert.equal(refreshed?.dependency_block_reason, null);
+    assert.equal(refreshed?.dependency_blocked_at, null);
   });
 
   test("run_events table is append-only (update/delete blocked)", async () => {

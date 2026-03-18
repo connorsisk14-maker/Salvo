@@ -24,6 +24,40 @@ function formatDuration(seconds: number | null): string {
   return `${minutes}m ${remainder}s`;
 }
 
+function describeRowContext(rowContext?: Record<string, unknown> | null): string {
+  if (!rowContext) {
+    return "Row context not captured.";
+  }
+  const entries = Object.entries(rowContext);
+  if (entries.length === 0) {
+    return "Row context captured but empty.";
+  }
+  const summary = entries
+    .slice(0, 3)
+    .map(([key, value]) => `${key}: ${describeRowValue(value)}`)
+    .join(" · ");
+  if (entries.length > 3) {
+    return `${summary} · +${entries.length - 3} more`;
+  }
+  return summary;
+}
+
+function describeRowValue(value: unknown): string {
+  if (typeof value === "string") {
+    return value.length <= 60 ? value : `${value.slice(0, 57)}…`;
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.length} items]`;
+  }
+  if (value === null || value === undefined) {
+    return "—";
+  }
+  return "{…}";
+}
+
 export function LeadsPage() {
   const [overview, setOverview] = useState<ApiLeadsOverview | null>(null);
   const [loading, setLoading] = useState(false);
@@ -139,23 +173,40 @@ export function LeadsPage() {
               <p className="muted">
                 {run.agent_profile} · {run.contract_family_key}
               </p>
-              <div className="lead-run-meta">
-                <div>
-                  <span className="label">Created</span>
-                  <span className="value">{formatTimestamp(run.created_at)}</span>
-                </div>
-                <div>
-                  <span className="label">Duration</span>
-                  <span className="value">{formatDuration(run.duration_seconds)}</span>
-                </div>
-                <div>
-                  <span className="label">Score</span>
-                  <span className="value">{run.score ?? "—"}</span>
+            <div className="lead-run-meta">
+              <div>
+                <span className="label">Created</span>
+                <span className="value">{formatTimestamp(run.created_at)}</span>
+              </div>
+              <div>
+                <span className="label">Duration</span>
+                <span className="value">{formatDuration(run.duration_seconds)}</span>
+              </div>
+              <div>
+                <span className="label">Score</span>
+                <span className="value">{run.score ?? "—"}</span>
+              </div>
+            </div>
+            {run.lead_chain ? (
+              <div className="lead-run-chain">
+                <p className="lead-run-chain-summary">
+                  {run.lead_chain.row_context
+                    ? describeRowContext(run.lead_chain.row_context)
+                    : "Row context pending…"}
+                </p>
+                <div className="lead-run-chain-meta">
+                  <span className="label">
+                    {run.lead_chain.strategist_run_id ? "Strategist run" : "Strategist task"}
+                  </span>
+                  <span className="value mono">
+                    {run.lead_chain.strategist_run_id ?? run.lead_chain.strategist_task_id ?? "pending"}
+                  </span>
                 </div>
               </div>
-              {run.outcome_summary ? <p className="muted">{run.outcome_summary}</p> : null}
-            </article>
-          ))}
+            ) : null}
+            {run.outcome_summary ? <p className="muted">{run.outcome_summary}</p> : null}
+          </article>
+        ))}
         </div>
         {runs.length === 0 && !loading ? <p className="muted">No recent runs yet.</p> : null}
       </section>

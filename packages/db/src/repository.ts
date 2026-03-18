@@ -45,10 +45,13 @@ import type {
   DbIntegrationKey,
   DbRun,
   DbRunSummary,
+  DbLeadRunChain,
   DbRunEvent,
   DbTask,
   DbWorkspace,
   IdempotentResult,
+  TaskDependencyInput,
+  TaskDependencyStatus,
   TaskChatProposal,
   ResearchIngestionCandidate,
   RecordEvaluationInput
@@ -248,8 +251,182 @@ export class SalvoRepository {
            response_json = $4::jsonb
        where scope = $1
          and idempotency_key = $2`,
-      [scope, idempotencyKey, responseStatus, JSON.stringify(responseJson)]
+    [scope, idempotencyKey, responseStatus, JSON.stringify(responseJson)]
     );
+  }
+
+  private async insertTaskDependencies(
+    client: PoolClient,
+    taskId: string,
+    dependencies: TaskDependencyInput[]
+  ): Promise<void> {
+    for (const dependency of dependencies ?? []) {
+      await client.query(
+        `insert into public.salvo_task_dependencies (
+           task_id,
+           dependency_contract_id,
+           reason
+         )
+         values ($1, $2, $3)`,
+        [taskId, dependency.contractId, dependency.reason ?? null]
+      );
+    }
+  }
+
+  private dependencyStatusSummary(dependencies: TaskDependencyStatus[]) {
+    const unsatisfied = dependencies.filter((entry) => entry.status !== "satisfied");
+    const failedEntry = unsatisfied.find((entry) => entry.status === "failed");
+    const pendingEntry = unsatisfied.find((entry) => entry.status === "pending");
+
+    return {
+      satisfied: unsatisfied.length === 0,
+      failed: Boolean(failedEntry),
+      reason:
+        failedEntry?.reason ??
+        pendingEntry?.reason ??
+        (pendingEntry ? `Waiting on dependency ${pendingEntry.contract_id}` : null)
+    };
+  }
+
+  private async fetchTaskDependencyStatuses(
+    client: PoolClient,
+    taskId: string
+  ): Promise<TaskDependencyStatus[]> {
+    const result = await client.query<{
+      dependency_contract_id: string;
+      reason: string | null;
+      has_success: boolean | null;
+      has_failure: boolean | null;
+    }>(
+      `select
+         td.dependency_contract_id,
+         td.reason,
+         bool_or(r.status = 'completed') as has_success,
+         bool_or(r.status in ('failed','blocked','cancelled')) as has_failure
+       from public.salvo_task_dependencies td
+       left join public.salvo_runs r on r.contract_id = td.dependency_contract_id
+       where td.task_id = $1
+       group by td.dependency_contract_id, td.reason`,
+      [taskId]
+    );
+
+    return result.rows.map((row) => {
+      const hasSuccess = row.has_success ?? false;
+      const hasFailure = row.has_failure ?? false;
+      const status: TaskDependencyStatus["status"] = hasSuccess
+        ? "satisfied"
+        : hasFailure
+          ? "failed"
+          : "pending";
+      return {
+        contract_id: row.dependency_contract_id,
+        reason: row.reason,
+        status
+      };
+    });
+  }
+
+  private async listTaskDependencyStatusesForClient(
+    client: PoolClient,
+    taskIds: string[]
+  ): Promise<Map<string, TaskDependencyStatus[]>> {
+    if (taskIds.length === 0) {
+      return new Map();
+    }
+    const result = await client.query<{
+      task_id: string;
+      dependency_contract_id: string;
+      reason: string | null;
+      has_success: boolean | null;
+      has_failure: boolean | null;
+    }>(
+      `select
+         td.task_id,
+         td.dependency_contract_id,
+         td.reason,
+         bool_or(r.status = 'completed') as has_success,
+         bool_or(r.status in ('failed','blocked','cancelled')) as has_failure
+       from public.salvo_task_dependencies td
+       left join public.salvo_runs r on r.contract_id = td.dependency_contract_id
+       where td.task_id = any($1)
+       group by td.task_id, td.dependency_contract_id, td.reason`,
+      [taskIds]
+    );
+
+    const dependencyMap = new Map<string, TaskDependencyStatus[]>();
+    for (const row of result.rows) {
+      const status: TaskDependencyStatus["status"] = (row.has_success ?? false)
+        ? "satisfied"
+        : (row.has_failure ?? false)
+          ? "failed"
+          : "pending";
+      const list = dependencyMap.get(row.task_id) ?? [];
+      list.push({
+        contract_id: row.dependency_contract_id,
+        reason: row.reason,
+        status
+      });
+      dependencyMap.set(row.task_id, list);
+    }
+
+    return dependencyMap;
+  }
+
+  async listTaskDependencyStatuses(taskIds: string[]): Promise<Map<string, TaskDependencyStatus[]>> {
+    return this.withTransaction((client) => this.listTaskDependencyStatusesForClient(client, taskIds));
+  }
+
+  private dependencyFailureReasonForTask(dependencies: TaskDependencyStatus[]): string | null {
+    const failed = dependencies.find((entry) => entry.status === "failed");
+    if (failed && failed.reason) {
+      return failed.reason;
+    }
+    if (failed) {
+      return `Dependency ${failed.contract_id} failed`;
+    }
+    return null;
+  }
+
+  private async refreshDependentTasks(
+    client: PoolClient,
+    dependencyContractId: string,
+    success: boolean
+  ): Promise<void> {
+    const tasks = await client.query<DbTask>(
+      `select t.id, t.status
+       from public.salvo_tasks t
+       join public.salvo_task_dependencies td on td.task_id = t.id
+       where td.dependency_contract_id = $1
+         and t.status in ('queued', 'blocked')
+       group by t.id, t.status`,
+      [dependencyContractId]
+    );
+
+    for (const task of tasks.rows) {
+      const dependencies = await this.fetchTaskDependencyStatuses(client, task.id);
+      const summary = this.dependencyStatusSummary(dependencies);
+      if (summary.satisfied) {
+        if (task.status === "blocked") {
+          await client.query(
+            `update public.salvo_tasks
+             set status = 'queued',
+                 dependency_block_reason = null,
+                 dependency_blocked_at = null
+             where id = $1`,
+            [task.id]
+          );
+        }
+      } else if (summary.failed && task.status !== "blocked") {
+        await client.query(
+          `update public.salvo_tasks
+           set status = 'blocked',
+               dependency_block_reason = $2,
+               dependency_blocked_at = now()
+           where id = $1`,
+          [task.id, summary.reason]
+        );
+      }
+    }
   }
 
   private async insertTask(client: PoolClient, input: CreateTaskInput): Promise<DbTask> {
@@ -266,14 +443,43 @@ export class SalvoRepository {
          original_request,
          normalized_request,
          status,
-         requires_approval
+         requires_approval,
+         preferred_agent_profile
        )
-       values ($1, $2, $3, $4, 'queued', $5)
+       values ($1, $2, $3, $4, 'queued', $5, $6)
        returning *`,
-      [workspaceId, title, request, normalized, input.requiresApproval ?? false]
+      [
+        workspaceId,
+        title,
+        request,
+        normalized,
+        input.requiresApproval ?? false,
+        input.preferredAgentProfile ?? null
+      ]
     );
 
-    return this.singleOrThrow(result.rows, "Failed to create task.");
+    let task = this.singleOrThrow(result.rows, "Failed to create task.");
+    await this.insertTaskDependencies(client, task.id, input.dependencies ?? []);
+
+    const dependencyCount = (input.dependencies ?? []).length;
+    if (dependencyCount > 0) {
+      const statuses = await this.fetchTaskDependencyStatuses(client, task.id);
+      const summary = this.dependencyStatusSummary(statuses);
+      if (!summary.satisfied) {
+        const blockedResult = await client.query<DbTask>(
+          `update public.salvo_tasks
+           set status = 'blocked',
+               dependency_block_reason = $2,
+               dependency_blocked_at = now()
+           where id = $1
+           returning *`,
+          [task.id, summary.reason]
+        );
+        task = this.singleOrThrow(blockedResult.rows, "Failed to block task for dependencies.");
+      }
+    }
+
+    return task;
   }
 
   async ensureWorkspace(name = "default", localPath = process.cwd()): Promise<DbWorkspace> {
@@ -304,6 +510,49 @@ export class SalvoRepository {
     );
 
     return result.rows;
+  }
+
+  async createLeadRunChain(input: {
+    scraperRunId: string;
+    strategistTaskId: string;
+    rowContext?: Record<string, unknown> | null;
+  }): Promise<DbLeadRunChain> {
+    const result = await this.pool.query<DbLeadRunChain>(
+      `insert into public.salvo_lead_run_chains (
+         scraper_run_id,
+         strategist_task_id,
+         row_context
+       )
+       values ($1, $2, $3)
+       returning *`,
+      [input.scraperRunId, input.strategistTaskId, input.rowContext ?? null]
+    );
+    return this.singleOrThrow(result.rows, "Failed to create lead run chain.");
+  }
+
+  async findLeadRunChainByScraperRun(scraperRunId: string): Promise<DbLeadRunChain | null> {
+    const result = await this.pool.query<DbLeadRunChain>(
+      `select * from public.salvo_lead_run_chains where scraper_run_id = $1 limit 1`,
+      [scraperRunId]
+    );
+    return result.rows[0] ?? null;
+  }
+
+  async findLeadRunChainByStrategistTask(taskId: string): Promise<DbLeadRunChain | null> {
+    const result = await this.pool.query<DbLeadRunChain>(
+      `select * from public.salvo_lead_run_chains where strategist_task_id = $1 limit 1`,
+      [taskId]
+    );
+    return result.rows[0] ?? null;
+  }
+
+  async linkLeadRunChainStrategistRun(chainId: string, runId: string): Promise<void> {
+    await this.pool.query(
+      `update public.salvo_lead_run_chains
+       set strategist_run_id = $1
+       where id = $2`,
+      [runId, chainId]
+    );
   }
 
   async getWorkspace(workspaceId: string): Promise<DbWorkspace | null> {
@@ -1023,28 +1272,51 @@ export class SalvoRepository {
 
   async claimNextTask(workerId: string): Promise<DbTask | null> {
     return this.withTransaction(async (client) => {
-      const result = await client.query<DbTask>(
-        `with candidate as (
-           select id
-           from public.salvo_tasks
-           where status = 'queued'
-             and cancelled_at is null
-             and (requires_approval = false or approved_at is not null)
-           order by created_at asc
-           for update skip locked
-           limit 1
-         )
-         update public.salvo_tasks t
-         set status = 'planning',
-             claimed_by = $1,
-             claimed_at = now()
-         from candidate
-         where t.id = candidate.id
-         returning t.*`,
-        [workerId]
-      );
+      while (true) {
+        const result = await client.query<DbTask>(
+          `with candidate as (
+             select id
+             from public.salvo_tasks
+             where status = 'queued'
+               and cancelled_at is null
+               and (requires_approval = false or approved_at is not null)
+             order by created_at asc
+             for update skip locked
+             limit 1
+           )
+           update public.salvo_tasks t
+           set status = 'planning',
+               claimed_by = $1,
+               claimed_at = now()
+           from candidate
+           where t.id = candidate.id
+           returning t.*`,
+          [workerId]
+        );
 
-      return result.rows[0] ?? null;
+        const task = result.rows[0];
+        if (!task) {
+          return null;
+        }
+
+        const statuses = await this.fetchTaskDependencyStatuses(client, task.id);
+        const summary = this.dependencyStatusSummary(statuses);
+        if (!summary.satisfied) {
+          await client.query(
+            `update public.salvo_tasks
+             set status = 'blocked',
+                 dependency_block_reason = $2,
+                 dependency_blocked_at = now(),
+                 claimed_by = null,
+                 claimed_at = null
+             where id = $1`,
+            [task.id, summary.reason]
+          );
+          continue;
+        }
+
+        return task;
+      }
     });
   }
 
@@ -1170,10 +1442,18 @@ export class SalvoRepository {
          e.findings_json,
          coalesce(c.contract_json->>'family_key', concat('legacy_', substring(r.contract_id::text, 1, 12))) as contract_family_key,
          coalesce(c.contract_json->>'category', 'general') as contract_category,
-         nullif(c.contract_json->>'subcategory', '') as contract_subcategory
+         nullif(c.contract_json->>'subcategory', '') as contract_subcategory,
+         lc.scraper_run_id as lead_chain_scraper_run_id,
+         lc.strategist_task_id as lead_chain_strategist_task_id,
+         lc.strategist_run_id as lead_chain_strategist_run_id,
+         lc.row_context as lead_chain_row_context
        from public.salvo_runs r
        left join public.salvo_evaluations e on e.run_id = r.id
        left join public.salvo_contracts c on c.id = r.contract_id
+       left join public.salvo_lead_run_chains lc on (
+         (r.agent_profile = 'lead_scraper' and lc.scraper_run_id = r.id)
+         or (r.agent_profile = 'lead_strategist' and lc.strategist_task_id = r.task_id)
+       )
        where r.agent_profile = any($1)
        order by r.created_at desc
        limit $2`,
@@ -1233,7 +1513,12 @@ export class SalvoRepository {
         ]
       );
 
-      return this.singleOrThrow(result.rows, `Failed to update run: ${runId}`);
+      const updated = this.singleOrThrow(result.rows, `Failed to update run: ${runId}`);
+      const success = nextStatus === "completed";
+      if (success || ["failed", "blocked", "cancelled"].includes(nextStatus)) {
+        await this.refreshDependentTasks(client, updated.contract_id, success);
+      }
+      return updated;
     });
   }
 

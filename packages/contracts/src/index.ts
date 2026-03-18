@@ -28,7 +28,8 @@ export const ContractCapabilitiesSchema = z.object({
   install_packages: z.boolean(),
   network_access: z.boolean(),
   db_read: z.boolean(),
-  db_write: z.boolean()
+  db_write: z.boolean(),
+  email_send: z.boolean()
 });
 
 export const ContractV1Schema = z.object({
@@ -78,6 +79,14 @@ export const ContractV1Schema = z.object({
   category: z.enum(CONTRACT_CATEGORIES),
   subcategory: z.string().trim().min(1).optional(),
   family_key: z.string().min(1),
+  dependencies: z
+    .array(
+      z.object({
+        contractId: z.string().uuid(),
+        reason: z.string().trim().min(1).optional()
+      })
+    )
+    .default([]),
   agent_profile: z.enum(AGENT_PROFILES)
 });
 
@@ -90,6 +99,10 @@ export type BuildContractInput = {
   request: string;
   taskTitle: string;
   preferredProfile?: AgentProfile;
+  dependencies?: Array<{
+    contractId: string;
+    reason?: string;
+  }>;
 };
 
 function classifyRisk(request: string): RiskLevel {
@@ -238,7 +251,8 @@ export function buildContractV1(input: BuildContractInput): ContractV1 {
       install_packages: false,
       network_access: false,
       db_read: true,
-      db_write: true
+      db_write: true,
+      email_send: false
     },
     constraints: {
       max_runtime_minutes: 25,
@@ -270,6 +284,7 @@ export function buildContractV1(input: BuildContractInput): ContractV1 {
     category: classification.category,
     subcategory: classification.subcategory,
     family_key: familyKey,
+    dependencies: input.dependencies ?? [],
     agent_profile: agentProfile
   });
 }

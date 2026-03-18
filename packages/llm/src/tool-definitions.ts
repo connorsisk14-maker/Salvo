@@ -210,6 +210,83 @@ const COMPLETE_INPUT_SCHEMA = {
   required: ["status", "summary", "deliverables", "evidence", "roadblocks", "learnings"]
 } satisfies Record<string, unknown>;
 
+const SEND_EMAIL_INPUT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    to: {
+      oneOf: [
+        {
+          type: "string",
+          minLength: 1
+        },
+        {
+          type: "array",
+          items: {
+            type: "string",
+            minLength: 1
+          }
+        }
+      ]
+    },
+    cc: {
+      oneOf: [
+        {
+          type: "string",
+          minLength: 1
+        },
+        {
+          type: "array",
+          items: {
+            type: "string",
+            minLength: 1
+          }
+        }
+      ]
+    },
+    bcc: {
+      oneOf: [
+        {
+          type: "string",
+          minLength: 1
+        },
+        {
+          type: "array",
+          items: {
+            type: "string",
+            minLength: 1
+          }
+        }
+      ]
+    },
+    from: {
+      type: "string",
+      minLength: 1
+    },
+    subject: {
+      type: "string",
+      minLength: 1
+    },
+    text: {
+      type: "string",
+      minLength: 1
+    },
+    html: {
+      type: "string",
+      minLength: 1
+    }
+  },
+  required: ["subject"],
+  anyOf: [
+    {
+      required: ["text"]
+    },
+    {
+      required: ["html"]
+    }
+  ]
+} satisfies Record<string, unknown>;
+
 const BASE_TOOL_DEFINITIONS = {
   read_file: {
     name: "read_file",
@@ -230,6 +307,11 @@ const BASE_TOOL_DEFINITIONS = {
     name: "run_command",
     description: "Run an allowlisted command inside the allowed workspace scope.",
     inputSchema: RUN_COMMAND_INPUT_SCHEMA
+  },
+  send_email: {
+    name: "send_email",
+    description: "Send an email through the configured email adapter.",
+    inputSchema: SEND_EMAIL_INPUT_SCHEMA
   },
   salvo_complete: {
     name: "salvo_complete",
@@ -298,6 +380,10 @@ export function buildToolDefinitions(
 
   if (contract.capabilities.run_tests) {
     definitions.push(BASE_TOOL_DEFINITIONS.run_command);
+  }
+
+  if (contract.capabilities.email_send) {
+    definitions.push(BASE_TOOL_DEFINITIONS.send_email);
   }
 
   appendSkillDefinitions(definitions, options, completionToolName);

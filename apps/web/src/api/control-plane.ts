@@ -8,6 +8,15 @@ export type ApiTask = {
   requires_approval: boolean;
   approved_at: string | null;
   created_at: string;
+  dependency_block_reason: string | null;
+  dependency_blocked_at: string | null;
+  dependencies: ApiTaskDependency[];
+};
+
+export type ApiTaskDependency = {
+  contract_id: string;
+  reason: string | null;
+  status: "pending" | "satisfied" | "failed";
 };
 
 export type ApiRun = {
@@ -275,6 +284,13 @@ export type ApiLeadZone = {
   last_updated_at: string;
 };
 
+export type ApiLeadRunChain = {
+  scraper_run_id: string | null;
+  strategist_task_id: string | null;
+  strategist_run_id: string | null;
+  row_context: Record<string, unknown> | null;
+};
+
 export type ApiLeadRun = {
   id: string;
   agent_profile: string;
@@ -284,6 +300,7 @@ export type ApiLeadRun = {
   duration_seconds: number | null;
   outcome_summary: string | null;
   score: number | null;
+  lead_chain: ApiLeadRunChain | null;
 };
 
 export type ApiLeadsOverview = {
@@ -639,7 +656,7 @@ export function saveTrustTier(input: {
 }
 
 export function updateIntegrationConfig(
-  key: "supabase" | "llm_api" | "process" | "http" | "google_sheets",
+  key: "supabase" | "llm_api" | "process" | "http" | "google_sheets" | "email",
   input: Record<string, unknown>
 ): Promise<ApiActionResponse> {
   return request<ApiActionResponse>(`/integrations/${key}/config`, {

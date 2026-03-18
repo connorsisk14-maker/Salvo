@@ -170,7 +170,8 @@ class OrchestratorDaemon {
       taskId: task.id,
       workspaceId: task.workspace_id,
       request: task.original_request,
-      taskTitle: task.title
+      taskTitle: task.title,
+      preferredProfile: task.preferred_agent_profile ?? undefined
     });
     const [workspace, memoryContext, researchContext, integrationConfigs] = await Promise.all([
       this.repo.getWorkspace(task.workspace_id),
@@ -744,6 +745,187 @@ class OrchestratorDaemon {
       score: evaluation.score,
       outcome: evaluation.outcome
     });
+
+    await this.handleLeadRunChain(detail, finalPayload, runId, evaluation.passed);
+  }
+
+  private async handleLeadRunChain(
+    detail: Awaited<ReturnType<SalvoRepository["getRunDetail"]>>,
+    finalPayload: Record<string, unknown> | null,
+    runId: string,
+    evaluationPassed: boolean
+  ): Promise<void> {
+    if (!detail) {
+      return;
+    }
+
+    if (detail.run.agent_profile === "lead_scraper" && evaluationPassed) {
+      await this.createLeadStrategistTask(detail, finalPayload);
+      return;
+    }
+
+    if (detail.run.agent_profile === "lead_strategist") {
+      await this.linkLeadStrategistRun(detail.task.id, runId);
+    }
+  }
+
+  private async createLeadStrategistTask(
+    detail: Awaited<ReturnType<SalvoRepository["getRunDetail"]>>,
+    finalPayload: Record<string, unknown> | null
+  ): Promise<void> {
+    if (!detail) {
+      return;
+    }
+
+    const existing = await this.repo.findLeadRunChainByScraperRun(detail.run.id);
+    if (existing) {
+      return;
+    }
+
+    const rowContext = this.extractLeadRowContext(finalPayload);
+    const request = this.buildLeadStrategistRequest(detail, rowContext);
+    const strategistTask = await this.repo.createTask({
+      workspaceId: detail.task.workspace_id,
+      title: `Lead strategist follow-up (${detail.run.id.slice(0, 8)})`,
+      request,
+      requiresApproval: false,
+      preferredAgentProfile: "lead_strategist"
+    });
+    await this.repo.createLeadRunChain({
+      scraperRunId: detail.run.id,
+      strategistTaskId: strategistTask.id,
+      rowContext
+    });
+    logger.info("lead strategist follow-up created", {
+      scraper_run_id: detail.run.id,
+      strategist_task_id: strategistTask.id
+    });
+  }
+
+  private async linkLeadStrategistRun(taskId: string, runId: string): Promise<void> {
+    const chain = await this.repo.findLeadRunChainByStrategistTask(taskId);
+    if (!chain || chain.strategist_run_id) {
+      return;
+    }
+    await this.repo.linkLeadRunChainStrategistRun(chain.id, runId);
+    logger.info("lead strategist run linked to chain", {
+      strategist_task_id: taskId,
+      strategist_run_id: runId,
+      chain_id: chain.id
+    });
+  }
+
+  private buildLeadStrategistRequest(
+    detail: Awaited<ReturnType<SalvoRepository["getRunDetail"]>>,
+    rowContext: Record<string, unknown> | null
+  ): string {
+    if (!detail) {
+      return "Lead strategist follow-up.";
+    }
+
+    const summary = this.formatLeadRowContextSummary(rowContext);
+    const snippet = this.stringifyLeadRowContext(rowContext);
+    const familyKey =
+      typeof detail.contract.contract_json.family_key === "string"
+        ? detail.contract.contract_json.family_key
+        : detail.contract.id;
+    const sheetId = process.env.SALVO_LEAD_PIPELINE_SHEET_ID?.trim();
+    const sheetNote = sheetId
+      ? `Reference Google Sheet ${sheetId} for redistribution updates.`
+      : "Capture follow-up notes in the primary lead tracking destination.";
+    return [
+      `Lead Strategist follow-up for run ${detail.run.id} (family ${familyKey}).`,
+      `Row summary: ${summary}`,
+      `Detailed row snapshot (truncated):\n${snippet}`,
+      sheetNote,
+      `Original scraper request: ${detail.task.original_request}`
+    ].join("\n\n");
+  }
+
+  private extractLeadRowContext(payload: Record<string, unknown> | null): Record<string, unknown> | null {
+    if (!payload) {
+      return null;
+    }
+
+    const candidateKeys = [
+      "row_context",
+      "row",
+      "lead",
+      "lead_row",
+      "lead_data",
+      "row_data",
+      "leadContext"
+    ];
+
+    for (const key of candidateKeys) {
+      const value = payload[key];
+      if (this.isPlainRecord(value)) {
+        return value;
+      }
+      if (Array.isArray(value)) {
+        const recordItem = value.find((item) => this.isPlainRecord(item));
+        if (recordItem) {
+          return recordItem as Record<string, unknown>;
+        }
+      }
+    }
+
+    if (typeof payload.summary === "string" && payload.summary.trim().length > 0) {
+      return { summary: payload.summary };
+    }
+
+    const deliverables = payload.deliverables;
+    if (Array.isArray(deliverables) && deliverables.length > 0) {
+      return { deliverables: deliverables.slice(0, 3) };
+    }
+
+    return null;
+  }
+
+  private formatLeadRowContextSummary(rowContext: Record<string, unknown> | null): string {
+    if (!rowContext) {
+      return "Row context not captured.";
+    }
+    const entries = Object.entries(rowContext);
+    if (entries.length === 0) {
+      return "Row context captured but empty.";
+    }
+    const summary = entries
+      .slice(0, 3)
+      .map(([key, value]) => `${key}: ${this.describeLeadRowValue(value)}`)
+      .join(" · ");
+    if (entries.length > 3) {
+      return `${summary} · +${entries.length - 3} more`;
+    }
+    return summary;
+  }
+
+  private stringifyLeadRowContext(rowContext: Record<string, unknown> | null, limit = 1200): string {
+    if (!rowContext) {
+      return "Row context not available.";
+    }
+    const json = JSON.stringify(rowContext, null, 2);
+    return json.length <= limit ? json : `${json.slice(0, limit)}…`;
+  }
+
+  private describeLeadRowValue(value: unknown): string {
+    if (typeof value === "string") {
+      return value.length <= 60 ? value : `${value.slice(0, 57)}…`;
+    }
+    if (typeof value === "number" || typeof value === "boolean") {
+      return String(value);
+    }
+    if (Array.isArray(value)) {
+      return `[${value.length} items]`;
+    }
+    if (value === null || value === undefined) {
+      return "—";
+    }
+    return "{…}";
+  }
+
+  private isPlainRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
   }
 }
 
