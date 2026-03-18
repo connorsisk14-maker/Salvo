@@ -67,6 +67,7 @@ test("normalizeArtifacts ensures required contract deliverables exist", () => {
       run_tests: true,
       install_packages: false,
       network_access: false,
+      email_send: false,
       db_read: true,
       db_write: false
     },
@@ -123,6 +124,7 @@ test("buildRunnerPrompts includes contract and workspace context", () => {
       run_tests: true,
       install_packages: false,
       network_access: false,
+      email_send: false,
       db_read: true,
       db_write: false
     },
