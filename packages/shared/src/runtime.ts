@@ -84,7 +84,8 @@ export const AGENT_PROFILES = [
   "builder",
   "researcher",
   "debugger",
-  "documenter"
+  "documenter",
+  "lead_scraper"
 ] as const;
 
 export type AgentProfile = (typeof AGENT_PROFILES)[number];
@@ -93,7 +94,8 @@ export const AGENT_TRUST_TIERS = [
   "unrestricted",
   "standard",
   "restricted",
-  "probation"
+  "probation",
+  "scraper"
 ] as const;
 
 export type AgentTrustTier = (typeof AGENT_TRUST_TIERS)[number];
@@ -112,7 +114,8 @@ export const DEFAULT_AGENT_TRUST_TIER_BY_PROFILE: Record<AgentProfile, AgentTrus
   builder: "standard",
   researcher: "restricted",
   debugger: "restricted",
-  documenter: "restricted"
+  documenter: "restricted",
+  lead_scraper: "scraper"
 };
 
 export const AGENT_TRUST_TIER_POLICIES: Record<AgentTrustTier, AgentTrustTierPolicy> = {
@@ -152,6 +155,16 @@ export const AGENT_TRUST_TIER_POLICIES: Record<AgentTrustTier, AgentTrustTierPol
     runTests: true,
     dbWrite: false
   }
+,
+  scraper: {
+    requiresApproval: false,
+    maxRuntimeMinutes: 20,
+    maxToolCalls: 120,
+    networkAccess: true,
+    installPackages: false,
+    runTests: true,
+    dbWrite: false
+  }
 };
 
 export const RETRY_DISPOSITIONS = [
@@ -165,6 +178,153 @@ export type RetryDisposition = (typeof RETRY_DISPOSITIONS)[number];
 export const EVALUATION_OUTCOMES = ["passed", "failed", "hard_failed"] as const;
 
 export type EvaluationOutcome = (typeof EVALUATION_OUTCOMES)[number];
+
+export type AgentProfileDefinition = {
+  displayName: string;
+  description: string;
+  prompt: string;
+  skillHints: string[];
+  contractDefaults: {
+    category: ContractCategory;
+    capabilities: {
+      filesystem_read: boolean;
+      filesystem_write: boolean;
+      run_tests: boolean;
+      install_packages: boolean;
+      network_access: boolean;
+      db_read: boolean;
+      db_write: boolean;
+    };
+    constraints: {
+      max_runtime_minutes: number;
+      max_tool_calls: number;
+      forbidden_paths?: string[];
+    };
+    successCriteriaNote?: string;
+  };
+};
+
+export const AGENT_PROFILE_DEFINITIONS: Record<AgentProfile, AgentProfileDefinition> = {
+  builder: {
+    displayName: "Builder",
+    description: "Executes product/feature work with broad filesystem access and developer tooling.",
+    prompt:
+      "You are the Builder agent. Balance deliverables, tests, and documentation while honoring the runtime contract, dependencies, and policy checks.",
+    skillHints: ["search_codebase", "run_test_suite", "scaffold_module"],
+    contractDefaults: {
+      category: "general",
+      capabilities: {
+        filesystem_read: true,
+        filesystem_write: true,
+        run_tests: true,
+        install_packages: true,
+        network_access: true,
+        db_read: true,
+        db_write: true
+      },
+      constraints: {
+        max_runtime_minutes: 30,
+        max_tool_calls: 200
+      }
+    }
+  },
+  researcher: {
+    displayName: "Researcher",
+    description: "Digests data, synthesizes insights, and publishes research-backed learnings.",
+    prompt:
+      "You are the Researcher agent focused on collecting evidence, logging experiments, and turning findings into actionable memories.",
+    skillHints: ["search_codebase", "run_test_suite"],
+    contractDefaults: {
+      category: "quality",
+      capabilities: {
+        filesystem_read: true,
+        filesystem_write: false,
+        run_tests: true,
+        install_packages: false,
+        network_access: true,
+        db_read: true,
+        db_write: false
+      },
+      constraints: {
+        max_runtime_minutes: 20,
+        max_tool_calls: 120
+      }
+    }
+  },
+  debugger: {
+    displayName: "Debugger",
+    description: "Investigates bugs and runtime issues with focused reproducibility.",
+    prompt:
+      "You are the Debugger agent. Capture failing traces, isolate regressions, and document how to prevent them while respecting runtime contracts.",
+    skillHints: ["search_codebase", "run_test_suite"],
+    contractDefaults: {
+      category: "debug",
+      capabilities: {
+        filesystem_read: true,
+        filesystem_write: false,
+        run_tests: true,
+        install_packages: false,
+        network_access: true,
+        db_read: true,
+        db_write: false
+      },
+      constraints: {
+        max_runtime_minutes: 18,
+        max_tool_calls: 120
+      }
+    }
+  },
+  documenter: {
+    displayName: "Documenter",
+    description: "Writes clear documentation and knowledge artifacts based on run history.",
+    prompt:
+      "You are the Documenter agent. Translate technical decisions into structured docs with citations from the workspace and run history.",
+    skillHints: ["search_codebase"],
+    contractDefaults: {
+      category: "documentation",
+      capabilities: {
+        filesystem_read: true,
+        filesystem_write: true,
+        run_tests: false,
+        install_packages: false,
+        network_access: true,
+        db_read: true,
+        db_write: false
+      },
+      constraints: {
+        max_runtime_minutes: 20,
+        max_tool_calls: 100
+      }
+    }
+  },
+  lead_scraper: {
+    displayName: "Lead Scraper",
+    description:
+      "Runs the DFW lead scraping workflow, prioritizing HVAC and professional services opportunities with safe access to Sheets and HTTP adapters.",
+    prompt:
+      "You are the Lead Scraper agent. Discover qualified HVAC/professional-services leads across the DFW metroplex. Prioritize exact data collection, deduplicate results, and keep all writes limited to the orchestrated Google Sheet or HTTP endpoints. Never write directly to the filesystem.",
+    skillHints: ["search_codebase", "expand_zones"],
+    contractDefaults: {
+      category: "integration",
+      capabilities: {
+        filesystem_read: false,
+        filesystem_write: false,
+        run_tests: false,
+        install_packages: false,
+        network_access: true,
+        db_read: true,
+        db_write: false
+      },
+      constraints: {
+        max_runtime_minutes: 18,
+        max_tool_calls: 100,
+        forbidden_paths: ["/etc", "/usr/local/bin"]
+      },
+      successCriteriaNote:
+        "Deliver structured lead rows and persistence proof in the configured Google Sheet every time."
+    }
+  }
+};
 
 export const RUN_EVENT_TYPES = [
   "run.started",

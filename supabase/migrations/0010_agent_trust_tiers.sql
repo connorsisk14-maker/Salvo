@@ -1,7 +1,7 @@
 create table if not exists public.salvo_agent_trust_tiers (
   workspace_id uuid not null references public.salvo_workspaces(id) on delete cascade,
-  agent_profile text not null check (agent_profile in ('builder', 'researcher', 'debugger', 'documenter')),
-  trust_tier text not null check (trust_tier in ('unrestricted', 'standard', 'restricted', 'probation')),
+  agent_profile text not null check (agent_profile in ('builder', 'researcher', 'debugger', 'documenter', 'lead_scraper')),
+  trust_tier text not null check (trust_tier in ('unrestricted', 'standard', 'restricted', 'probation', 'scraper')),
   successful_runs integer not null default 0 check (successful_runs >= 0),
   last_run_at timestamptz,
   promoted_at timestamptz,
