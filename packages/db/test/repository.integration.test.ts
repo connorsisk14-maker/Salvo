@@ -5,7 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Pool } from "pg";
 import { randomUUID } from "node:crypto";
-import type { TaskPriority } from "@salvo/shared";
+import type { AgentProfile, TaskPriority } from "@salvo/shared";
 import { SalvoRepository } from "../src/repository";
 
 const databaseUrl = process.env.SALVO_TEST_DATABASE_URL ?? process.env.SALVO_DATABASE_URL;
@@ -1132,5 +1132,81 @@ if (!databaseUrl) {
     await repo.deleteRunCheckpoint(run.id, "progress");
     const removed = await repo.loadRunCheckpoint(run.id, "progress");
     assert.equal(removed, null);
+  });
+
+  test("listAgentPerformanceSignals summarizes agent profiles by workspace", async () => {
+    const workspace = await repo.ensureWorkspace(`signals-${randomUUID()}`, process.cwd());
+    const task = await repo.createTask({
+      workspaceId: workspace.id,
+      title: "signal task",
+      request: "analyze agents",
+      requiresApproval: false
+    });
+    const contract = await repo.createContract({
+      taskId: task.id,
+      risk: "low",
+      status: "active",
+      contractJson: {
+        family_key: "routing-family",
+        category: "quality"
+      }
+    });
+
+    async function createCompletedRun(
+      agentProfile: AgentProfile,
+      score: number,
+      passed: boolean,
+      cost: number,
+      endedOffsetMs: number
+    ) {
+      const run = await repo.createRun({
+        taskId: task.id,
+        contractId: contract.id,
+        agentProfile,
+        workerId: `worker-${agentProfile}-${randomUUID()}`
+      });
+      await repo.transitionRunStatus(run.id, "starting");
+      await repo.transitionRunStatus(run.id, "running");
+      await repo.transitionRunStatus(run.id, "evaluating");
+      const endedAt = new Date(Date.now() - endedOffsetMs);
+      await repo.transitionRunStatus(run.id, "completed", { endedAt });
+      await repo.recordEvaluation({
+        runId: run.id,
+        contractId: contract.id,
+        passed,
+        score,
+        outcome: passed ? "passed" : "failed",
+        findings: []
+      });
+      await repo.appendRunEvent(run.id, "usage.reported", "info", {
+        cost_usd: cost,
+        model: "test-model"
+      });
+      return run;
+    }
+
+    await createCompletedRun("builder", 80, true, 0.6, 3000);
+    await createCompletedRun("builder", 60, false, 0.9, 5000);
+    await createCompletedRun("researcher", 95, true, 0.25, 1000);
+
+    const signals = await repo.listAgentPerformanceSignals(workspace.id, 10);
+    assert.equal(signals.length, 2);
+
+    const researcherSignal = signals[0];
+    assert.equal(researcherSignal.agentProfile, "researcher");
+    assert.equal(researcherSignal.contractFamilyKey, "routing-family");
+    assert.equal(researcherSignal.contractCategory, "quality");
+    assert.equal(researcherSignal.runCount, 1);
+    assert.equal(researcherSignal.avgScore, 95);
+    assert.equal(researcherSignal.passRate, 1);
+    assert.equal(researcherSignal.avgCostUsd, 0.25);
+    assert.ok(researcherSignal.lastUsedAt);
+
+    const builderSignal = signals.find((entry) => entry.agentProfile === "builder");
+    assert.ok(builderSignal);
+    assert.equal(builderSignal?.runCount, 2);
+    assert.equal(builderSignal?.avgScore, 70);
+    assert.equal(builderSignal?.passRate, 0.5);
+    assert.equal(builderSignal?.avgCostUsd, 0.75);
   });
 }

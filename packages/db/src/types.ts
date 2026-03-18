@@ -1,6 +1,7 @@
 import type {
   AgentProfile,
   AgentTrustTier,
+  ContractCategory,
   ContractStatus,
   RunExitReason,
   RunEventLevel,
@@ -139,6 +140,18 @@ export type DbRunCheckpoint = {
   checkpoint_state: Record<string, unknown>;
   created_at: string;
   updated_at: string;
+};
+
+export type AgentPerformanceSignal = {
+  workspaceId: string;
+  contractFamilyKey: string;
+  contractCategory: ContractCategory;
+  agentProfile: AgentProfile;
+  runCount: number;
+  avgScore: number;
+  passRate: number;
+  avgCostUsd: number;
+  lastUsedAt: string | null;
 };
 
 export type DbLeadRunChain = {

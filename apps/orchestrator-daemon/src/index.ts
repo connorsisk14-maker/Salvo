@@ -19,8 +19,8 @@ import {
   resolveLlmProviderAndModel
 } from "@salvo/shared";
 import {
-  buildMemoryRetrievalQuery,
   buildHeuristicContract,
+  buildMemoryRetrievalQuery,
   collectWorkspaceSnapshot,
   planContract,
   resolveContractPlannerConfig
@@ -31,6 +31,7 @@ import {
   shouldRunEveningPlanner,
   toLocalDateKey
 } from "./planner";
+import { routeAgentProfiles, type ProfileHistoryEntry } from "./router";
 import { applyTrustTierPolicy } from "./trust-tier";
 
 await initializeSecrets();
@@ -58,6 +59,20 @@ const logger = createLogger({
 function readPositiveIntegerEnv(name: string, fallback: number): number {
   const value = Number(process.env[name] ?? fallback);
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+
+function routingPriorityScore(priority: DbTask["priority"]): number {
+  switch (priority) {
+    case "urgent":
+      return 10;
+    case "high":
+      return 7;
+    case "medium":
+      return 5;
+    case "low":
+    default:
+      return 2;
+  }
 }
 
 export class OrchestratorDaemon {
@@ -241,7 +256,7 @@ export class OrchestratorDaemon {
       task,
       contract: heuristicContract
     });
-    const [workspace, memoryContext, researchContext, integrationConfigs] = await Promise.all([
+    const [workspace, memoryContext, researchContext, integrationConfigs, performanceSignals] = await Promise.all([
       this.repo.getWorkspace(task.workspace_id),
       this.repo.listRelevantMemoryPromptContext(
         task.workspace_id,
@@ -250,7 +265,8 @@ export class OrchestratorDaemon {
         5
       ),
       this.repo.listResearchContext(task.workspace_id, 5),
-      this.repo.listIntegrationConfigs()
+      this.repo.listIntegrationConfigs(),
+      this.repo.listAgentPerformanceSignals(task.workspace_id, 24)
     ]);
     const workspaceContext = workspace ?? {
       id: task.workspace_id,
@@ -279,12 +295,58 @@ export class OrchestratorDaemon {
         env: process.env
       })
     });
+    const routingHistory: ProfileHistoryEntry[] = performanceSignals
+      .filter(
+        (signal) =>
+          signal.contractFamilyKey === plannedContract.contract.family_key ||
+          signal.contractCategory === plannedContract.contract.category
+      )
+      .map((signal) => ({
+        profile: signal.agentProfile,
+        successRate: signal.passRate,
+        runCount: signal.runCount,
+        averageScore: signal.avgScore,
+        averageCostUsd: signal.avgCostUsd,
+        matchScope:
+          signal.contractFamilyKey === plannedContract.contract.family_key ? "family" : "category"
+      }));
+    const routingDecision = routeAgentProfiles({
+      preferredProfile: task.preferred_agent_profile ?? undefined,
+      plannedProfile: plannedContract.contract.agent_profile,
+      contractCategory: plannedContract.contract.category,
+      contractCapabilities: plannedContract.contract.capabilities,
+      taskPriority: routingPriorityScore(task.priority),
+      taskTitle: `${task.title} ${task.original_request}`,
+      history: routingHistory
+    });
+    const routedContract = {
+      ...plannedContract.contract,
+      agent_profile: routingDecision.selectedProfile
+    };
+    await this.repo.createAuditEvent({
+      actor: `system:${workerId}`,
+      action: "agent.routed",
+      target: task.id,
+      metadata: {
+        workspace_id: task.workspace_id,
+        contract_family_key: routedContract.family_key,
+        planned_agent_profile: plannedContract.contract.agent_profile,
+        selected_agent_profile: routingDecision.selectedProfile,
+        reason: routingDecision.reasoning,
+        candidates: routingDecision.rankedCandidates.slice(0, 3).map((candidate) => ({
+          agent_profile: candidate.profile,
+          score: candidate.score,
+          reasons: candidate.reasons
+        }))
+      }
+    });
+
     const trustTierState = await this.repo.getAgentTrustTier(
       task.workspace_id,
-      plannedContract.contract.agent_profile
+      routedContract.agent_profile
     );
     const governedContract = applyTrustTierPolicy(
-      plannedContract.contract,
+      routedContract,
       trustTierState.trust_tier
     );
     const contract = governedContract.contract;

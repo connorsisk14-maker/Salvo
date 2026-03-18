@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { Pool, PoolClient, QueryResultRow } from "pg";
 import {
   AGENT_PROFILES,
+  type ContractCategory,
   DEFAULT_TASK_PRIORITY,
   DEFAULT_AGENT_TRUST_TIER_BY_PROFILE,
   assertRunTransition,
@@ -56,7 +57,8 @@ import type {
   TaskDependencyStatus,
   TaskChatProposal,
   ResearchIngestionCandidate,
-  RecordEvaluationInput
+  RecordEvaluationInput,
+  AgentPerformanceSignal
 } from "./types";
 
 const TERMINAL_RUN_STATUSES = new Set<RunStatus>([
@@ -1669,6 +1671,71 @@ export class SalvoRepository {
     );
 
     return result.rows;
+  }
+
+  async listAgentPerformanceSignals(
+    workspaceId: string,
+    limit = 20
+  ): Promise<AgentPerformanceSignal[]> {
+    const result = await this.pool.query<{
+      workspace_id: string;
+      contract_family_key: string;
+      contract_category: ContractCategory;
+      agent_profile: AgentProfile;
+      run_count: number;
+      avg_score: number;
+      pass_rate: number;
+      avg_cost_usd: number;
+      last_used_at: string | null;
+    }>(
+      `select
+         t.workspace_id,
+         coalesce(c.contract_json->>'family_key', concat('legacy_', substring(c.id::text, 1, 12))) as contract_family_key,
+         coalesce(c.contract_json->>'category', 'general') as contract_category,
+         r.agent_profile,
+         count(*)::integer as run_count,
+         coalesce(avg(e.score)::double precision, 0) as avg_score,
+         coalesce(
+           sum(case when e.passed then 1 else 0 end)::double precision / nullif(count(*), 0),
+           0
+         ) as pass_rate,
+         coalesce(avg(costs.cost_usd), 0) as avg_cost_usd,
+         max(coalesce(r.ended_at, r.updated_at, r.created_at)) as last_used_at
+       from public.salvo_runs r
+       join public.salvo_tasks t on t.id = r.task_id
+       join public.salvo_contracts c on c.id = r.contract_id
+       join public.salvo_evaluations e on e.run_id = r.id
+       left join lateral (
+         select coalesce((payload_json->>'cost_usd')::double precision, 0) as cost_usd
+         from public.salvo_run_events
+         where run_id = r.id
+           and event_type = 'usage.reported'
+         order by sequence_no desc
+         limit 1
+       ) costs on true
+       where t.workspace_id = $1
+         and r.status in ('completed', 'failed', 'blocked')
+       group by
+         t.workspace_id,
+         contract_family_key,
+         contract_category,
+         r.agent_profile
+       order by last_used_at desc nulls last
+       limit $2`,
+      [workspaceId, limit]
+    );
+
+    return result.rows.map((row) => ({
+      workspaceId: row.workspace_id,
+      contractFamilyKey: row.contract_family_key,
+      contractCategory: row.contract_category,
+      agentProfile: row.agent_profile,
+      runCount: Number(row.run_count ?? 0),
+      avgScore: Number(row.avg_score ?? 0),
+      passRate: Number(row.pass_rate ?? 0),
+      avgCostUsd: Number(row.avg_cost_usd ?? 0),
+      lastUsedAt: row.last_used_at ?? null
+    }));
   }
 
   async listBudgetLimits(): Promise<DbBudgetLimit[]> {

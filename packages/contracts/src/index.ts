@@ -194,7 +194,7 @@ function normalizedFamilyComponent(input: string): string {
   return input.trim().toLowerCase().replace(/\s+/g, " ");
 }
 
-function buildContractFamilyKey(input: {
+export function buildContractFamilyKey(input: {
   request: string;
   risk: RiskLevel;
   category: ContractCategory;
