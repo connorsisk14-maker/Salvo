@@ -618,13 +618,55 @@ class OrchestratorDaemon {
       await this.repo.transitionTaskStatus(run.task_id, "failed");
     });
 
-    child.on("close", async () => {
+    child.on("close", async (code, signal) => {
       this.activeRuns.delete(run.id);
       logger.info("runner process closed", {
         run_id: run.id,
-        task_id: run.task_id
+        task_id: run.task_id,
+        exit_code: code,
+        signal
       });
-      await this.evaluateRun(run.id);
+
+      try {
+        const current = await this.repo.getRun(run.id);
+        if (!current || isTerminalRunStatus(current.status)) {
+          return;
+        }
+
+        if (current.status === "starting") {
+          const reasonParts = [];
+          if (typeof code === "number") {
+            reasonParts.push(`exit code ${code}`);
+          }
+          if (signal) {
+            reasonParts.push(`signal ${signal}`);
+          }
+          const reason = reasonParts.length > 0 ? reasonParts.join(", ") : "runner exited before startup";
+
+          await this.repo.appendRunEvent(run.id, "run.failed", "error", {
+            reason: "runner_startup_failure",
+            exit_code: code,
+            signal: signal ?? null
+          });
+          await this.repo.transitionRunStatus(run.id, "failed", {
+            exitReason: "runner_crash",
+            outcomeSummary: `Runner exited before startup: ${reason}`,
+            endedAt: new Date()
+          });
+          await this.repo.transitionTaskStatus(run.task_id, "failed");
+          return;
+        }
+
+        await this.evaluateRun(run.id);
+      } catch (error) {
+        logger.error("runner close handling failed", {
+          run_id: run.id,
+          task_id: run.task_id,
+          exit_code: code,
+          signal,
+          error
+        });
+      }
     });
   }
 
