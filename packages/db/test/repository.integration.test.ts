@@ -652,6 +652,70 @@ if (!databaseUrl) {
     assert.equal(familyAlpha[0].review_status, "accepted");
   });
 
+  test("relevant memory retrieval combines family bias with semantic match", async () => {
+    const workspace = await repo.ensureWorkspace(`memory-search-${randomUUID()}`, process.cwd());
+
+    await repo.createMemory({
+      workspaceId: workspace.id,
+      sourceRunIds: [randomUUID()],
+      contractFamilyKey: "family-hvac",
+      memoryType: "research_experiment",
+      title: "HVAC family baseline",
+      summary: "Family-specific baseline guidance.",
+      bodyMarkdown: "General advice for HVAC family work.",
+      tags: ["hvac"],
+      confidence: 0.55,
+      reviewStatus: "accepted"
+    });
+
+    await repo.createMemory({
+      workspaceId: workspace.id,
+      sourceRunIds: [randomUUID()],
+      contractFamilyKey: "family-ops",
+      memoryType: "research_experiment",
+      title: "Dispatch urgency wording",
+      summary: "Emergency HVAC dispatch messaging converts better.",
+      bodyMarkdown: "Use emergency dispatch wording for after-hours HVAC repairs and quote requests.",
+      tags: ["dispatch", "hvac", "after-hours"],
+      confidence: 0.9,
+      reviewStatus: "accepted"
+    });
+
+    await repo.createMemory({
+      workspaceId: workspace.id,
+      sourceRunIds: [randomUUID()],
+      contractFamilyKey: "family-random",
+      memoryType: "research_experiment",
+      title: "Unrelated memory",
+      summary: "Completely different gardening content.",
+      bodyMarkdown: "Seasonal pruning guidance for shade perennials and soil moisture management.",
+      tags: ["gardening"],
+      confidence: 1,
+      reviewStatus: "accepted"
+    });
+
+    const promptContext = await repo.listRelevantMemoryPromptContext(
+      workspace.id,
+      "Need an HVAC emergency dispatch follow-up plan for after-hours repair leads.",
+      "family-hvac",
+      5
+    );
+    const referenceContext = await repo.listRelevantMemoryContext(
+      workspace.id,
+      "Need an HVAC emergency dispatch follow-up plan for after-hours repair leads.",
+      "family-hvac",
+      5
+    );
+
+    assert.equal(promptContext.length, 2);
+    assert.equal(promptContext[0]?.title, "HVAC family baseline");
+    assert.equal(promptContext[1]?.title, "Dispatch urgency wording");
+    assert.deepEqual(
+      referenceContext.map((entry) => entry.id),
+      promptContext.map((entry) => entry.id)
+    );
+  });
+
   test("accepted experiment publishing creates linked memory and exposes it in contract memory context", async () => {
     const workspace = await repo.ensureWorkspace(`publish-${randomUUID()}`, process.cwd());
     const sourceRunIds = [randomUUID(), randomUUID(), randomUUID()];

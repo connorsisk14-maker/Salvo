@@ -68,6 +68,22 @@ export async function collectWorkspaceSnapshot(workspacePath: string): Promise<s
   }
 }
 
+export function buildMemoryRetrievalQuery(input: {
+  task: Pick<DbTask, "title" | "original_request">;
+  contract: Pick<ContractV1, "family_key" | "category" | "subcategory">;
+}): string {
+  return [
+    input.task.title,
+    input.task.original_request,
+    input.contract.family_key,
+    input.contract.category,
+    input.contract.subcategory ?? ""
+  ]
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .join("\n");
+}
+
 export function buildContractPlanningPrompts(input: {
   task: Pick<DbTask, "id" | "workspace_id" | "title" | "original_request">;
   workspace: Pick<DbWorkspace, "id" | "name" | "local_path">;

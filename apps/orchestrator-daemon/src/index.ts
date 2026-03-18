@@ -19,6 +19,7 @@ import {
   resolveLlmProviderAndModel
 } from "@salvo/shared";
 import {
+  buildMemoryRetrievalQuery,
   buildHeuristicContract,
   collectWorkspaceSnapshot,
   planContract,
@@ -180,10 +181,15 @@ export class OrchestratorDaemon {
       taskTitle: task.title,
       preferredProfile: task.preferred_agent_profile ?? undefined
     });
+    const planningMemoryQuery = buildMemoryRetrievalQuery({
+      task,
+      contract: heuristicContract
+    });
     const [workspace, memoryContext, researchContext, integrationConfigs] = await Promise.all([
       this.repo.getWorkspace(task.workspace_id),
-      this.repo.listContractMemoryPromptContext(
+      this.repo.listRelevantMemoryPromptContext(
         task.workspace_id,
+        planningMemoryQuery,
         heuristicContract.family_key,
         5
       ),
@@ -227,8 +233,13 @@ export class OrchestratorDaemon {
     );
     const contract = governedContract.contract;
 
-    const memoryReferenceContext = await this.repo.listContractMemoryContext(
+    const executionMemoryQuery = buildMemoryRetrievalQuery({
+      task,
+      contract
+    });
+    const memoryReferenceContext = await this.repo.listRelevantMemoryContext(
       task.workspace_id,
+      executionMemoryQuery,
       contract.family_key,
       5
     );

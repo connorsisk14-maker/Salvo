@@ -3264,6 +3264,121 @@ export class SalvoRepository {
     return result.rows;
   }
 
+  async listRelevantMemoryPromptContext(
+    workspaceId: string,
+    queryText: string,
+    contractFamilyKey: string | null,
+    limit = 5
+  ): Promise<DbContractMemoryPrompt[]> {
+    const normalizedQuery = queryText.trim().toLowerCase();
+    if (!normalizedQuery) {
+      if (!contractFamilyKey) {
+        return [];
+      }
+      return this.listContractMemoryPromptContext(workspaceId, contractFamilyKey, limit);
+    }
+
+    const result = await this.pool.query<DbContractMemoryPrompt>(
+      `select
+         id,
+         title,
+         summary,
+         body_markdown,
+         confidence,
+         review_status,
+         source_run_ids
+       from (
+         select
+           id,
+           title,
+           summary,
+           body_markdown,
+           confidence,
+           review_status,
+           source_run_ids,
+           created_at,
+           case
+             when contract_family_key is not distinct from $3 then 1
+             else 0
+           end as family_match,
+           greatest(
+             similarity(lower(title), $2),
+             similarity(lower(summary), $2),
+             similarity(lower(body_markdown), $2),
+             similarity(lower(coalesce(array_to_string(tags, ' '), '')), $2),
+             similarity(lower(coalesce(contract_family_key, '')), $2)
+           ) as semantic_score
+         from public.salvo_memories
+         where workspace_id = $1
+           and review_status = 'accepted'
+       ) memories
+       where family_match = 1 or semantic_score >= 0.08
+       order by family_match desc, semantic_score desc, confidence desc, created_at desc
+       limit $4`,
+      [workspaceId, normalizedQuery, contractFamilyKey, limit]
+    );
+
+    return result.rows;
+  }
+
+  async listRelevantMemoryContext(
+    workspaceId: string,
+    queryText: string,
+    contractFamilyKey: string | null,
+    limit = 5
+  ): Promise<DbContractMemoryContext[]> {
+    const normalizedQuery = queryText.trim().toLowerCase();
+    if (!normalizedQuery) {
+      if (!contractFamilyKey) {
+        return [];
+      }
+      return this.listContractMemoryContext(workspaceId, contractFamilyKey, limit);
+    }
+
+    const result = await this.pool.query<DbContractMemoryContext>(
+      `select
+         id,
+         confidence,
+         review_status,
+         source_run_ids,
+         experiment_id
+       from (
+         select
+           id,
+           confidence,
+           review_status,
+           source_run_ids,
+           (
+             select replace(tag, 'experiment:', '')
+             from unnest(tags) as t(tag)
+             where tag like 'experiment:%'
+             limit 1
+           ) as experiment_id,
+           created_at,
+           case
+             when contract_family_key is not distinct from $3 then 1
+             else 0
+           end as family_match,
+           greatest(
+             similarity(lower(title), $2),
+             similarity(lower(summary), $2),
+             similarity(lower(body_markdown), $2),
+             similarity(lower(coalesce(array_to_string(tags, ' '), '')), $2),
+             similarity(lower(coalesce(contract_family_key, '')), $2)
+           ) as semantic_score
+         from public.salvo_memories
+         where workspace_id = $1
+           and review_status = 'accepted'
+       ) memories
+       where family_match = 1 or semantic_score >= 0.08
+       order by family_match desc, semantic_score desc, confidence desc, created_at desc
+       limit $4`,
+      [workspaceId, normalizedQuery, contractFamilyKey, limit]
+    );
+
+    return result.rows;
+  }
+
   async listResearchDocuments(
     limit = 100,
     reviewStatus?: "unreviewed" | "accepted" | "rejected"

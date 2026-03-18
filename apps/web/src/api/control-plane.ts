@@ -13,6 +13,17 @@ export type ApiTask = {
   dependencies: ApiTaskDependency[];
 };
 
+export type ApiContract = {
+  id: string;
+  task_id: string;
+  version: number;
+  status: string;
+  risk: "low" | "medium" | "high";
+  contract_json: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+};
+
 export type ApiTaskDependency = {
   contract_id: string;
   reason: string | null;
@@ -506,6 +517,10 @@ export function createTask(input: {
 
 export function listTasks(): Promise<ApiTask[]> {
   return request<ApiTask[]>("/tasks");
+}
+
+export function getContract(contractId: string): Promise<ApiContract> {
+  return request<ApiContract>(`/contracts/${contractId}`);
 }
 
 export function sendTaskChat(input: {

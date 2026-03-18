@@ -128,8 +128,8 @@ function createPlannerRepoFixture(input: {
     async listResearchContext() {
       return [];
     },
-    async listContractMemoryPromptContext(workspaceId, contractFamilyKey) {
-      return memories[`${workspaceId}:${contractFamilyKey}`] ?? [];
+    async listRelevantMemoryPromptContext(workspaceId, _queryText, contractFamilyKey) {
+      return memories[`${workspaceId}:${contractFamilyKey ?? "general"}`] ?? [];
     },
     async listIntegrationConfigs() {
       return integrationConfigs;

@@ -30,27 +30,41 @@ export type EvaluationResult = {
   findings: string[];
 };
 
-function evaluateAssertions(input: EvaluationInput): string[] {
-  const failures: string[] = [];
+type AssertionEvaluation = {
+  assertion: string;
+  recognized: boolean;
+  passed: boolean;
+};
+
+function evaluateAssertions(input: EvaluationInput): AssertionEvaluation[] {
+  const results: AssertionEvaluation[] = [];
   for (const assertion of input.requiredAssertions ?? []) {
     if (assertion === "Runner emits a final payload event.") {
-      if (!input.finalPayloadPresent) {
-        failures.push("Assertion failed: Runner emits a final payload event.");
-      }
+      results.push({
+        assertion,
+        recognized: true,
+        passed: Boolean(input.finalPayloadPresent)
+      });
       continue;
     }
 
     if (assertion === "At least one deliverable produced.") {
-      if (input.producedDeliverables.length === 0) {
-        failures.push("Assertion failed: At least one deliverable produced.");
-      }
+      results.push({
+        assertion,
+        recognized: true,
+        passed: input.producedDeliverables.length > 0
+      });
       continue;
     }
 
-    failures.push(`Assertion not recognized and skipped: ${assertion}`);
+    results.push({
+      assertion,
+      recognized: false,
+      passed: true
+    });
   }
 
-  return failures;
+  return results;
 }
 
 function clampScore(input: number): number {
@@ -125,11 +139,18 @@ export function evaluateRun(input: EvaluationInput): EvaluationResult {
     };
   }
 
-  const assertionFindings = evaluateAssertions(input);
-  findings.push(...assertionFindings);
+  const assertionResults = evaluateAssertions(input);
+  const failedAssertions = assertionResults.filter((result) => result.recognized && !result.passed);
+  findings.push(...failedAssertions.map((result) => `Assertion failed: ${result.assertion}`));
+  const skippedAssertions = assertionResults.filter((result) => !result.recognized);
+  findings.push(...skippedAssertions.map((result) => `Assertion not recognized and skipped: ${result.assertion}`));
 
-  const contractComplianceScore =
-    assertionFindings.length === 0 ? clampScore(input.contractCompliance) / 100 : 0;
+  const recognizedResults = assertionResults.filter((result) => result.recognized);
+  const satisfiedAssertions = recognizedResults.filter((result) => result.passed).length;
+  const requiredTestCount = input.requiredTestCommands?.length ?? 0;
+  const totalCriteria = recognizedResults.length + requiredTestCount;
+  const satisfiedCriteria = satisfiedAssertions + requiredTestCount;
+  const contractComplianceScore = totalCriteria === 0 ? 1 : satisfiedCriteria / totalCriteria;
   const testsScore = input.testsExitCode === 0 || input.testsExitCode === undefined ? 1 : 0;
   const deliverablesScore = 1;
   const evidenceScore = input.evidencePresent ? 1 : 0;

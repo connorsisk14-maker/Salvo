@@ -1,4 +1,9 @@
 import type { Adapter, AdapterRunRequest, AdapterRunResult } from "./types";
+import {
+  executeAdapterRunWithReliability,
+  FatalAdapterError,
+  RetryableAdapterError
+} from "./reliability";
 
 export class HttpAdapter implements Adapter {
   readonly key = "http";
@@ -30,44 +35,56 @@ export class HttpAdapter implements Adapter {
   }
 
   async run(request: AdapterRunRequest): Promise<AdapterRunResult> {
-    const health = await this.health();
-    if (health.status !== "ready") {
-      return {
-        ok: false,
-        detail: health.detail ?? "HTTP adapter is blocked."
-      };
-    }
+    return executeAdapterRunWithReliability(this.key, async () => {
+      const health = await this.health();
+      if (health.status !== "ready") {
+        throw new FatalAdapterError(health.detail ?? "HTTP adapter is blocked.");
+      }
 
-    try {
-      const response = await fetch(`${this.baseUrl}/runs`, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          authorization: `Bearer ${this.token}`
-        },
-        body: JSON.stringify({
-          runId: request.runId,
-          payload: request.payload
-        })
-      });
+      let response: Response;
+      try {
+        response = await fetch(`${this.baseUrl}/runs`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${this.token}`
+          },
+          body: JSON.stringify({
+            runId: request.runId,
+            payload: request.payload
+          })
+        });
+      } catch (error) {
+        throw new RetryableAdapterError(
+          `HTTP adapter request failed: ${(error as Error).message}`
+        );
+      }
 
       if (!response.ok) {
+        const detail = `HTTP adapter request failed with ${response.status}.`;
+        if (response.status >= 500) {
+          throw new RetryableAdapterError(detail);
+        }
         return {
           ok: false,
-          detail: `HTTP adapter request failed with ${response.status}.`
+          detail
         };
+      }
+
+      let payload: unknown;
+      try {
+        payload = await response.json();
+      } catch (error) {
+        throw new RetryableAdapterError(
+          `HTTP adapter response parsing failed: ${(error as Error).message}`
+        );
       }
 
       return {
         ok: true,
         detail: `HTTP adapter run ${request.runId} completed.`,
-        output: await response.json()
+        output: payload
       };
-    } catch (error) {
-      return {
-        ok: false,
-        detail: `HTTP adapter request failed: ${(error as Error).message}`
-      };
-    }
+    });
   }
 }
