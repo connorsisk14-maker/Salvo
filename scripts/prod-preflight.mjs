@@ -165,8 +165,10 @@ export async function runPreflight(options = {}) {
   const opts = {
     strictLlm: false,
     skipDb: false,
+    mode: "production",
     ...options
   };
+  const isLocalMode = opts.mode === "local";
   const env = await buildRuntimeEnv();
   const errors = [];
   const warnings = [];
@@ -179,6 +181,7 @@ export async function runPreflight(options = {}) {
     databaseUrlPresent: Boolean(firstTruthy(env.SALVO_DATABASE_URL, env.SALVO_TEST_DATABASE_URL)),
     apiTokenPresent: Boolean(firstTruthy(env.SALVO_API_TOKEN)),
     workspaceRoot: env.SALVO_WORKSPACE_ROOT,
+    mode: opts.mode,
     migrationFileCount: 0,
     database: null
   };
@@ -191,10 +194,20 @@ export async function runPreflight(options = {}) {
   }
 
   if (!checks.platformDarwin) {
-    errors.push("Production launchd deployment requires macOS (darwin).");
+    const message = "Production launchd deployment requires macOS (darwin).";
+    if (isLocalMode) {
+      warnings.push(message);
+    } else {
+      errors.push(message);
+    }
   }
   if (!checks.launchctl) {
-    errors.push("launchctl is not available in PATH.");
+    const message = "launchctl is not available in PATH.";
+    if (isLocalMode) {
+      warnings.push(message);
+    } else {
+      errors.push(message);
+    }
   }
   if (!checks.pnpm) {
     errors.push("pnpm is not available in PATH.");
@@ -267,6 +280,7 @@ export async function runPreflight(options = {}) {
 function printReport(report) {
   const status = report.ok ? "PASS" : "FAIL";
   console.log(`[prod-preflight] ${status}`);
+  console.log(`[prod-preflight] mode: ${report.checks.mode}`);
   console.log(`[prod-preflight] platform darwin: ${report.checks.platformDarwin ? "yes" : "no"}`);
   console.log(`[prod-preflight] launchctl present: ${report.checks.launchctl ? "yes" : "no"}`);
   console.log(`[prod-preflight] pnpm present: ${report.checks.pnpm ? "yes" : "no"}`);
@@ -303,7 +317,8 @@ async function main() {
   const args = new Set(process.argv.slice(2));
   const report = await runPreflight({
     strictLlm: args.has("--strict-llm"),
-    skipDb: args.has("--skip-db")
+    skipDb: args.has("--skip-db"),
+    mode: args.has("--local") ? "local" : "production"
   });
 
   if (args.has("--json")) {

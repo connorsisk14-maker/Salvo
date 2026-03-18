@@ -1,7 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import type { ContractV1 } from "@salvo/contracts";
-import { createDbPool, SalvoRepository, type DbRun, type DbRunEvent } from "@salvo/db";
+import {
+  createDbPool,
+  SalvoRepository,
+  type DbRun,
+  type DbRunEvent,
+  type DbTask
+} from "@salvo/db";
 import { evaluateRun } from "@salvo/evaluation";
 import {
   BackupManager,
@@ -47,7 +54,7 @@ function readPositiveIntegerEnv(name: string, fallback: number): number {
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
 }
 
-class OrchestratorDaemon {
+export class OrchestratorDaemon {
   private readonly repo: SalvoRepository;
   private readonly backupManager = new BackupManager();
   private readonly activeRuns = new Map<string, ChildProcess>();
@@ -257,7 +264,13 @@ class OrchestratorDaemon {
     const requiresRiskReview = contract.risk === "high" && !task.approved_at;
     const requiresTierReview = governedContract.requiresManualReview && !task.approved_at;
     const requiresManualReview = requiresRiskReview || requiresTierReview;
-    const budgetCheck = await this.checkBudgetCap(task, contract);
+    let budgetCheck;
+    try {
+      budgetCheck = await this.checkBudgetCap(task, contract);
+    } catch (error) {
+      await this.handleBudgetCheckFailure(task, error as Error);
+      return;
+    }
     const requiresBudgetReview = budgetCheck.blockingBudgets.length > 0;
 
     const contractRecord = await this.repo.createContract({
@@ -376,6 +389,24 @@ class OrchestratorDaemon {
         (entry) => estimate.cost_usd > 0 && estimate.cost_usd > entry.remaining_usd
       )
     };
+  }
+
+  protected async handleBudgetCheckFailure(task: DbTask, error: Error): Promise<void> {
+    logger.error("budget check failed", {
+      task_id: task.id,
+      workspace_id: task.workspace_id,
+      error: error.message
+    });
+    await this.repo.createAuditEvent({
+      actor: `system:${workerId}`,
+      action: "budget.check_failed",
+      target: task.id,
+      metadata: {
+        workspace_id: task.workspace_id,
+        error: error.message
+      }
+    });
+    await this.repo.transitionTaskStatus(task.id, "failed");
   }
 
   private async staleLoop(): Promise<void> {
@@ -571,24 +602,27 @@ class OrchestratorDaemon {
     }
   }
 
-  private async launchRun(run: DbRun): Promise<void> {
-    if (this.activeRuns.has(run.id)) {
-      return;
-    }
-
-    const child = spawn(
+  protected spawnRunnerProcess(run: DbRun): ChildProcess {
+    return spawn(
       "pnpm",
       ["--filter", "@salvo/agent-runner", "runner", "--", "--run-id", run.id],
       {
         env: {
           ...process.env,
           SALVO_DATABASE_URL: process.env.SALVO_DATABASE_URL,
-          SALVO_WORKSPACE_ROOT:
-            process.env.SALVO_WORKSPACE_ROOT ?? process.cwd()
+          SALVO_WORKSPACE_ROOT: process.env.SALVO_WORKSPACE_ROOT ?? process.cwd()
         },
         stdio: ["ignore", "inherit", "inherit"]
       }
     );
+  }
+
+  protected async launchRun(run: DbRun): Promise<void> {
+    if (this.activeRuns.has(run.id)) {
+      return;
+    }
+
+    const child = this.spawnRunnerProcess(run);
     this.activeRuns.set(run.id, child);
     logger.info("runner spawned", {
       run_id: run.id,
@@ -633,27 +667,8 @@ class OrchestratorDaemon {
           return;
         }
 
-        if (current.status === "starting") {
-          const reasonParts = [];
-          if (typeof code === "number") {
-            reasonParts.push(`exit code ${code}`);
-          }
-          if (signal) {
-            reasonParts.push(`signal ${signal}`);
-          }
-          const reason = reasonParts.length > 0 ? reasonParts.join(", ") : "runner exited before startup";
-
-          await this.repo.appendRunEvent(run.id, "run.failed", "error", {
-            reason: "runner_startup_failure",
-            exit_code: code,
-            signal: signal ?? null
-          });
-          await this.repo.transitionRunStatus(run.id, "failed", {
-            exitReason: "runner_crash",
-            outcomeSummary: `Runner exited before startup: ${reason}`,
-            endedAt: new Date()
-          });
-          await this.repo.transitionTaskStatus(run.task_id, "failed");
+        if (current.status === "starting" || current.status === "provisioning") {
+          await this.failRunBeforeExecution(current, code ?? null, signal ?? null);
           return;
         }
 
@@ -670,11 +685,38 @@ class OrchestratorDaemon {
     });
   }
 
+  protected async failRunBeforeExecution(
+    run: DbRun,
+    code: number | null,
+    signal: NodeJS.Signals | null
+  ): Promise<void> {
+    if (isTerminalRunStatus(run.status)) {
+      return;
+    }
+
+    await this.repo.appendRunEvent(run.id, "run.failed", "error", {
+      reason: "runner_startup_failure",
+      exit_code: code,
+      signal
+    });
+
+    await this.repo.transitionRunStatus(run.id, "failed", {
+      exitReason: "runner_crash",
+      outcomeSummary: `Runner terminated before execution (${code ?? "unknown"}${
+        signal ? `, signal ${signal}` : ""
+      })`,
+      endedAt: new Date(),
+      heartbeatAt: new Date()
+    });
+
+    await this.repo.transitionTaskStatus(run.task_id, "failed");
+  }
+
   private findPolicyDeniedCount(events: DbRunEvent[]): number {
     return events.filter((event) => event.event_type === "policy.denied").length;
   }
 
-  private async evaluateRun(runId: string): Promise<void> {
+  protected async evaluateRun(runId: string): Promise<void> {
     const detail = await this.repo.getRunDetail(runId);
     if (!detail) {
       return;
@@ -999,9 +1041,11 @@ async function main(): Promise<void> {
   });
 }
 
-try {
-  await main();
-} catch (error) {
-  logger.error("daemon crashed", { error });
-  process.exit(1);
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  try {
+    await main();
+  } catch (error) {
+    logger.error("daemon crashed", { error });
+    process.exit(1);
+  }
 }

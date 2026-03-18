@@ -1,28 +1,10 @@
-const baseUrl = process.env.SALVO_E2E_API_URL ?? "http://localhost:8787";
+import { baseUrl, request } from "./lib/api-client.mjs";
 const timeoutMs = Number(process.env.SALVO_E2E_TIMEOUT_MS ?? 45_000);
 const requireResearch =
   (process.env.SALVO_E2E_REQUIRE_RESEARCH ?? "0").toLowerCase() === "1";
-const apiToken = process.env.SALVO_E2E_API_TOKEN ?? process.env.SALVO_API_TOKEN ?? "";
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function request(path, init) {
-  const response = await fetch(`${baseUrl}${path}`, {
-    ...init,
-    headers: {
-      "content-type": "application/json",
-      ...(apiToken ? { authorization: `Bearer ${apiToken}` } : {}),
-      ...(init?.headers ?? {})
-    }
-  });
-
-  if (!response.ok) {
-    throw new Error(`Request failed: ${response.status} ${path}`);
-  }
-
-  return response.json();
 }
 
 async function waitForRun(taskId, startedAt) {

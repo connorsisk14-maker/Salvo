@@ -27,7 +27,11 @@ jobs:
       SALVO_DATABASE_URL: postgresql://salvo:salvo@localhost:54329/salvo_test
       SALVO_TEST_DATABASE_URL: postgresql://salvo:salvo@localhost:54329/salvo_test
       SALVO_WORKSPACE_ROOT: ${{ github.workspace }}/.salvo-workspace
+      SALVO_API_TOKEN: local-dev-token
       SALVO_E2E_API_URL: http://localhost:8787
+      SALVO_E2E_API_TOKEN: local-dev-token
+      SALVO_LOCAL_DB_MODE: external
+      SALVO_LOCAL_LLM_MODE: fake
       SALVO_LLM_PROVIDER: anthropic
       SALVO_LLM_API_KEY: test-key
       SALVO_LLM_BASE_URL: http://127.0.0.1:9797
@@ -92,21 +96,7 @@ jobs:
       - name: Build
         run: pnpm build
 
-      - name: Real LLM smoke (PR, secret-gated)
-        if: ${{ github.event_name == 'pull_request' && secrets.SALVO_CI_REAL_LLM_API_KEY != '' }}
-        env:
-          SALVO_CI_REAL_LLM_API_KEY: ${{ secrets.SALVO_CI_REAL_LLM_API_KEY }}
-          SALVO_CI_REAL_LLM_PROVIDER: ${{ vars.SALVO_CI_REAL_LLM_PROVIDER }}
-          SALVO_CI_REAL_LLM_BASE_URL: ${{ vars.SALVO_CI_REAL_LLM_BASE_URL }}
-          SALVO_CI_REAL_LLM_MODEL: ${{ vars.SALVO_CI_REAL_LLM_MODEL }}
-        run: node scripts/ci-real-llm-smoke.mjs
-
-      - name: Real LLM smoke note when secret is missing
-        if: ${{ github.event_name == 'pull_request' && secrets.SALVO_CI_REAL_LLM_API_KEY == '' }}
-        run: |
-          echo "::warning::Real-LLM CI smoke skipped. Configure SALVO_CI_REAL_LLM_API_KEY repository secret to enable."
-
-      - name: End-to-end smoke
+      - name: Authenticated fake-LLM smoke
         run: |
           set -euo pipefail
           START_TS=$(date +%s)
@@ -153,3 +143,14 @@ jobs:
           cat /tmp/salvo-orchestrator.log || true
           echo "=== research-daemon ==="
           cat /tmp/salvo-research.log || true
+
+      - name: Upload smoke logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-logs
+          path: |
+            /tmp/salvo-fake-llm.log
+            /tmp/salvo-api.log
+            /tmp/salvo-orchestrator.log
+            /tmp/salvo-research.log

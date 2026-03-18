@@ -2,6 +2,7 @@ import http from "node:http";
 
 const host = process.env.SALVO_FAKE_LLM_HOST ?? "127.0.0.1";
 const port = Number(process.env.SALVO_FAKE_LLM_PORT ?? 9797);
+const fakeMode = process.env.SALVO_FAKE_LLM_MODE ?? "local";
 
 function readBody(request) {
   return new Promise((resolve, reject) => {
@@ -131,7 +132,7 @@ const server = http.createServer(async (request, response) => {
 });
 
 server.listen(port, host, () => {
-  console.log(`[fake-llm] listening on http://${host}:${port}`);
+  console.log(`[fake-llm] mode=${fakeMode} listening on http://${host}:${port}`);
 });
 
 function shutdown() {

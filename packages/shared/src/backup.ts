@@ -129,7 +129,7 @@ export function computeNextScheduledBackupAt(input: Date, hourLocal: number): Da
 }
 
 function computeInitialScheduledBackupAt(input: Date, hourLocal: number): Date {
-  return computeBackupScheduleSlot(input, hourLocal);
+  return computeNextScheduledBackupAt(input, hourLocal);
 }
 
 function formatTimestampForFile(input: Date): string {

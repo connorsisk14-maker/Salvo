@@ -45,6 +45,14 @@ Copy `.env.example` to `.env` and set:
 
 Secret values such as `SALVO_DATABASE_URL`, `SALVO_API_TOKEN`, `SALVO_LLM_API_KEY`, and adapter tokens should not be stored in plaintext `.env`. Use the configured secrets backend instead. See [docs/SECRETS.md](/Users/connorsisk/Desktop/SALVO/docs/SECRETS.md).
 
+For local bootstrap, `.env.example` only documents optional overrides. The `ux:*` commands synthesize safe local defaults in-process when values are absent:
+
+- `SALVO_LOCAL_DB_MODE=docker` unless you explicitly set `external`
+- `SALVO_LOCAL_LLM_MODE=fake` unless you explicitly set `real`
+- `SALVO_DATABASE_URL` and `SALVO_TEST_DATABASE_URL` pointing at the managed local Postgres container when DB mode is `docker`
+- `SALVO_API_TOKEN=local-dev-token` for local control-plane auth
+- `SALVO_LLM_PROVIDER=anthropic`, `SALVO_LLM_API_KEY=fake-key`, and `SALVO_LLM_BASE_URL=http://127.0.0.1:9797` in fake-LLM mode
+
 ## Migrations
 
 Raw SQL migrations live in `supabase/migrations`.
@@ -58,45 +66,48 @@ Raw SQL migrations live in `supabase/migrations`.
 - `0007_research_analysis_pipeline.sql` research ingestion/experiment tables + contract-family memory scope
 - `0008_idempotency_recovery.sql` idempotency record storage + recovery support metadata
 
-## Local Run
+## UX Quick Start
+
+Use the deterministic UX pipeline for local setup instead of booting each service manually:
 
 ```bash
 pnpm install
-pnpm dev:api
-pnpm dev:orchestrator
-pnpm dev:research
-pnpm dev:dashboard
-# or run all services in parallel:
-pnpm dev:all
-```
-
-Then open `http://localhost:5173`.
-
-## UX Quick Start
-
-Use the scripted flow to migrate DB + launch API/orchestrator/research/dashboard in the background:
-
-```bash
+pnpm ux:doctor
 pnpm ux:up
+pnpm ux:smoke
 pnpm ux:status
-```
-
-To stop everything:
-
-```bash
 pnpm ux:down
+pnpm ux:clean
 ```
+
+Command behavior:
+
+1. `pnpm ux:doctor` runs a non-mutating preflight and supports `--json`.
+2. `pnpm ux:db:up` provisions or starts the Docker-backed local Postgres container `salvo-postgres`, binds it to `localhost:54329`, and ensures `salvo_test` exists.
+3. `pnpm ux:llm:up` starts the fake Anthropic-compatible LLM server and records its PID in `.salvo-workspace/dev/pids.json`.
+4. `pnpm ux:up` composes doctor, DB bootstrap, migrations, fake LLM bootstrap when enabled, and background startup for the API, orchestrator, research daemon, and dashboard.
+5. `pnpm ux:smoke` runs the authenticated fake-LLM smoke flow.
+6. `pnpm ux:status` reports PID state first, then probes control-plane health. The detailed daemon health endpoints are authenticated.
+7. `pnpm ux:down` stops processes launched through `ux:up`.
+8. `pnpm ux:clean` removes generated local runtime artifacts under `.salvo-workspace/dev`, `.salvo-workspace/logs`, `.salvo-workspace/runs`, and backup status files.
+
+Override the local defaults only when needed:
+
+- Set `SALVO_LOCAL_DB_MODE=external` if you want to use an existing Postgres instance and provide `SALVO_DATABASE_URL`.
+- Set `SALVO_LOCAL_LLM_MODE=real` if you want to use a live provider and provide `SALVO_LLM_API_KEY` plus any required base URL overrides.
+
+The fake provider responds on `/health` so the stack can detect it before starting agents.
 
 ## Checks
 
 ```bash
 pnpm typecheck
 pnpm test
+pnpm build
 pnpm test:e2e
 ```
 
-For DB-backed integration tests, set `SALVO_TEST_DATABASE_URL` (recommended) or `SALVO_DATABASE_URL`.
-For e2e smoke test, keep API/orchestrator/research running and optionally set `SALVO_E2E_API_URL`.
+`pnpm test:e2e` expects the authenticated control-plane path. When you use `pnpm ux:up`, it automatically exports matching local values for `SALVO_E2E_API_URL` and `SALVO_E2E_API_TOKEN`.
 
 ## Secrets Management
 
@@ -130,7 +141,7 @@ Control-plane health endpoints:
 - `GET /memories`, `POST /memories/:id/review`
 - `GET /stream/overview`, `GET /stream/runs/:id` (SSE polling replacement for dashboard updates)
 
-Daemon endpoints are DB-backed via `salvo_daemon_heartbeats` and return `healthy`, `stale`, or `offline`.
+`GET /health` is public. The daemon detail endpoints and control operations require a bearer token from `SALVO_API_TOKEN`. Daemon endpoints are DB-backed via `salvo_daemon_heartbeats` and return `healthy`, `stale`, or `offline`.
 
 The orchestrator also re-queues orphaned planning tasks and recovers orphaned/stale runs using configurable thresholds, with each recovery action written to `audit_events`.
 

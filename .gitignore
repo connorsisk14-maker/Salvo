@@ -7,3 +7,4 @@ dist
 .salvo-workspace/runs
 .salvo-workspace/logs
 .salvo-workspace/dev
+.salvo-workspace/backups
