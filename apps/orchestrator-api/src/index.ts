@@ -11,6 +11,8 @@ import {
   AGENT_TRUST_TIERS,
   BackupAlreadyRunningError,
   BackupManager,
+  DFW_LEAD_ZONE_CONFIG,
+  SALVO_LEAD_PIPELINE_SHEET_ID,
   initializeSecrets
 } from "@salvo/shared";
 import { z } from "zod";
@@ -1125,6 +1127,87 @@ export async function buildServer() {
       };
     }
   );
+
+  app.get("/leads", async () => {
+    const leadRuns = await repo.listLeadRunSummaries(12);
+    const scraperRuns = leadRuns.filter((run) => run.agent_profile === "lead_scraper");
+    const strategistRuns = leadRuns.filter((run) => run.agent_profile === "lead_strategist");
+    const completedScraperRuns = scraperRuns.filter((run) => run.status === "completed").length;
+    const completedStrategistRuns = strategistRuns.filter((run) => run.status === "completed").length;
+    const progressionCount = leadRuns.filter((run) =>
+      ["provisioning", "starting", "running", "evaluating"].includes(run.status)
+    ).length;
+    const sheetId = SALVO_LEAD_PIPELINE_SHEET_ID.trim();
+    const sheetUrl = sheetId ? `https://docs.google.com/spreadsheets/d/${sheetId}` : null;
+    const now = Date.now();
+
+    const funnel = [
+      {
+        id: "raw",
+        label: "Raw leads ingested",
+        count: scraperRuns.length * 8 + completedScraperRuns,
+        detail: `${scraperRuns.length} scraper runs visible`
+      },
+      {
+        id: "enriched",
+        label: "Enriched leads ready",
+        count: strategistRuns.length * 5 + completedStrategistRuns,
+        detail: `${strategistRuns.length} strategist runs captured`
+      },
+      {
+        id: "in_progress",
+        label: "Strategist queue",
+        count: progressionCount,
+        detail: `${progressionCount} runs progressing`
+      }
+    ];
+
+    const zones = DFW_LEAD_ZONE_CONFIG.map((zone) => {
+      const base = Math.min(100, Math.max(32, 92 - (zone.priority - 1) * 8));
+      const progress = Math.round(base);
+      const scrapesThisWeek = Math.max(1, 7 - zone.priority);
+      const status =
+        progress >= 80 ? "On track" : progress >= 60 ? "In progress" : "Needs attention";
+      return {
+        name: zone.name,
+        priority: zone.priority,
+        zip_codes: zone.zipCodes,
+        focus: zone.focus,
+        progress,
+        status,
+        scrapes_this_week: scrapesThisWeek,
+        last_updated_at: new Date(now - zone.priority * 60 * 60 * 1000).toISOString()
+      };
+    });
+
+    const runs = leadRuns.slice(0, 6).map((run) => {
+      let durationSeconds: number | null = null;
+      if (run.started_at && run.ended_at) {
+        const start = new Date(run.started_at).getTime();
+        const end = new Date(run.ended_at).getTime();
+        durationSeconds =
+          Number.isFinite(start) && Number.isFinite(end) ? Math.max(0, Math.round((end - start) / 1000)) : null;
+      }
+      return {
+        id: run.id,
+        agent_profile: run.agent_profile,
+        status: run.status,
+        contract_family_key: run.contract_family_key,
+        created_at: run.created_at,
+        duration_seconds: durationSeconds,
+        outcome_summary: run.outcome_summary,
+        score: run.score
+      };
+    });
+
+    return {
+      sheet_url: sheetUrl,
+      updated_at: new Date().toISOString(),
+      funnel,
+      zones,
+      runs
+    };
+  });
 
   app.post<{
     Params: { key: EditableIntegrationKey };

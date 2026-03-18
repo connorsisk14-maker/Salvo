@@ -666,6 +666,155 @@ strong {
   font-weight: 600;
 }
 
+.leads-page-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.leads-page-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+}
+
+.leads-funnel-grid {
+  display: grid;
+  gap: 0.9rem;
+  margin-top: 1.1rem;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+
+.funnel-card {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0.9rem;
+  background: #fff;
+  display: grid;
+  gap: 0.25rem;
+}
+
+.funnel-card-value {
+  font-size: 2rem;
+  font-weight: 600;
+}
+
+.funnel-card-label {
+  margin: 0;
+  font-weight: 600;
+}
+
+.lead-zones-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 0.9rem;
+  margin-top: 1.2rem;
+}
+
+.lead-zone-card {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 1rem;
+  background: #fff;
+  display: grid;
+  gap: 0.6rem;
+}
+
+.lead-zone-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.lead-zone-status {
+  font-size: 0.75rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.lead-progress-bar {
+  height: 8px;
+  background: var(--line);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.lead-progress-fill {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  border-radius: inherit;
+}
+
+.lead-zone-meta {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 0.65rem;
+  font-size: 0.8rem;
+}
+
+.lead-zone-meta .label {
+  display: block;
+  font-size: 0.65rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.lead-zone-meta .value {
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.lead-runs-section {
+  margin-top: 1.6rem;
+}
+
+.lead-runs-grid {
+  display: grid;
+  gap: 0.9rem;
+  margin-top: 0.7rem;
+}
+
+.lead-run-card {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0.95rem;
+  background: #fff;
+  display: grid;
+  gap: 0.45rem;
+}
+
+.lead-run-card-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.lead-run-meta {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 0.65rem;
+  font-size: 0.8rem;
+}
+
+.lead-run-meta .label {
+  display: block;
+  font-size: 0.65rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.lead-run-meta .value {
+  font-weight: 600;
+}
+
 .board-section-head {
   display: flex;
   align-items: center;

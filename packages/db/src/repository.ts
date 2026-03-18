@@ -6,6 +6,7 @@ import {
   assertRunTransition,
   assertTaskTransition,
   isTerminalRunStatus,
+  type AgentProfile,
   type RunExitReason,
   type RunEventLevel,
   type RunEventType,
@@ -65,6 +66,8 @@ const CANCELLABLE_RUN_STATUSES = new Set<RunStatus>([
   "running",
   "evaluating"
 ]);
+
+const LEAD_AGENT_PROFILES: AgentProfile[] = ["lead_scraper", "lead_strategist"];
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -1150,6 +1153,28 @@ export class SalvoRepository {
        order by r.created_at desc
        limit $1`,
       [limit]
+    );
+
+    return result.rows;
+  }
+
+  async listLeadRunSummaries(limit = 100): Promise<DbRunSummary[]> {
+    const result = await this.pool.query<DbRunSummary>(
+      `select
+         r.*,
+         e.outcome as evaluation_outcome,
+         e.hard_fail_reason,
+         e.findings_json,
+         coalesce(c.contract_json->>'family_key', concat('legacy_', substring(r.contract_id::text, 1, 12))) as contract_family_key,
+         coalesce(c.contract_json->>'category', 'general') as contract_category,
+         nullif(c.contract_json->>'subcategory', '') as contract_subcategory
+       from public.salvo_runs r
+       left join public.salvo_evaluations e on e.run_id = r.id
+       left join public.salvo_contracts c on c.id = r.contract_id
+       where r.agent_profile = any($1)
+       order by r.created_at desc
+       limit $2`,
+      [LEAD_AGENT_PROFILES, limit]
     );
 
     return result.rows;

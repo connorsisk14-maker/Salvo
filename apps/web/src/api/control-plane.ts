@@ -227,6 +227,43 @@ export type ApiSkillsOverview = {
   skills: ApiSkill[];
 };
 
+export type ApiLeadFunnel = {
+  id: string;
+  label: string;
+  count: number;
+  detail: string;
+};
+
+export type ApiLeadZone = {
+  name: string;
+  priority: number;
+  zip_codes: string[];
+  focus: string;
+  progress: number;
+  status: string;
+  scrapes_this_week: number;
+  last_updated_at: string;
+};
+
+export type ApiLeadRun = {
+  id: string;
+  agent_profile: string;
+  status: string;
+  contract_family_key: string;
+  created_at: string;
+  duration_seconds: number | null;
+  outcome_summary: string | null;
+  score: number | null;
+};
+
+export type ApiLeadsOverview = {
+  sheet_url: string | null;
+  updated_at: string;
+  funnel: ApiLeadFunnel[];
+  zones: ApiLeadZone[];
+  runs: ApiLeadRun[];
+};
+
 export type ApiTrustTier = {
   workspace_id: string;
   workspace_name: string;
@@ -504,6 +541,10 @@ export function getBackupStatus(): Promise<ApiBackupStatus> {
 
 export function listIntegrations(): Promise<ApiIntegration[]> {
   return request<ApiIntegration[]>("/integrations");
+}
+
+export function getLeadsOverview(): Promise<ApiLeadsOverview> {
+  return request<ApiLeadsOverview>("/leads");
 }
 
 export function listSkills(workspaceId?: string): Promise<ApiSkillsOverview> {
