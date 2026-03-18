@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.salvo.orchestrator-daemon</string>
+  <key>WorkingDirectory</key>
+  <string>__ROOT_DIR__</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PNPM_BIN__</string>
+    <string>--filter</string>
+    <string>@salvo/orchestrator-daemon</string>
+    <string>start</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__PATH__</string>
+__ENV_VARS__
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>__LOG_DIR__/orchestrator-daemon.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIR__/orchestrator-daemon.err.log</string>
+</dict>
+</plist>

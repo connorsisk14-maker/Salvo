@@ -11,6 +11,10 @@ export const EVALUATION_WEIGHTS = {
 export type EvaluationInput = {
   contractCompliance: number;
   testsExitCode?: number;
+  testsRun?: ReadonlyArray<{ command?: string; exit_code?: number; denied?: boolean }>;
+  requiredTestCommands?: readonly string[];
+  requiredAssertions?: readonly string[];
+  finalPayloadPresent?: boolean;
   requiredDeliverables: readonly string[];
   producedDeliverables: readonly string[];
   evidencePresent: boolean;
@@ -25,6 +29,29 @@ export type EvaluationResult = {
   hardFailReason?: string;
   findings: string[];
 };
+
+function evaluateAssertions(input: EvaluationInput): string[] {
+  const failures: string[] = [];
+  for (const assertion of input.requiredAssertions ?? []) {
+    if (assertion === "Runner emits a final payload event.") {
+      if (!input.finalPayloadPresent) {
+        failures.push("Assertion failed: Runner emits a final payload event.");
+      }
+      continue;
+    }
+
+    if (assertion === "At least one deliverable produced.") {
+      if (input.producedDeliverables.length === 0) {
+        failures.push("Assertion failed: At least one deliverable produced.");
+      }
+      continue;
+    }
+
+    failures.push(`Assertion not recognized and skipped: ${assertion}`);
+  }
+
+  return failures;
+}
 
 function clampScore(input: number): number {
   if (input < 0) {
@@ -63,6 +90,31 @@ export function evaluateRun(input: EvaluationInput): EvaluationResult {
     };
   }
 
+  const requiredTests = input.requiredTestCommands ?? [];
+  const testsRun = input.testsRun ?? [];
+  for (const requiredTest of requiredTests) {
+    const match = testsRun.find((entry) => entry.command === requiredTest);
+    if (!match) {
+      return {
+        outcome: "hard_failed",
+        passed: false,
+        score: 0,
+        hardFailReason: "Required test command missing.",
+        findings: [`Hard fail: required test command not executed (${requiredTest}).`]
+      };
+    }
+
+    if (match.denied || match.exit_code !== 0) {
+      return {
+        outcome: "hard_failed",
+        passed: false,
+        score: 0,
+        hardFailReason: "Required test command failed.",
+        findings: [`Hard fail: required test command failed (${requiredTest}).`]
+      };
+    }
+  }
+
   if (input.testsExitCode !== undefined && input.testsExitCode !== 0) {
     return {
       outcome: "hard_failed",
@@ -73,7 +125,11 @@ export function evaluateRun(input: EvaluationInput): EvaluationResult {
     };
   }
 
-  const contractComplianceScore = clampScore(input.contractCompliance) / 100;
+  const assertionFindings = evaluateAssertions(input);
+  findings.push(...assertionFindings);
+
+  const contractComplianceScore =
+    assertionFindings.length === 0 ? clampScore(input.contractCompliance) / 100 : 0;
   const testsScore = input.testsExitCode === 0 || input.testsExitCode === undefined ? 1 : 0;
   const deliverablesScore = 1;
   const evidenceScore = input.evidencePresent ? 1 : 0;
