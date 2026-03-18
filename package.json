@@ -11,9 +11,37 @@
     "dev:runner": "pnpm --filter @salvo/agent-runner runner -- --run-id",
     "dev:research": "pnpm --filter @salvo/research-daemon dev",
     "dev:all": "pnpm -r --parallel --filter @salvo/web --filter @salvo/orchestrator-api --filter @salvo/orchestrator-daemon --filter @salvo/research-daemon dev",
+    "db:migrate": "pnpm --filter @salvo/db exec tsx ../../scripts/apply-migrations.ts",
+    "secrets:encrypt": "pnpm --filter @salvo/shared exec tsx ../../scripts/secrets.mjs encrypt",
+    "secrets:template": "pnpm --filter @salvo/shared exec tsx ../../scripts/secrets.mjs template",
+    "ux:up": "pnpm --filter @salvo/shared exec tsx ../../scripts/ux-stack.mjs up",
+    "ux:down": "pnpm --filter @salvo/shared exec tsx ../../scripts/ux-stack.mjs down",
+    "ux:status": "pnpm --filter @salvo/shared exec tsx ../../scripts/ux-stack.mjs status",
+    "ux:doctor": "pnpm --filter @salvo/shared exec tsx ../../scripts/ux-stack.mjs doctor",
+    "ux:db:up": "pnpm --filter @salvo/shared exec tsx ../../scripts/ux-stack.mjs db:up",
+    "ux:llm:up": "pnpm --filter @salvo/shared exec tsx ../../scripts/ux-stack.mjs llm:up",
+    "ux:smoke": "pnpm --filter @salvo/shared exec tsx ../../scripts/ux-stack.mjs smoke",
+    "ux:clean": "pnpm --filter @salvo/shared exec tsx ../../scripts/ux-stack.mjs clean",
+    "prod:preflight": "node scripts/prod-preflight.mjs",
+    "prod:up": "node scripts/prod-up.mjs",
+    "prod:down": "node scripts/prod-down.mjs",
+    "health:monitor": "node scripts/monitor-health.mjs",
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
+    "lint": "pnpm exec eslint . --max-warnings=0",
     "test": "pnpm -r --if-present test",
-    "test:e2e": "node scripts/e2e-smoke.mjs"
+    "test:coverage": "c8 --reporter=text-summary --reporter=lcov --check-coverage --lines 45 --functions 45 --branches 65 --statements 45 pnpm test",
+    "audit:security": "pnpm audit --audit-level=high",
+    "test:e2e": "node scripts/e2e-smoke.mjs",
+    "test:load": "SALVO_LOAD_CONCURRENCY=3 node scripts/load-test.mjs",
+    "test:load:5": "SALVO_LOAD_CONCURRENCY=5 node scripts/load-test.mjs"
+  },
+  "dependencies": {
+    "nodemailer": "^8.0.2"
+  },
+  "devDependencies": {
+    "@typescript-eslint/parser": "^8.29.1",
+    "c8": "^10.1.3",
+    "eslint": "^9.23.0"
   }
 }

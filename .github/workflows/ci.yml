@@ -1,0 +1,156 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: salvo
+          POSTGRES_PASSWORD: salvo
+          POSTGRES_DB: salvo_test
+        ports:
+          - 54329:5432
+        options: >-
+          --health-cmd "pg_isready -U salvo -d salvo_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      PGPASSWORD: salvo
+      SALVO_DATABASE_URL: postgresql://salvo:salvo@localhost:54329/salvo_test
+      SALVO_TEST_DATABASE_URL: postgresql://salvo:salvo@localhost:54329/salvo_test
+      SALVO_WORKSPACE_ROOT: ${{ github.workspace }}/.salvo-workspace
+      SALVO_API_TOKEN: local-dev-token
+      SALVO_E2E_API_URL: http://localhost:8787
+      SALVO_E2E_API_TOKEN: local-dev-token
+      SALVO_LOCAL_DB_MODE: external
+      SALVO_LOCAL_LLM_MODE: fake
+      SALVO_LLM_PROVIDER: anthropic
+      SALVO_LLM_API_KEY: test-key
+      SALVO_LLM_BASE_URL: http://127.0.0.1:9797
+      SALVO_FAKE_LLM_PORT: 9797
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.8.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install postgres client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Migration verify (fresh DB, SQL files)
+        run: |
+          set -euo pipefail
+          for file in $(ls supabase/migrations/*.sql | sort); do
+            psql "$SALVO_DATABASE_URL" -v ON_ERROR_STOP=1 -f "$file"
+          done
+
+      - name: Migration verify (idempotent apply script)
+        run: |
+          set -euo pipefail
+          createdb -h localhost -p 54329 -U salvo salvo_ci_verify
+          export SALVO_DATABASE_URL="postgresql://salvo:salvo@localhost:54329/salvo_ci_verify"
+          export SALVO_TEST_DATABASE_URL="$SALVO_DATABASE_URL"
+          pnpm db:migrate
+          pnpm db:migrate
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Coverage checks
+        run: pnpm test:coverage
+
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage
+
+      - name: Security audit (high severity gate)
+        run: pnpm audit:security
+
+      - name: Build
+        run: pnpm build
+
+      - name: Authenticated fake-LLM smoke
+        run: |
+          set -euo pipefail
+          START_TS=$(date +%s)
+
+          node scripts/fake-llm-server.mjs > /tmp/salvo-fake-llm.log 2>&1 &
+          FAKE_LLM_PID=$!
+          pnpm --filter @salvo/orchestrator-api start > /tmp/salvo-api.log 2>&1 &
+          API_PID=$!
+          pnpm --filter @salvo/orchestrator-daemon start > /tmp/salvo-orchestrator.log 2>&1 &
+          ORCH_PID=$!
+          pnpm --filter @salvo/research-daemon start > /tmp/salvo-research.log 2>&1 &
+          RESEARCH_PID=$!
+
+          cleanup() {
+            kill "$FAKE_LLM_PID" "$API_PID" "$ORCH_PID" "$RESEARCH_PID" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          for i in $(seq 1 60); do
+            if curl -sf "$SALVO_E2E_API_URL/health" >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+
+          curl -sf "$SALVO_E2E_API_URL/health" >/dev/null
+          pnpm test:e2e
+
+          END_TS=$(date +%s)
+          DURATION=$((END_TS - START_TS))
+          echo "E2E smoke duration: ${DURATION}s"
+          if [ "$DURATION" -gt 60 ]; then
+            echo "::warning::E2E smoke exceeded 60 seconds (${DURATION}s)."
+          fi
+
+      - name: Dump daemon logs on failure
+        if: failure()
+        run: |
+          echo "=== fake-llm ==="
+          cat /tmp/salvo-fake-llm.log || true
+          echo "=== orchestrator-api ==="
+          cat /tmp/salvo-api.log || true
+          echo "=== orchestrator-daemon ==="
+          cat /tmp/salvo-orchestrator.log || true
+          echo "=== research-daemon ==="
+          cat /tmp/salvo-research.log || true
+
+      - name: Upload smoke logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-logs
+          path: |
+            /tmp/salvo-fake-llm.log
+            /tmp/salvo-api.log
+            /tmp/salvo-orchestrator.log
+            /tmp/salvo-research.log

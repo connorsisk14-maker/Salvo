@@ -7,12 +7,14 @@
     "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
     "build": "tsc --project tsconfig.json",
-    "typecheck": "tsc --project tsconfig.json --noEmit"
+    "typecheck": "tsc --project tsconfig.json --noEmit",
+    "test": "tsx --test test/*.test.ts"
   },
   "dependencies": {
     "@salvo/contracts": "workspace:*",
     "@salvo/db": "workspace:*",
     "@salvo/evaluation": "workspace:*",
+    "@salvo/llm": "workspace:*",
     "@salvo/shared": "workspace:*"
   },
   "devDependencies": {

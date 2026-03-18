@@ -1,8 +1,11 @@
+import { createHash } from "node:crypto";
 import { z } from "zod";
 import {
   AGENT_PROFILES,
+  CONTRACT_CATEGORIES,
   assertContractTransition,
   type AgentProfile,
+  type ContractCategory,
   type ContractStatus,
   type WorkspaceId
 } from "@salvo/shared";
@@ -16,6 +19,8 @@ export const APPROVAL_REQUIRED_BY_RISK: Record<RiskLevel, boolean> = {
   high: true
 };
 
+export const DEFAULT_CONTRACT_CATEGORIES = [...CONTRACT_CATEGORIES];
+
 export const ContractCapabilitiesSchema = z.object({
   filesystem_read: z.boolean(),
   filesystem_write: z.boolean(),
@@ -23,7 +28,8 @@ export const ContractCapabilitiesSchema = z.object({
   install_packages: z.boolean(),
   network_access: z.boolean(),
   db_read: z.boolean(),
-  db_write: z.boolean()
+  db_write: z.boolean(),
+  email_send: z.boolean()
 });
 
 export const ContractV1Schema = z.object({
@@ -70,6 +76,17 @@ export const ContractV1Schema = z.object({
     required: z.boolean().default(true)
   }),
   risk: z.enum(RISK_LEVELS),
+  category: z.enum(CONTRACT_CATEGORIES),
+  subcategory: z.string().trim().min(1).optional(),
+  family_key: z.string().min(1),
+  dependencies: z
+    .array(
+      z.object({
+        contractId: z.string().uuid(),
+        reason: z.string().trim().min(1).optional()
+      })
+    )
+    .default([]),
   agent_profile: z.enum(AGENT_PROFILES)
 });
 
@@ -82,6 +99,10 @@ export type BuildContractInput = {
   request: string;
   taskTitle: string;
   preferredProfile?: AgentProfile;
+  dependencies?: Array<{
+    contractId: string;
+    reason?: string;
+  }>;
 };
 
 function classifyRisk(request: string): RiskLevel {
@@ -103,9 +124,104 @@ function classifyRisk(request: string): RiskLevel {
   return "low";
 }
 
+function classifyContract(request: string): {
+  category: ContractCategory;
+  subcategory?: string;
+} {
+  const lowered = request.toLowerCase();
+
+  if (lowered.includes("migration") || lowered.includes("schema") || lowered.includes("database")) {
+    return {
+      category: "migration",
+      subcategory: "database"
+    };
+  }
+
+  if (
+    lowered.includes("integrat") ||
+    lowered.includes("connector") ||
+    lowered.includes("api key") ||
+    lowered.includes("webhook")
+  ) {
+    return {
+      category: "integration",
+      subcategory: "external-api"
+    };
+  }
+
+  if (lowered.includes("test") || lowered.includes("coverage") || lowered.includes("qa")) {
+    return {
+      category: "quality",
+      subcategory: "testing"
+    };
+  }
+
+  if (lowered.includes("doc") || lowered.includes("readme")) {
+    return {
+      category: "documentation",
+      subcategory: "knowledge"
+    };
+  }
+
+  if (
+    lowered.includes("incident") ||
+    lowered.includes("ops") ||
+    lowered.includes("deploy") ||
+    lowered.includes("rollback")
+  ) {
+    return {
+      category: "operations",
+      subcategory: "runtime"
+    };
+  }
+
+  if (lowered.includes("bug") || lowered.includes("fix") || lowered.includes("debug")) {
+    return {
+      category: "debug",
+      subcategory: "bugfix"
+    };
+  }
+
+  return {
+    category: "general"
+  };
+}
+
+function normalizedFamilyComponent(input: string): string {
+  return input.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function buildContractFamilyKey(input: {
+  request: string;
+  risk: RiskLevel;
+  category: ContractCategory;
+  subcategory?: string;
+  agentProfile: AgentProfile;
+}): string {
+  const seed = [
+    normalizedFamilyComponent(input.category),
+    normalizedFamilyComponent(input.subcategory ?? "none"),
+    normalizedFamilyComponent(input.risk),
+    normalizedFamilyComponent(input.agentProfile),
+    normalizedFamilyComponent(input.request)
+  ].join("|");
+
+  const digest = createHash("sha256").update(seed).digest("hex").slice(0, 16);
+  return `family_${digest}`;
+}
+
 export function buildContractV1(input: BuildContractInput): ContractV1 {
   const risk = classifyRisk(input.request);
+  const classification = classifyContract(input.request);
+  const agentProfile = input.preferredProfile ?? "builder";
   const approvalRequired = APPROVAL_REQUIRED_BY_RISK[risk];
+  const familyKey = buildContractFamilyKey({
+    request: input.request,
+    risk,
+    category: classification.category,
+    subcategory: classification.subcategory,
+    agentProfile
+  });
 
   return ContractV1Schema.parse({
     schema_version: 1,
@@ -135,7 +251,8 @@ export function buildContractV1(input: BuildContractInput): ContractV1 {
       install_packages: false,
       network_access: false,
       db_read: true,
-      db_write: true
+      db_write: true,
+      email_send: false
     },
     constraints: {
       max_runtime_minutes: 25,
@@ -151,8 +268,11 @@ export function buildContractV1(input: BuildContractInput): ContractV1 {
       summary_required: true
     },
     success_criteria: {
-      required_test_commands: [],
-      assertions: ["Runner emits a final payload event."]
+      required_test_commands: ["echo salvo-test"],
+      assertions: [
+        "Runner emits a final payload event.",
+        "At least one deliverable produced."
+      ]
     },
     failure_handling: {
       stop_on_policy_denial: true
@@ -161,7 +281,11 @@ export function buildContractV1(input: BuildContractInput): ContractV1 {
       required: true
     },
     risk,
-    agent_profile: input.preferredProfile ?? "builder"
+    category: classification.category,
+    subcategory: classification.subcategory,
+    family_key: familyKey,
+    dependencies: input.dependencies ?? [],
+    agent_profile: agentProfile
   });
 }
 

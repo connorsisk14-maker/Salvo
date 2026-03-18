@@ -7,10 +7,13 @@
     "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
     "build": "tsc --project tsconfig.json",
-    "typecheck": "tsc --project tsconfig.json --noEmit"
+    "typecheck": "tsc --project tsconfig.json --noEmit",
+    "test": "tsx --test test/*.test.ts",
+    "test:integration": "SALVO_RESEARCH_DAEMON_IT=1 tsx --test test/pipeline.integration.test.ts"
   },
   "dependencies": {
-    "@salvo/db": "workspace:*"
+    "@salvo/db": "workspace:*",
+    "@salvo/shared": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^22.15.2",
