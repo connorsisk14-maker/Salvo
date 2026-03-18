@@ -9,6 +9,7 @@ import { LeadsPage } from "./pages/LeadsPage";
 import { RunDetailPage } from "./pages/RunDetailPage";
 import { IntegrationsPage } from "./pages/IntegrationsPage";
 import { SkillsPage } from "./pages/SkillsPage";
+import { AnalyticsPage } from "./pages/AnalyticsPage";
 
 const chatSessionStorageKey = "salvo.dashboard.chat.session.v1";
 
@@ -438,6 +439,12 @@ export function AppShell() {
           >
             Integrations
           </NavLink>
+          <NavLink
+            to="/analytics"
+            className={({ isActive }) => `top-nav-link ${isActive ? "top-nav-link-active" : ""}`}
+          >
+            Analytics
+          </NavLink>
           <button
             type="button"
             className="top-nav-chat"
@@ -470,6 +477,7 @@ export function AppShell() {
             <Route path="/leads" element={<LeadsPage />} />
             <Route path="/skills" element={<SkillsPage />} />
             <Route path="/integrations" element={<IntegrationsPage />} />
+            <Route path="/analytics" element={<AnalyticsPage />} />
             <Route path="/runs/:runId" element={<RunDetailPage />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>

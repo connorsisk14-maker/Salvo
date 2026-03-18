@@ -1429,6 +1429,29 @@ export async function buildServer() {
     };
   });
 
+  app.get<{
+    Querystring: {
+      from?: string;
+      to?: string;
+    };
+  }>("/analytics/cost", async (req) => {
+    const parsedQuery = parseRequestBody(
+      z
+        .object({
+          from: z.string().optional(),
+          to: z.string().optional()
+        })
+        .strict(),
+      req.query ?? {}
+    );
+
+    const range = parsedQuery.ok ? parsedQuery.value : {};
+    return repo.getCostAnalytics({
+      from: range.from,
+      to: range.to
+    });
+  });
+
   app.post<{
     Body: {
       workspaceId: string;

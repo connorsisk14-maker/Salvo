@@ -14,6 +14,9 @@ import {
   type TaskStatus
 } from "@salvo/shared";
 import type {
+  AnalyticsCostDayRow,
+  AnalyticsCostDimensionRow,
+  AnalyticsCostSummary,
   CreateAuditEventInput,
   DaemonType,
   CreateContractInput,
@@ -1402,6 +1405,160 @@ export class SalvoRepository {
     );
 
     return this.singleOrThrow(result.rows, "Failed to save budget limit.");
+  }
+
+  async getCostAnalytics(input: { from?: string; to?: string }): Promise<{
+    summary: AnalyticsCostSummary;
+    byDay: AnalyticsCostDayRow[];
+    byModel: AnalyticsCostDimensionRow[];
+    byAgent: AnalyticsCostDimensionRow[];
+    byCategory: AnalyticsCostDimensionRow[];
+  }> {
+    const fromDate = input.from ? new Date(input.from) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const toDate = input.to ? new Date(input.to) : new Date();
+    const normalizedFrom = new Date(fromDate.toISOString());
+    const normalizedTo = new Date(toDate.toISOString());
+
+    const argumentsList = [normalizedFrom.toISOString(), normalizedTo.toISOString()];
+    const usageCte = `
+      with usage as (
+        select
+          r.id as run_id,
+          r.agent_profile,
+          coalesce(e.payload_json->>'model', 'unknown') as model,
+          coalesce(c.contract_json->>'contract_category', 'general') as category,
+          coalesce((e.payload_json->>'cost_usd')::double precision, 0) as cost_usd,
+          date_trunc('day', r.created_at at time zone 'UTC')::date as day
+        from public.salvo_runs r
+        left join lateral (
+          select payload_json
+          from public.salvo_run_events
+          where run_id = r.id
+            and event_type = 'usage.reported'
+          order by sequence_no desc
+          limit 1
+        ) e on true
+        left join public.salvo_contracts c on c.id = r.contract_id
+        where r.created_at >= $1
+          and r.created_at <= $2
+          and exists (
+            select 1
+            from public.salvo_run_events ev
+            where ev.run_id = r.id
+              and ev.event_type = 'usage.reported'
+          )
+      )
+    `;
+
+    const summaryResult = await this.pool.query<{
+      total_cost: number;
+      run_count: number;
+      average_cost: number;
+      first_event: string | null;
+      last_event: string | null;
+    }>(
+      `
+        ${usageCte}
+        select
+          coalesce(sum(cost_usd), 0) as total_cost,
+          count(*) as run_count,
+          coalesce(sum(cost_usd) / nullif(count(*), 0), 0) as average_cost,
+          min(day) as first_event,
+          max(day) as last_event
+        from usage
+      `,
+      argumentsList
+    );
+
+    const [byDayResult, byModelResult, byAgentResult, byCategoryResult] = await Promise.all([
+      this.pool.query<{ day: string; cost_usd: number; runs: number }>(
+        `
+          ${usageCte}
+          select
+            day,
+            sum(cost_usd) as cost_usd,
+            count(*) as runs
+          from usage
+          group by day
+          order by day desc
+          limit 30
+        `,
+        argumentsList
+      ),
+      this.pool.query<{ model: string; cost_usd: number; runs: number }>(
+        `
+          ${usageCte}
+          select
+            model,
+            sum(cost_usd) as cost_usd,
+            count(*) as runs
+          from usage
+          group by model
+          order by cost_usd desc
+          limit 10
+        `,
+        argumentsList
+      ),
+      this.pool.query<{ agent_profile: string; cost_usd: number; runs: number }>(
+        `
+          ${usageCte}
+          select
+            agent_profile,
+            sum(cost_usd) as cost_usd,
+            count(*) as runs
+          from usage
+          group by agent_profile
+          order by cost_usd desc
+          limit 10
+        `,
+        argumentsList
+      ),
+      this.pool.query<{ category: string; cost_usd: number; runs: number }>(
+        `
+          ${usageCte}
+          select
+            category,
+            sum(cost_usd) as cost_usd,
+            count(*) as runs
+          from usage
+          group by category
+          order by cost_usd desc
+          limit 10
+        `,
+        argumentsList
+      )
+    ]);
+
+    const summaryRow = summaryResult.rows[0];
+    return {
+      summary: {
+        totalCostUsd: summaryRow?.total_cost ?? 0,
+        runCount: summaryRow?.run_count ?? 0,
+        averageCostUsd: summaryRow?.average_cost ?? 0,
+        firstEventAt: summaryRow?.first_event ?? null,
+        lastEventAt: summaryRow?.last_event ?? null
+      },
+      byDay: byDayResult.rows.map((row) => ({
+        date: row.day,
+        costUsd: row.cost_usd,
+        runs: row.runs
+      })),
+      byModel: byModelResult.rows.map((row) => ({
+        label: row.model,
+        costUsd: row.cost_usd,
+        runs: row.runs
+      })),
+      byAgent: byAgentResult.rows.map((row) => ({
+        label: row.agent_profile,
+        costUsd: row.cost_usd,
+        runs: row.runs
+      })),
+      byCategory: byCategoryResult.rows.map((row) => ({
+        label: row.category,
+        costUsd: row.cost_usd,
+        runs: row.runs
+      }))
+    };
   }
 
   async listBudgetStatuses(): Promise<DbBudgetStatus[]> {

@@ -122,6 +122,18 @@ export type DbRunSummary = DbRun & {
   contract_family_key: string;
   contract_category: string;
   contract_subcategory: string | null;
+  lead_chain_scraper_run_id: string | null;
+  lead_chain_strategist_task_id: string | null;
+  lead_chain_strategist_run_id: string | null;
+};
+
+export type DbLeadRunChain = {
+  id: string;
+  scraper_run_id: string;
+  strategist_task_id: string;
+  strategist_run_id: string | null;
+  row_context: Record<string, unknown> | null;
+  created_at: string;
 };
 
 export type DbRunEvent = {
@@ -332,6 +344,7 @@ export type CreateRunInput = {
   contractId: string;
   agentProfile: AgentProfile;
   workerId: string;
+  leadChainId?: string;
 };
 
 export type RecordEvaluationInput = {
@@ -382,4 +395,24 @@ export type ResearchIngestionCandidate = {
   contract_category: string;
   contract_subcategory: string | null;
   source_summary: Record<string, unknown>;
+};
+
+export type AnalyticsCostSummary = {
+  totalCostUsd: number;
+  runCount: number;
+  averageCostUsd: number;
+  firstEventAt: string | null;
+  lastEventAt: string | null;
+};
+
+export type AnalyticsCostDimensionRow = {
+  label: string;
+  costUsd: number;
+  runs: number;
+};
+
+export type AnalyticsCostDayRow = {
+  date: string;
+  costUsd: number;
+  runs: number;
 };

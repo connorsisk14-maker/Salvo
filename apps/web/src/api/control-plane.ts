@@ -177,6 +177,36 @@ export type ApiCostMetrics = {
   }>;
 };
 
+export type ApiCostAnalytics = {
+  summary: {
+    totalCostUsd: number;
+    runCount: number;
+    averageCostUsd: number;
+    firstEventAt: string | null;
+    lastEventAt: string | null;
+  };
+  byDay: Array<{
+    date: string;
+    costUsd: number;
+    runs: number;
+  }>;
+  byModel: Array<{
+    label: string;
+    costUsd: number;
+    runs: number;
+  }>;
+  byAgentProfile: Array<{
+    label: string;
+    costUsd: number;
+    runs: number;
+  }>;
+  byCategory: Array<{
+    label: string;
+    costUsd: number;
+    runs: number;
+  }>;
+};
+
 export type ApiBudgetStatus = {
   id: string;
   workspace_id: string;
@@ -564,6 +594,18 @@ export function setSkillConfig(skillName: string, workspaceId: string, enabled: 
 
 export function getCostMetrics(): Promise<ApiCostMetrics> {
   return request<ApiCostMetrics>("/metrics/costs");
+}
+
+export function fetchAnalyticsCost(params: { from?: string; to?: string }): Promise<ApiCostAnalytics> {
+  const query = new URLSearchParams();
+  if (params.from) {
+    query.set("from", params.from);
+  }
+  if (params.to) {
+    query.set("to", params.to);
+  }
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  return request<ApiCostAnalytics>(`/analytics/cost${suffix}`);
 }
 
 export function getBudgetOverview(): Promise<ApiBudgetOverview> {
