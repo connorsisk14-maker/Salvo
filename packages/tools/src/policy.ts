@@ -20,6 +20,59 @@ export function resolvePolicyPaths(rootDir: string, paths: string[]): string[] {
   );
 }
 
+function normalizePathSet(paths: string[]): string[] {
+  const normalized = [...new Set(paths.map((entry) => path.resolve(entry)))].sort();
+  return normalized.filter((candidate, index) => {
+    return !normalized.some((other, otherIndex) => {
+      if (index === otherIndex) {
+        return false;
+      }
+      return candidate !== other && isWithinPath(candidate, other);
+    });
+  });
+}
+
+function intersectPathAllowlists(basePaths: string[], overlayPaths: string[]): string[] {
+  if (overlayPaths.length === 0) {
+    return normalizePathSet(basePaths);
+  }
+  if (basePaths.length === 0) {
+    return normalizePathSet(overlayPaths);
+  }
+
+  const intersections: string[] = [];
+  for (const basePath of basePaths) {
+    for (const overlayPath of overlayPaths) {
+      if (isWithinPath(basePath, overlayPath)) {
+        intersections.push(path.resolve(overlayPath));
+      } else if (isWithinPath(overlayPath, basePath)) {
+        intersections.push(path.resolve(basePath));
+      }
+    }
+  }
+
+  return normalizePathSet(intersections);
+}
+
+function intersectExactAllowlists(baseValues: string[], overlayValues: string[]): string[] {
+  if (overlayValues.length === 0) {
+    return [...new Set(baseValues)].sort();
+  }
+  if (baseValues.length === 0) {
+    return [...new Set(overlayValues)].sort();
+  }
+
+  return [...new Set(baseValues.filter((entry) => overlayValues.includes(entry)))].sort();
+}
+
+function uniqueCombined(valuesA: string[], valuesB: string[]): string[] {
+  return [...new Set([...valuesA, ...valuesB])].sort();
+}
+
+function resolvePolicyEntries(rootDir: string | undefined, entries: string[]): string[] {
+  return entries.map((entry) => (rootDir ? path.resolve(rootDir, entry) : path.resolve(entry)));
+}
+
 export function evaluateReadPathPolicy(
   absolutePath: string,
   policy: ToolPolicy
@@ -126,5 +179,64 @@ export function buildToolPolicy(rootDir: string, overrides?: Partial<ToolPolicy>
     allowedWritePaths: resolvePolicyPaths(rootDir, merged.allowedWritePaths),
     forbiddenPaths: resolvePolicyPaths(rootDir, merged.forbiddenPaths),
     allowedCommandCwds: resolvePolicyPaths(rootDir, merged.allowedCommandCwds)
+  };
+}
+
+export type ToolPolicyOverlay = Partial<ToolPolicy> & {
+  commandTimeoutMs?: number;
+};
+
+export function mergeToolPolicies(
+  base: ToolPolicy,
+  overlay?: ToolPolicyOverlay,
+  rootDir?: string
+): ToolPolicy {
+  if (!overlay) {
+    return {
+      ...base,
+      allowedReadPaths: [...base.allowedReadPaths],
+      allowedWritePaths: [...base.allowedWritePaths],
+      forbiddenPaths: [...base.forbiddenPaths],
+      allowedCommands: [...base.allowedCommands],
+      allowedCommandCwds: [...base.allowedCommandCwds]
+    };
+  }
+
+  const overlayReadPaths = resolvePolicyEntries(rootDir, overlay.allowedReadPaths ?? []);
+  const overlayWritePaths = resolvePolicyEntries(rootDir, overlay.allowedWritePaths ?? []);
+  const overlayForbiddenPaths = resolvePolicyEntries(rootDir, overlay.forbiddenPaths ?? []);
+  const overlayCommandCwds = resolvePolicyEntries(rootDir, overlay.allowedCommandCwds ?? []);
+
+  const mergedAllowedReadPaths = intersectPathAllowlists(
+    base.allowedReadPaths,
+    overlayReadPaths
+  );
+  const mergedAllowedWritePaths = intersectPathAllowlists(
+    base.allowedWritePaths,
+    overlayWritePaths
+  );
+  const mergedForbiddenPaths = uniqueCombined(
+    base.forbiddenPaths,
+    overlayForbiddenPaths
+  );
+  const mergedAllowedCommands = intersectExactAllowlists(
+    base.allowedCommands,
+    overlay.allowedCommands ?? []
+  );
+  const mergedAllowedCommandCwds = intersectPathAllowlists(
+    base.allowedCommandCwds,
+    overlayCommandCwds
+  );
+
+  return {
+    allowedReadPaths: mergedAllowedReadPaths,
+    allowedWritePaths: mergedAllowedWritePaths,
+    forbiddenPaths: mergedForbiddenPaths,
+    allowedCommands: mergedAllowedCommands,
+    allowedCommandCwds: mergedAllowedCommandCwds,
+    commandTimeoutMs:
+      typeof overlay.commandTimeoutMs === "number" && overlay.commandTimeoutMs > 0
+        ? Math.min(base.commandTimeoutMs, overlay.commandTimeoutMs)
+        : base.commandTimeoutMs
   };
 }

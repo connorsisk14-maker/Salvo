@@ -1,5 +1,7 @@
 import { clearStoredApiToken, getStoredApiToken } from "./auth";
 
+export type ApiTaskPriority = "urgent" | "high" | "medium" | "low";
+
 export type ApiTask = {
   id: string;
   title: string;
@@ -11,6 +13,18 @@ export type ApiTask = {
   dependency_block_reason: string | null;
   dependency_blocked_at: string | null;
   dependencies: ApiTaskDependency[];
+  priority?: ApiTaskPriority | null;
+};
+
+export type ApiContract = {
+  id: string;
+  task_id: string;
+  version: number;
+  status: string;
+  risk: "low" | "medium" | "high";
+  contract_json: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
 };
 
 export type ApiTaskDependency = {
@@ -23,6 +37,7 @@ export type ApiRun = {
   id: string;
   task_id: string;
   contract_id: string;
+  agent_profile: string;
   status: string;
   attempt_no: number;
   exit_reason?: string | null;
@@ -333,6 +348,24 @@ export type ApiTrustTierOverview = {
   tiers: ApiTrustTier[];
 };
 
+export type ApiWorkspaceToolPolicy = {
+  id: string;
+  workspace_id: string;
+  workspace_name: string;
+  policy_json: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ApiWorkspaceToolPolicyOverview = {
+  updated_at: string;
+  workspaces: Array<{
+    id: string;
+    name: string;
+  }>;
+  policies: ApiWorkspaceToolPolicy[];
+};
+
 export type ApiRunDetail = {
   run: ApiRun;
   task: ApiTask;
@@ -405,10 +438,6 @@ export type ApiTaskChatApproveResponse = {
 
 const baseUrl = import.meta.env.VITE_SALVO_API_URL ?? "http://localhost:8787";
 export const controlPlaneBaseUrl = baseUrl;
-
-export function createRunEventStream(runId: string): EventSource {
-  return new EventSource(`${controlPlaneBaseUrl}/stream/runs/${runId}`);
-}
 
 function buildHeaders(init: RequestInit | undefined): Headers {
   const headers = new Headers(init?.headers ?? {});
@@ -493,19 +522,25 @@ export function createTask(input: {
   title: string;
   request: string;
   requiresApproval: boolean;
+  priority?: ApiTaskPriority;
 }): Promise<ApiTask> {
   return request<ApiTask>("/tasks", {
     method: "POST",
     body: JSON.stringify({
       title: input.title,
       request: input.request,
-      requiresApproval: input.requiresApproval
+      requiresApproval: input.requiresApproval,
+      priority: input.priority
     })
   });
 }
 
 export function listTasks(): Promise<ApiTask[]> {
   return request<ApiTask[]>("/tasks");
+}
+
+export function getContract(contractId: string): Promise<ApiContract> {
+  return request<ApiContract>(`/contracts/${contractId}`);
 }
 
 export function sendTaskChat(input: {
@@ -655,8 +690,27 @@ export function saveTrustTier(input: {
   });
 }
 
+export function getWorkspaceToolPolicyOverview(): Promise<ApiWorkspaceToolPolicyOverview> {
+  return request<ApiWorkspaceToolPolicyOverview>("/workspace-policies");
+}
+
+export function saveWorkspaceToolPolicy(input: {
+  workspaceId: string;
+  allowedReadPaths?: string[];
+  allowedWritePaths?: string[];
+  forbiddenPaths?: string[];
+  allowedCommands?: string[];
+  allowedCommandCwds?: string[];
+  commandTimeoutMs?: number;
+}): Promise<ApiActionResponse & { policy?: ApiWorkspaceToolPolicy }> {
+  return request<ApiActionResponse & { policy?: ApiWorkspaceToolPolicy }>("/workspace-policies", {
+    method: "POST",
+    body: JSON.stringify(input)
+  });
+}
+
 export function updateIntegrationConfig(
-  key: "supabase" | "llm_api" | "process" | "http" | "google_sheets" | "email",
+  key: "supabase" | "llm_api" | "process" | "http" | "google_sheets" | "slack" | "email",
   input: Record<string, unknown>
 ): Promise<ApiActionResponse> {
   return request<ApiActionResponse>(`/integrations/${key}/config`, {

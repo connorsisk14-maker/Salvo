@@ -1,7 +1,9 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
+import { readFile, stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import type { ContractV1 } from "@salvo/contracts";
+import path from "node:path";
+import type { ContractAssertion, ContractV1 } from "@salvo/contracts";
 import {
   createDbPool,
   SalvoRepository,
@@ -16,10 +18,12 @@ import {
   estimateRunCost,
   initializeSecrets,
   isTerminalRunStatus,
-  resolveLlmProviderAndModel
+  resolveLlmProviderAndModel,
+  withTelemetrySpan
 } from "@salvo/shared";
 import {
   buildHeuristicContract,
+  buildMemoryRetrievalQuery,
   collectWorkspaceSnapshot,
   planContract,
   resolveContractPlannerConfig
@@ -30,6 +34,7 @@ import {
   shouldRunEveningPlanner,
   toLocalDateKey
 } from "./planner";
+import { routeAgentProfiles, type ProfileHistoryEntry } from "./router";
 import { applyTrustTierPolicy } from "./trust-tier";
 
 await initializeSecrets();
@@ -44,20 +49,118 @@ const orphanTaskThresholdSeconds = readPositiveIntegerEnv(
   120
 );
 const recoveryMaxAttempts = readPositiveIntegerEnv("SALVO_RECOVERY_MAX_RUN_ATTEMPTS", 2);
+const checkpointResumeMaxAttempts = readPositiveIntegerEnv(
+  "SALVO_RECOVERY_MAX_CHECKPOINT_RESUMES",
+  2
+);
+const agentLoopCheckpointKey = "agent_loop_v1";
 const logger = createLogger({
   component: "orchestrator-daemon",
   daemon_id: workerId
 });
+const TEXT_ARTIFACT_EXTENSIONS = new Set([
+  ".md",
+  ".txt",
+  ".json",
+  ".log",
+  ".yaml",
+  ".yml",
+  ".ts",
+  ".tsx",
+  ".js",
+  ".jsx",
+  ".css",
+  ".html"
+]);
+
+function isTextArtifact(filePath: string): boolean {
+  return TEXT_ARTIFACT_EXTENSIONS.has(path.extname(filePath).toLowerCase());
+}
+
+async function loadArtifactSnapshot(artifactPath: string): Promise<{ path: string; content?: string }> {
+  if (!isTextArtifact(artifactPath)) {
+    return { path: artifactPath };
+  }
+
+  try {
+    const fileInfo = await stat(artifactPath);
+    if (!fileInfo.isFile()) {
+      return { path: artifactPath };
+    }
+    const maxBytes = Math.min(64_000, fileInfo.size);
+    const content = await readFile(artifactPath, "utf8");
+    return {
+      path: artifactPath,
+      content: content.slice(0, maxBytes)
+    };
+  } catch {
+    return { path: artifactPath };
+  }
+}
+
+function summarizeUsage(events: DbRunEvent[]): {
+  inputTokens?: number;
+  outputTokens?: number;
+  costUsd?: number;
+  maxInputTokens?: number;
+  maxOutputTokens?: number;
+  maxTotalTokens?: number;
+} | undefined {
+  const usageEvents = events.filter((event) => event.event_type === "usage.reported");
+  if (usageEvents.length === 0) {
+    return undefined;
+  }
+
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let costUsd = 0;
+  for (const event of usageEvents) {
+    const input = Number(event.payload_json?.input_tokens ?? 0);
+    const output = Number(event.payload_json?.output_tokens ?? 0);
+    const cost = Number(event.payload_json?.cost_usd ?? 0);
+    if (Number.isFinite(input)) {
+      inputTokens += input;
+    }
+    if (Number.isFinite(output)) {
+      outputTokens += output;
+    }
+    if (Number.isFinite(cost)) {
+      costUsd += cost;
+    }
+  }
+
+  return {
+    inputTokens,
+    outputTokens,
+    costUsd
+  };
+}
 
 function readPositiveIntegerEnv(name: string, fallback: number): number {
   const value = Number(process.env[name] ?? fallback);
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
 }
 
+function routingPriorityScore(priority: DbTask["priority"]): number {
+  switch (priority) {
+    case "urgent":
+      return 10;
+    case "high":
+      return 7;
+    case "medium":
+      return 5;
+    case "low":
+    default:
+      return 2;
+  }
+}
+
 export class OrchestratorDaemon {
   private readonly repo: SalvoRepository;
   private readonly backupManager = new BackupManager();
-  private readonly activeRuns = new Map<string, ChildProcess>();
+  protected readonly activeRuns = new Map<string, ChildProcess>();
+  private readonly checkpointResumeAttempts = new Map<string, number>();
+  private readonly maxConcurrentRunners = readPositiveIntegerEnv("SALVO_MAX_CONCURRENT_RUNNERS", 4);
   private claimTimer?: NodeJS.Timeout;
   private staleTimer?: NodeJS.Timeout;
   private recoveryTimer?: NodeJS.Timeout;
@@ -72,6 +175,7 @@ export class OrchestratorDaemon {
     "SALVO_PLANNER_MAX_DRAFTS_PER_WORKSPACE",
     3
   );
+  private claimInFlight = false;
   private stopped = false;
 
   constructor(repo: SalvoRepository) {
@@ -155,23 +259,84 @@ export class OrchestratorDaemon {
     await this.repo.close();
   }
 
+  private async readQueueDepth(): Promise<number | null> {
+    const maybeRepo = this.repo as SalvoRepository & {
+      countClaimableTasks?: () => Promise<number>;
+    };
+    if (typeof maybeRepo.countClaimableTasks !== "function") {
+      return null;
+    }
+    return maybeRepo.countClaimableTasks();
+  }
+
+  private canClaimTasks(): boolean {
+    const maybeRepo = this.repo as SalvoRepository & {
+      claimNextTask?: (workerId: string) => Promise<DbTask | null>;
+    };
+    return typeof maybeRepo.claimNextTask === "function";
+  }
+
+  private triggerClaimRefill(): void {
+    if (!this.canClaimTasks()) {
+      return;
+    }
+    void this.claimLoop().catch((error) => {
+      logger.error("claim loop refill failed", {
+        error
+      });
+    });
+  }
+
   private async publishHeartbeat(extra?: Record<string, unknown>): Promise<void> {
+    const queueDepth = await this.readQueueDepth();
     await this.repo.upsertDaemonHeartbeat("orchestrator", workerId, {
       active_runs: this.activeRuns.size,
+      max_concurrent_runs: this.maxConcurrentRunners,
+      available_runner_slots: Math.max(this.maxConcurrentRunners - this.activeRuns.size, 0),
+      queue_depth: queueDepth,
       ...extra
     });
   }
 
-  private async claimLoop(): Promise<void> {
-    const task = await this.repo.claimNextTask(workerId);
-    if (!task) {
+  protected async claimLoop(): Promise<void> {
+    if (this.claimInFlight || this.stopped) {
       return;
     }
-    logger.info("task claimed", {
-      task_id: task.id,
-      workspace_id: task.workspace_id
-    });
 
+    await withTelemetrySpan(
+      {
+        logger,
+        name: "orchestrator.claim_loop",
+        attributes: {
+          active_runs: this.activeRuns.size,
+          max_concurrent_runs: this.maxConcurrentRunners
+        }
+      },
+      async () => {
+        this.claimInFlight = true;
+        try {
+          while (this.activeRuns.size < this.maxConcurrentRunners) {
+            const task = await this.repo.claimNextTask(workerId);
+            if (!task) {
+              return;
+            }
+            logger.info("task claimed", {
+              task_id: task.id,
+              workspace_id: task.workspace_id,
+              priority: task.priority,
+              active_runs: this.activeRuns.size,
+              max_concurrent_runs: this.maxConcurrentRunners
+            });
+            await this.processClaimedTask(task);
+          }
+        } finally {
+          this.claimInFlight = false;
+        }
+      }
+    );
+  }
+
+  protected async processClaimedTask(task: DbTask): Promise<void> {
     const heuristicContract = buildHeuristicContract({
       contractId: randomUUID(),
       taskId: task.id,
@@ -180,15 +345,21 @@ export class OrchestratorDaemon {
       taskTitle: task.title,
       preferredProfile: task.preferred_agent_profile ?? undefined
     });
-    const [workspace, memoryContext, researchContext, integrationConfigs] = await Promise.all([
+    const planningMemoryQuery = buildMemoryRetrievalQuery({
+      task,
+      contract: heuristicContract
+    });
+    const [workspace, memoryContext, researchContext, integrationConfigs, performanceSignals] = await Promise.all([
       this.repo.getWorkspace(task.workspace_id),
-      this.repo.listContractMemoryPromptContext(
+      this.repo.listRelevantMemoryPromptContext(
         task.workspace_id,
+        planningMemoryQuery,
         heuristicContract.family_key,
         5
       ),
       this.repo.listResearchContext(task.workspace_id, 5),
-      this.repo.listIntegrationConfigs()
+      this.repo.listIntegrationConfigs(),
+      this.repo.listAgentPerformanceSignals(task.workspace_id, 24)
     ]);
     const workspaceContext = workspace ?? {
       id: task.workspace_id,
@@ -217,18 +388,69 @@ export class OrchestratorDaemon {
         env: process.env
       })
     });
+    const routingHistory: ProfileHistoryEntry[] = performanceSignals
+      .filter(
+        (signal) =>
+          signal.contractFamilyKey === plannedContract.contract.family_key ||
+          signal.contractCategory === plannedContract.contract.category
+      )
+      .map((signal) => ({
+        profile: signal.agentProfile,
+        successRate: signal.passRate,
+        runCount: signal.runCount,
+        averageScore: signal.avgScore,
+        averageCostUsd: signal.avgCostUsd,
+        matchScope:
+          signal.contractFamilyKey === plannedContract.contract.family_key ? "family" : "category"
+      }));
+    const routingDecision = routeAgentProfiles({
+      preferredProfile: task.preferred_agent_profile ?? undefined,
+      plannedProfile: plannedContract.contract.agent_profile,
+      contractCategory: plannedContract.contract.category,
+      contractCapabilities: plannedContract.contract.capabilities,
+      taskPriority: routingPriorityScore(task.priority),
+      taskTitle: `${task.title} ${task.original_request}`,
+      history: routingHistory
+    });
+    const routedContract = {
+      ...plannedContract.contract,
+      agent_profile: routingDecision.selectedProfile
+    };
+    await this.repo.createAuditEvent({
+      actor: `system:${workerId}`,
+      action: "agent.routed",
+      target: task.id,
+      metadata: {
+        workspace_id: task.workspace_id,
+        contract_family_key: routedContract.family_key,
+        planned_agent_profile: plannedContract.contract.agent_profile,
+        selected_agent_profile: routingDecision.selectedProfile,
+        reason: routingDecision.reasoning,
+        candidates: routingDecision.rankedCandidates.slice(0, 3).map((candidate) => ({
+          agent_profile: candidate.profile,
+          score: candidate.score,
+          reasons: candidate.reasons
+        }))
+      }
+    });
+
     const trustTierState = await this.repo.getAgentTrustTier(
       task.workspace_id,
-      plannedContract.contract.agent_profile
+      routedContract.agent_profile
     );
     const governedContract = applyTrustTierPolicy(
-      plannedContract.contract,
+      routedContract,
       trustTierState.trust_tier
     );
     const contract = governedContract.contract;
 
-    const memoryReferenceContext = await this.repo.listContractMemoryContext(
+    const executionMemoryQuery = buildMemoryRetrievalQuery({
+      task,
+      contract
+    });
+    const memoryReferenceContext = await this.repo.listRelevantMemoryContext(
       task.workspace_id,
+      executionMemoryQuery,
       contract.family_key,
       5
     );
@@ -618,71 +840,98 @@ export class OrchestratorDaemon {
   }
 
   protected async launchRun(run: DbRun): Promise<void> {
-    if (this.activeRuns.has(run.id)) {
-      return;
-    }
-
-    const child = this.spawnRunnerProcess(run);
-    this.activeRuns.set(run.id, child);
-    logger.info("runner spawned", {
-      run_id: run.id,
-      task_id: run.task_id,
-      child_pid: child.pid
-    });
-
-    child.on("error", async (error) => {
-      this.activeRuns.delete(run.id);
-      logger.error("runner process error", {
-        run_id: run.id,
-        task_id: run.task_id,
-        error
-      });
-      await this.repo.appendRunEvent(run.id, "run.failed", "error", {
-        reason: "runner_spawn_error",
-        error: error.message
-      });
-      const current = await this.repo.getRun(run.id);
-      if (current && !isTerminalRunStatus(current.status)) {
-        await this.repo.transitionRunStatus(run.id, "failed", {
-          exitReason: "runner_crash",
-          outcomeSummary: `Runner spawn failed: ${error.message}`,
-          endedAt: new Date()
-        });
-      }
-      await this.repo.transitionTaskStatus(run.task_id, "failed");
-    });
-
-    child.on("close", async (code, signal) => {
-      this.activeRuns.delete(run.id);
-      logger.info("runner process closed", {
-        run_id: run.id,
-        task_id: run.task_id,
-        exit_code: code,
-        signal
-      });
-
-      try {
-        const current = await this.repo.getRun(run.id);
-        if (!current || isTerminalRunStatus(current.status)) {
-          return;
-        }
-
-        if (current.status === "starting" || current.status === "provisioning") {
-          await this.failRunBeforeExecution(current, code ?? null, signal ?? null);
-          return;
-        }
-
-        await this.evaluateRun(run.id);
-      } catch (error) {
-        logger.error("runner close handling failed", {
+    await withTelemetrySpan(
+      {
+        logger,
+        name: "orchestrator.launch_run",
+        attributes: {
           run_id: run.id,
           task_id: run.task_id,
-          exit_code: code,
-          signal,
-          error
+          agent_profile: run.agent_profile
+        }
+      },
+      async () => {
+        if (this.activeRuns.has(run.id)) {
+          return;
+        }
+
+        const child = this.spawnRunnerProcess(run);
+        this.activeRuns.set(run.id, child);
+        void this.publishHeartbeat().catch((error) => {
+          logger.warn("failed to publish heartbeat after runner spawn", {
+            run_id: run.id,
+            error
+          });
+        });
+        logger.info("runner spawned", {
+          run_id: run.id,
+          task_id: run.task_id,
+          child_pid: child.pid
+        });
+
+        child.on("error", async (error) => {
+          this.activeRuns.delete(run.id);
+          void this.publishHeartbeat().catch(() => {});
+          this.triggerClaimRefill();
+          logger.error("runner process error", {
+            run_id: run.id,
+            task_id: run.task_id,
+            error
+          });
+          await this.repo.appendRunEvent(run.id, "run.failed", "error", {
+            reason: "runner_spawn_error",
+            error: error.message
+          });
+          const current = await this.repo.getRun(run.id);
+          if (current && !isTerminalRunStatus(current.status)) {
+            await this.repo.transitionRunStatus(run.id, "failed", {
+              exitReason: "runner_crash",
+              outcomeSummary: `Runner spawn failed: ${error.message}`,
+              endedAt: new Date()
+            });
+          }
+          await this.repo.transitionTaskStatus(run.task_id, "failed");
+        });
+
+        child.on("close", async (code, signal) => {
+          this.activeRuns.delete(run.id);
+          void this.publishHeartbeat().catch(() => {});
+          this.triggerClaimRefill();
+          logger.info("runner process closed", {
+            run_id: run.id,
+            task_id: run.task_id,
+            exit_code: code,
+            signal
+          });
+
+          try {
+            const current = await this.repo.getRun(run.id);
+            if (!current || isTerminalRunStatus(current.status)) {
+              return;
+            }
+
+            if (current.status === "starting" || current.status === "provisioning") {
+              await this.failRunBeforeExecution(current, code ?? null, signal ?? null);
+              return;
+            }
+
+            if (await this.resumeRunFromCheckpoint(current, code ?? null, signal ?? null)) {
+              return;
+            }
+
+            await this.evaluateRun(run.id);
+          } catch (error) {
+            logger.error("runner close handling failed", {
+              run_id: run.id,
+              task_id: run.task_id,
+              exit_code: code,
+              signal,
+              error
+            });
+          }
         });
       }
-    });
+    );
   }
 
   protected async failRunBeforeExecution(
@@ -712,17 +961,78 @@ export class OrchestratorDaemon {
     await this.repo.transitionTaskStatus(run.task_id, "failed");
   }
 
+  protected async resumeRunFromCheckpoint(
+    run: DbRun,
+    code: number | null,
+    signal: NodeJS.Signals | null
+  ): Promise<boolean> {
+    if (run.status !== "running") {
+      return false;
+    }
+
+    const finalPayload = await this.repo.getRunFinalPayload(run.id);
+    if (finalPayload) {
+      this.checkpointResumeAttempts.delete(run.id);
+      return false;
+    }
+
+    const checkpoint = await this.repo.loadRunCheckpoint(run.id, agentLoopCheckpointKey);
+    if (!checkpoint) {
+      this.checkpointResumeAttempts.delete(run.id);
+      return false;
+    }
+
+    const nextAttempt = (this.checkpointResumeAttempts.get(run.id) ?? 0) + 1;
+    if (nextAttempt > checkpointResumeMaxAttempts) {
+      this.checkpointResumeAttempts.delete(run.id);
+      await this.repo.appendRunEvent(run.id, "run.failed", "error", {
+        reason: "checkpoint_resume_exhausted",
+        exit_code: code,
+        signal
+      });
+      await this.repo.transitionRunStatus(run.id, "failed", {
+        exitReason: "runner_crash",
+        outcomeSummary: "Runner crashed repeatedly while attempting to resume from checkpoint.",
+        endedAt: new Date(),
+        heartbeatAt: new Date()
+      });
+      await this.repo.transitionTaskStatus(run.task_id, "failed");
+      return true;
+    }
+
+    this.checkpointResumeAttempts.set(run.id, nextAttempt);
+    await this.repo.appendRunEvent(run.id, "run.resumed", "warn", {
+      reason: "runner_relaunch_from_checkpoint",
+      checkpoint_key: agentLoopCheckpointKey,
+      resume_attempt: nextAttempt,
+      exit_code: code,
+      signal
+    });
+    await this.launchRun(run);
+    return true;
+  }
+
   private findPolicyDeniedCount(events: DbRunEvent[]): number {
     return events.filter((event) => event.event_type === "policy.denied").length;
   }
 
   protected async evaluateRun(runId: string): Promise<void> {
+    await withTelemetrySpan(
+      {
+        logger,
+        name: "orchestrator.evaluate_run",
+        attributes: {
+          run_id: runId
+        }
+      },
+      async () => {
     const detail = await this.repo.getRunDetail(runId);
     if (!detail) {
       return;
     }
 
     if (isTerminalRunStatus(detail.run.status)) {
+      this.checkpointResumeAttempts.delete(runId);
       return;
     }
 
@@ -730,7 +1040,12 @@ export class OrchestratorDaemon {
 
     const finalPayload = await this.repo.getRunFinalPayload(runId);
     const events = await this.repo.listRunEvents(runId);
+    const artifacts = await this.repo.listArtifactsForRun(runId);
     const policyDeniedCount = this.findPolicyDeniedCount(events);
+    const artifactSnapshots = await Promise.all(
+      artifacts.map(async (artifact) => loadArtifactSnapshot(artifact.path))
+    );
+    const usage = summarizeUsage(events);
 
     const payload = (finalPayload ?? {}) as {
       deliverables?: string[];
@@ -745,10 +1060,15 @@ export class OrchestratorDaemon {
     const firstExitCode = commandResults.find((item) => item.exit_code !== undefined)?.exit_code;
 
     const contractJson = detail.contract.contract_json as {
+      constraints?: {
+        max_total_input_tokens?: number;
+        max_total_output_tokens?: number;
+        max_total_cost_usd?: number;
+      };
       deliverables?: { required_artifacts?: string[] };
       success_criteria?: {
         required_test_commands?: string[];
-        assertions?: string[];
+        assertions?: Array<ContractAssertion>;
       };
     };
 
@@ -763,7 +1083,23 @@ export class OrchestratorDaemon {
       producedDeliverables: payload.deliverables ?? [],
       evidencePresent: payload.evidence !== undefined,
       learningsCount: payload.learnings?.length ?? 0,
-      policyDeniedCount
+      policyDeniedCount,
+      artifacts: artifactSnapshots,
+      commandResults,
+      tokenUsage: usage
+        ? {
+            ...usage,
+            maxInputTokens: contractJson.constraints?.max_total_input_tokens,
+            maxOutputTokens: contractJson.constraints?.max_total_output_tokens,
+            maxTotalTokens:
+              contractJson.constraints?.max_total_input_tokens &&
+              contractJson.constraints?.max_total_output_tokens
+                ? contractJson.constraints.max_total_input_tokens +
+                  contractJson.constraints.max_total_output_tokens
+                : undefined,
+            maxCostUsd: contractJson.constraints?.max_total_cost_usd
+          }
+        : undefined
     });
 
     await this.repo.recordEvaluation({
@@ -796,6 +1132,7 @@ export class OrchestratorDaemon {
     });
 
     await this.repo.transitionTaskStatus(detail.task.id, evaluation.passed ? "completed" : "failed");
+    this.checkpointResumeAttempts.delete(runId);
     const trustTierOutcome = await this.repo.recordAgentTrustTierOutcome(
       detail.task.workspace_id,
       detail.run.agent_profile,
@@ -831,6 +1168,8 @@ export class OrchestratorDaemon {
     });
 
     await this.handleLeadRunChain(detail, finalPayload, runId, evaluation.passed);
+      }
+    );
   }
 
   private async handleLeadRunChain(
@@ -849,7 +1188,7 @@ export class OrchestratorDaemon {
     }
 
     if (detail.run.agent_profile === "lead_strategist") {
-      await this.linkLeadStrategistRun(detail.task.id, runId);
+      await this.linkLeadStrategistRun(detail, runId, finalPayload);
     }
   }
 
@@ -880,6 +1219,14 @@ export class OrchestratorDaemon {
       strategistTaskId: strategistTask.id,
       rowContext
     });
+    await this.recordLeadProgress({
+      workspaceId: detail.task.workspace_id,
+      rowContext,
+      scraperRunId: detail.run.id,
+      strategistTaskId: strategistTask.id,
+      scrapedAt: detail.run.ended_at ? new Date(detail.run.ended_at) : new Date(),
+      qualifiedAt: new Date()
+    });
     const rowSummaryLabel = this.formatLeadRowContextSummary(rowContext);
     logger.info("lead strategist follow-up created", {
       scraper_run_id: detail.run.id,
@@ -888,17 +1235,147 @@ export class OrchestratorDaemon {
     });
   }
 
-  private async linkLeadStrategistRun(taskId: string, runId: string): Promise<void> {
-    const chain = await this.repo.findLeadRunChainByStrategistTask(taskId);
+  private async linkLeadStrategistRun(
+    detail: Awaited<ReturnType<SalvoRepository["getRunDetail"]>>,
+    runId: string,
+    finalPayload: Record<string, unknown> | null
+  ): Promise<void> {
+    const runDetail = detail;
+    if (!runDetail) {
+      return;
+    }
+
+    const chain = await this.repo.findLeadRunChainByStrategistTask(runDetail.task.id);
     if (!chain || chain.strategist_run_id) {
       return;
     }
     await this.repo.linkLeadRunChainStrategistRun(chain.id, runId);
+    await this.recordLeadProgress({
+      workspaceId: runDetail.task.workspace_id,
+      rowContext: chain.row_context,
+      scraperRunId: chain.scraper_run_id,
+      strategistTaskId: chain.strategist_task_id,
+      strategistRunId: runId,
+      qualifiedAt: new Date(),
+      ...this.extractLeadStageProgress(finalPayload)
+    });
     logger.info("lead strategist run linked to chain", {
-      strategist_task_id: taskId,
+      strategist_task_id: runDetail.task.id,
       strategist_run_id: runId,
       chain_id: chain.id
     });
+  }
+
+  private async recordLeadProgress(input: {
+    workspaceId: string;
+    rowContext: Record<string, unknown> | null;
+    scraperRunId?: string;
+    strategistTaskId?: string;
+    strategistRunId?: string;
+    scrapedAt?: Date;
+    qualifiedAt?: Date;
+    contactedAt?: Date;
+    convertedAt?: Date;
+  }): Promise<void> {
+    const leadKey = this.buildLeadKey(
+      input.rowContext,
+      input.scraperRunId ?? input.strategistTaskId ?? input.strategistRunId ?? input.workspaceId
+    );
+    await this.repo.upsertLeadRecord({
+      workspaceId: input.workspaceId,
+      leadKey,
+      rowContext: input.rowContext,
+      scraperRunId: input.scraperRunId,
+      strategistTaskId: input.strategistTaskId,
+      strategistRunId: input.strategistRunId,
+      scrapedAt: input.scrapedAt,
+      qualifiedAt: input.qualifiedAt,
+      contactedAt: input.contactedAt,
+      convertedAt: input.convertedAt
+    });
+  }
+
+  private extractLeadStageProgress(finalPayload: Record<string, unknown> | null): {
+    contactedAt?: Date;
+    convertedAt?: Date;
+  } {
+    if (!finalPayload) {
+      return {};
+    }
+
+    const result: { contactedAt?: Date; convertedAt?: Date } = {};
+    const contactedAt = this.readLeadStageDate(finalPayload, "contacted_at", "contactedAt");
+    const convertedAt = this.readLeadStageDate(finalPayload, "converted_at", "convertedAt");
+    const stage = this.readLeadStageString(finalPayload, "stage", "status", "lead_stage");
+
+    if (contactedAt) {
+      result.contactedAt = contactedAt;
+    }
+    if (convertedAt) {
+      result.convertedAt = convertedAt;
+    }
+
+    if (stage === "contacted" && !result.contactedAt) {
+      result.contactedAt = new Date();
+    } else if (stage === "converted") {
+      result.contactedAt ??= new Date();
+      result.convertedAt = result.convertedAt ?? new Date();
+    }
+
+    return result;
+  }
+
+  private readLeadStageString(
+    payload: Record<string, unknown>,
+    ...keys: string[]
+  ): string | undefined {
+    for (const key of keys) {
+      const value = payload[key];
+      if (typeof value === "string" && value.trim().length > 0) {
+        return value.trim().toLowerCase();
+      }
+    }
+    return undefined;
+  }
+
+  private readLeadStageDate(
+    payload: Record<string, unknown>,
+    ...keys: string[]
+  ): Date | undefined {
+    for (const key of keys) {
+      const value = payload[key];
+      if (typeof value === "string" && value.trim().length > 0) {
+        const parsed = new Date(value);
+        if (!Number.isNaN(parsed.getTime())) {
+          return parsed;
+        }
+      }
+    }
+    return undefined;
+  }
+
+  private buildLeadKey(rowContext: Record<string, unknown> | null, fallbackSeed: string): string {
+    const stable = this.stableStringify(rowContext ?? { fallbackSeed });
+    return createHash("sha256").update(stable).digest("hex");
+  }
+
+  private stableStringify(value: unknown): string {
+    const canonicalize = (input: unknown): unknown => {
+      if (Array.isArray(input)) {
+        return input.map((entry) => canonicalize(entry));
+      }
+      if (this.isPlainRecord(input)) {
+        return Object.keys(input)
+          .sort()
+          .reduce<Record<string, unknown>>((acc, key) => {
+            acc[key] = canonicalize(input[key]);
+            return acc;
+          }, {});
+      }
+      return input;
+    };
+
+    return JSON.stringify(canonicalize(value));
   }
 
   private buildLeadStrategistRequest(

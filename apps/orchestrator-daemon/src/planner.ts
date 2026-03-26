@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { DbContractMemoryPrompt, DbRunSummary, DbTask, SalvoRepository } from "@salvo/db";
 import {
+  buildMemoryRetrievalQuery,
   buildHeuristicContract,
   collectWorkspaceSnapshot,
   planContract,
@@ -35,7 +36,7 @@ type PlannerRepo = Pick<
   | "listTasks"
   | "listRunSummaries"
   | "listResearchContext"
-  | "listContractMemoryPromptContext"
+  | "listRelevantMemoryPromptContext"
   | "listIntegrationConfigs"
   | "createTask"
   | "createContract"
@@ -196,7 +197,15 @@ export async function runEveningPlannerCycle(input: RunEveningPlannerCycleInput)
 
       const memories: DbContractMemoryPrompt[] = familyKey === "general"
         ? []
-        : await input.repo.listContractMemoryPromptContext(workspace.id, familyKey, 5);
+        : await input.repo.listRelevantMemoryPromptContext(
+            workspace.id,
+            buildMemoryRetrievalQuery({
+              task,
+              contract: heuristicContract
+            }),
+            familyKey,
+            5
+          );
 
       const planned = await planContract({
         task,

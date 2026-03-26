@@ -9,19 +9,39 @@ export type LlmPricing = {
 };
 
 export const MODEL_CATALOG = {
+  "gpt-5.4-mini": {
+    provider: "openai",
+    inputUsdPer1mTokens: 0.25,
+    outputUsdPer1mTokens: 2
+  },
+  "gpt-5.4": {
+    provider: "openai",
+    inputUsdPer1mTokens: 2.5,
+    outputUsdPer1mTokens: 15
+  },
   "gpt-5-mini": {
     provider: "openai",
-    inputUsdPer1mTokens: 0.3,
-    outputUsdPer1mTokens: 1.2
+    inputUsdPer1mTokens: 0.25,
+    outputUsdPer1mTokens: 2
   },
   "gpt-5-nano": {
     provider: "openai",
     inputUsdPer1mTokens: 0.05,
-    outputUsdPer1mTokens: 0.2
+    outputUsdPer1mTokens: 0.4
   },
   "gpt-5": {
     provider: "openai",
     inputUsdPer1mTokens: 1.25,
+    outputUsdPer1mTokens: 10
+  },
+  "gpt-4o-mini": {
+    provider: "openai",
+    inputUsdPer1mTokens: 0.15,
+    outputUsdPer1mTokens: 0.6
+  },
+  "gpt-4o": {
+    provider: "openai",
+    inputUsdPer1mTokens: 2.5,
     outputUsdPer1mTokens: 10
   },
   "claude-3-5-haiku": {
@@ -106,10 +126,27 @@ export type LlmResponse = {
   raw: Record<string, unknown>;
 };
 
+export type LlmStreamChunk =
+  | {
+      type: "response.started";
+      provider: LlmProvider;
+      model: string;
+      responseId?: string;
+    }
+  | {
+      type: "text_delta";
+      text: string;
+    }
+  | {
+      type: "response.completed";
+      response: LlmResponse;
+    };
+
 export function resolveModelPricing(model: string): LlmPricing | null {
   const normalizedModel = model.toLowerCase();
 
-  for (const [catalogModel, pricing] of Object.entries(MODEL_CATALOG)) {
+  const orderedEntries = Object.entries(MODEL_CATALOG).sort((left, right) => right[0].length - left[0].length);
+  for (const [catalogModel, pricing] of orderedEntries) {
     if (normalizedModel.includes(catalogModel)) {
       return pricing;
     }
@@ -118,13 +155,15 @@ export function resolveModelPricing(model: string): LlmPricing | null {
   return null;
 }
 
-export type AnthropicToolDefinition = {
+/** Wire format for tool definitions sent to Anthropic-compatible endpoints. */
+export type ProviderToolDefinition = {
   name: string;
   description: string;
   input_schema: Record<string, unknown>;
 };
 
-export type AnthropicMessageRequest = {
+/** Wire format for requests sent to Anthropic-compatible endpoints. */
+export type ProviderMessageRequest = {
   model: string;
   max_tokens: number;
   temperature?: number;
@@ -136,5 +175,53 @@ export type AnthropicMessageRequest = {
       | { type: "tool_result"; tool_use_id: string; content: string; is_error?: boolean }
     >;
   }>;
-  tools?: AnthropicToolDefinition[];
+  tools?: ProviderToolDefinition[];
+};
+
+// Backward-compatible aliases.
+export type AnthropicToolDefinition = ProviderToolDefinition;
+export type AnthropicMessageRequest = ProviderMessageRequest;
+
+export type OpenAiToolDefinition = {
+  type: "function";
+  function: {
+    name: string;
+    description: string;
+    parameters: Record<string, unknown>;
+  };
+};
+
+export type OpenAiChatMessage =
+  | {
+      role: "system" | "user";
+      content: string;
+    }
+  | {
+      role: "assistant";
+      content: string | null;
+      tool_calls?: Array<{
+        id: string;
+        type: "function";
+        function: {
+          name: string;
+          arguments: string;
+        };
+      }>;
+    }
+  | {
+      role: "tool";
+      tool_call_id: string;
+      content: string;
+    };
+
+export type OpenAiChatCompletionRequest = {
+  model: string;
+  max_tokens?: number;
+  temperature?: number;
+  messages: OpenAiChatMessage[];
+  tools?: OpenAiToolDefinition[];
+  stream?: boolean;
+  stream_options?: {
+    include_usage?: boolean;
+  };
 };

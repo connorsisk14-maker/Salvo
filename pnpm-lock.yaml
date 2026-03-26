@@ -39,6 +39,9 @@ importers:
       '@salvo/shared':
         specifier: workspace:*
         version: link:../../packages/shared
+      '@salvo/skills':
+        specifier: workspace:*
+        version: link:../../packages/skills
       '@salvo/tools':
         specifier: workspace:*
         version: link:../../packages/tools
@@ -58,9 +61,15 @@ importers:
       '@fastify/cors':
         specifier: ^10.0.2
         version: 10.1.0
+      '@salvo/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
       '@salvo/db':
         specifier: workspace:*
         version: link:../../packages/db
+      '@salvo/llm':
+        specifier: workspace:*
+        version: link:../../packages/llm
       '@salvo/shared':
         specifier: workspace:*
         version: link:../../packages/shared
@@ -117,6 +126,9 @@ importers:
       '@salvo/db':
         specifier: workspace:*
         version: link:../../packages/db
+      '@salvo/llm':
+        specifier: workspace:*
+        version: link:../../packages/llm
       '@salvo/shared':
         specifier: workspace:*
         version: link:../../packages/shared
@@ -227,6 +239,9 @@ importers:
 
   packages/evaluation:
     dependencies:
+      '@salvo/contracts':
+        specifier: workspace:*
+        version: link:../contracts
       '@salvo/shared':
         specifier: workspace:*
         version: link:../shared
@@ -265,6 +280,9 @@ importers:
       '@salvo/contracts':
         specifier: workspace:*
         version: link:../contracts
+      '@salvo/shared':
+        specifier: workspace:*
+        version: link:../shared
     devDependencies:
       '@types/node':
         specifier: ^22.15.2

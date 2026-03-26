@@ -1,19 +1,16 @@
 import path from "node:path";
 import { mkdir } from "node:fs/promises";
-import { EmailAdapter } from "@salvo/adapters";
+import { EmailAdapter, HttpAdapter, SlackAdapter } from "@salvo/adapters";
 import { createDbPool, SalvoRepository } from "@salvo/db";
-import { buildToolDefinitions, executeToolUse, LlmClient } from "@salvo/llm";
+import { executeToolUse, LlmClient } from "@salvo/llm";
+import { createBuiltinSkillRegistry } from "@salvo/skills";
 import { CommandAdapter, FilesystemAdapter } from "@salvo/tools";
 import { createLogger, initializeSecrets, type RunEventType } from "@salvo/shared";
 import {
   buildRunnerPrompts,
   collectPromptContext,
-  commandEvidence,
-  normalizeArtifacts,
   parseContractPolicy,
-  reserveToolCall,
   resolveRunnerLlmConfig,
-  runLlmGeneration,
   validateRunnerContract
 } from "./runtime";
 import { runAgentLoop } from "./agent-loop";
@@ -21,6 +18,7 @@ import { runAgentLoop } from "./agent-loop";
 await initializeSecrets();
 
 const defaultEmailSendLimit = Number(process.env.SALVO_EMAIL_MAX_SENDS_PER_RUN ?? 3);
+const agentLoopCheckpointKey = "agent_loop_v1";
 
 function parseArg(flag: string): string | undefined {
   const idx = process.argv.indexOf(flag);
@@ -66,7 +64,10 @@ async function main(): Promise<void> {
 
   const { run, task, contract } = context;
   const contractJson = validateRunnerContract(contract.contract_json);
+  const resumeCheckpoint = await repo.loadRunCheckpoint(run.id, agentLoopCheckpointKey);
+  const resumeFromCheckpoint = run.status === "running" && resumeCheckpoint !== null;
   const integrationConfigs = await repo.listIntegrationConfigs();
+  const workspacePolicy = await repo.getWorkspaceToolPolicy(task.workspace_id);
   const llmConfig = resolveRunnerLlmConfig({
     integrationConfigs,
     env: process.env,
@@ -80,7 +81,7 @@ async function main(): Promise<void> {
 
   await mkdir(workspaceRoot, { recursive: true });
 
-  const policy = parseContractPolicy(workspaceRoot, contractJson);
+  const policy = parseContractPolicy(workspaceRoot, contractJson, workspacePolicy?.policy_json);
   const filesystem = new FilesystemAdapter(workspaceRoot, policy);
   const command = new CommandAdapter(policy);
   const emailConfig =
@@ -100,6 +101,41 @@ async function main(): Promise<void> {
         ]
       })
     : undefined;
+  const slackConfig =
+    integrationConfigs.find((row) => row.integration_key === "slack")?.config_json ?? {};
+  const slackBotToken =
+    readIntegrationString(slackConfig, "botToken") ||
+    readIntegrationString(slackConfig, "bot_token");
+  const slackWebhookUrl =
+    readIntegrationString(slackConfig, "webhookUrl") ||
+    readIntegrationString(slackConfig, "webhook_url");
+  const slackAdapter =
+    slackBotToken || slackWebhookUrl
+      ? new SlackAdapter({
+          botToken: slackBotToken,
+          defaultChannel:
+            readIntegrationString(slackConfig, "defaultChannel") ||
+            readIntegrationString(slackConfig, "default_channel"),
+          webhookUrl: slackWebhookUrl
+        })
+      : undefined;
+  const httpConfig =
+    integrationConfigs.find((row) => row.integration_key === "http")?.config_json ?? {};
+  const httpBaseUrl = readIntegrationString(httpConfig, "baseUrl");
+  const httpToken = readIntegrationString(httpConfig, "token") || undefined;
+  const httpAdapter = httpBaseUrl ? new HttpAdapter(httpBaseUrl, httpToken) : undefined;
+  const skillRegistry = createBuiltinSkillRegistry();
+  const skillExecutionContext = {
+    workspacePath: workspaceRoot,
+    runId: run.id,
+    adapters: {
+      filesystem,
+      command,
+      ...(httpAdapter ? { http: httpAdapter } : {}),
+      ...(slackAdapter ? { slack: slackAdapter } : {})
+    },
+    repo: {}
+  };
   const promptContext = await collectPromptContext({
     relevantFiles: contractJson.context.relevant_files,
     listDirectory: (targetPath) => filesystem.listDirectory(targetPath),
@@ -112,27 +148,46 @@ async function main(): Promise<void> {
     context: promptContext
   });
 
-  await repo.transitionRunStatus(run.id, "running", {
-    runnerPid: process.pid,
-    startedAt: new Date(),
-    heartbeatAt: new Date()
-  });
-  await repo.transitionTaskStatus(task.id, "running");
-  await repo.appendRunEvent(run.id, "run.started", "info", {
-    run_id: run.id,
-    task_id: task.id,
-    workspace: workspaceRoot,
-    agent_profile: run.agent_profile,
-    model: llmConfig.model,
-    provider: llmConfig.provider
-  });
-  logger.info("run started", {
-    task_id: task.id,
-    agent_profile: run.agent_profile,
-    workspace: workspaceRoot,
-    model: llmConfig.model,
-    provider: llmConfig.provider
-  });
+  if (resumeFromCheckpoint) {
+    await repo.updateRunExecutionState(run.id, {
+      runnerPid: process.pid,
+      heartbeatAt: new Date()
+    });
+    await repo.appendRunEvent(run.id, "run.resumed", "info", {
+      run_id: run.id,
+      task_id: task.id,
+      workspace: workspaceRoot,
+      checkpoint_key: agentLoopCheckpointKey
+    });
+    logger.info("run resumed from checkpoint", {
+      task_id: task.id,
+      agent_profile: run.agent_profile,
+      workspace: workspaceRoot,
+      checkpoint_key: agentLoopCheckpointKey
+    });
+  } else {
+    await repo.transitionRunStatus(run.id, "running", {
+      runnerPid: process.pid,
+      startedAt: new Date(),
+      heartbeatAt: new Date()
+    });
+    await repo.transitionTaskStatus(task.id, "running");
+    await repo.appendRunEvent(run.id, "run.started", "info", {
+      run_id: run.id,
+      task_id: task.id,
+      workspace: workspaceRoot,
+      agent_profile: run.agent_profile,
+      model: llmConfig.model,
+      provider: llmConfig.provider
+    });
+    logger.info("run started", {
+      task_id: task.id,
+      agent_profile: run.agent_profile,
+      workspace: workspaceRoot,
+      model: llmConfig.model,
+      provider: llmConfig.provider
+    });
+  }
 
   const heartbeatTimer = setInterval(async () => {
     await repo.recordHeartbeat(run.id);
@@ -140,7 +195,6 @@ async function main(): Promise<void> {
       at: new Date().toISOString()
     });
   }, 10_000);
-  let toolCallsUsed = 0;
   const emailSendPolicy = {
     maxSends:
       Number.isFinite(defaultEmailSendLimit) && defaultEmailSendLimit > 0
@@ -149,252 +203,93 @@ async function main(): Promise<void> {
     sendsUsed: 0
   };
 
-  const trackToolCall = async (payload: Record<string, unknown>) => {
-    try {
-      toolCallsUsed = reserveToolCall(
-        toolCallsUsed,
-        contractJson.constraints.max_tool_calls,
-        String(payload.tool ?? "unknown")
-      );
-    } catch (error) {
-      await repo.appendRunEvent(run.id, "policy.denied", "warn", {
-        reason: "tool_call_limit",
-        message: (error as Error).message,
-        max_tool_calls: contractJson.constraints.max_tool_calls,
-        tool_calls_used: toolCallsUsed,
-        ...payload
-      });
-      throw error;
-    }
-
-    await repo.appendRunEvent(run.id, "tool.called", "info", payload);
-  };
-
   try {
-    if (llmConfig.provider === "anthropic") {
-      const llmClient = new LlmClient(llmConfig);
-      const loopResult = await runAgentLoop({
-        provider: llmConfig.provider,
-        model: llmConfig.model,
-        systemPrompt: prompts.systemPrompt,
-        userPrompt: prompts.userPrompt,
-        contract: contractJson,
-        workspaceRoot,
-        createMessage: (systemPrompt, messages) =>
-          llmClient.createMessage(
-            systemPrompt,
-            messages,
-            buildToolDefinitions(contractJson)
-          ),
-        executeToolUse: async (block) =>
-          executeToolUse({
-            block,
-            workspaceRoot,
-            requiredTestCommands: new Set(contractJson.success_criteria.required_test_commands),
-            deps: {
-              readFile: (targetPath) => filesystem.readFile(targetPath),
-              writeFile: (targetPath, content) => filesystem.writeFile(targetPath, content),
-              listDirectory: (targetPath) => filesystem.listDirectory(targetPath),
-              runCommand: (commandName, args, cwd, timeoutMs) =>
-                command.run(commandName, args, cwd, timeoutMs)
-            },
-            persistence: {
-              appendRunEvent: (eventType, level, payload) =>
-                repo.appendRunEvent(
-                  run.id,
-                  eventType as RunEventType,
-                  level,
-                  payload
-                ).then(() => undefined),
-              createArtifact: (params) =>
-                repo.createArtifact({
-                  runId: run.id,
-                  taskId: task.id,
-                  artifactType: params.artifactType,
-                  path: params.path,
-                  metadataJson: params.metadataJson
-                })
-            },
-            emailAdapter,
-            emailSendPolicy
-          }),
-        appendRunEvent: (eventType, level, payload) =>
-          repo.appendRunEvent(
-            run.id,
-            eventType as RunEventType,
-            level,
-            payload
-          ).then(() => undefined)
-      });
-
-      const finalLevel = loopResult.finalPayload.status === "completed" ? "info" : "error";
-      await repo.appendRunEvent(run.id, "run.final_payload", finalLevel, loopResult.finalPayload);
-      if (loopResult.finalPayload.status !== "completed") {
-        await repo.appendRunEvent(run.id, "run.failed", "error", {
-          reason: loopResult.exitReason
-        });
-        process.exitCode = 1;
-      } else {
-        logger.info("run completed", {
-          task_id: task.id,
-          deliverables: loopResult.finalPayload.deliverables
-        });
-      }
-      return;
-    }
-
-    await trackToolCall({
-      tool: "llm",
-      provider: llmConfig.provider,
-      model: llmConfig.model
-    });
-
-    const llmResult = await runLlmGeneration({
-      config: llmConfig,
-      systemPrompt: prompts.systemPrompt,
-      userPrompt: prompts.userPrompt
-    });
-
-    await repo.appendRunEvent(run.id, "tool.result", "info", {
-      tool: "llm",
+    const llmClient = new LlmClient(llmConfig);
+    const loopResult = await runAgentLoop({
       provider: llmConfig.provider,
       model: llmConfig.model,
-      plan_steps: llmResult.output.plan_steps.length,
-      artifact_count: llmResult.output.artifacts.length,
-      learning_count: llmResult.output.learnings.length
-    });
-    await repo.appendRunEvent(run.id, "plan.generated", "info", {
-      steps: llmResult.output.plan_steps
-    });
-
-    await repo.appendRunEvent(run.id, "usage.reported", "info", llmResult.usage);
-    logger.info("usage reported", llmResult.usage);
-
-    const artifacts = normalizeArtifacts(llmResult.output, contractJson);
-    const createdArtifacts: string[] = [];
-    const testsRun: Array<{ command: string; exit_code?: number; denied?: boolean }> = [];
-    const commandResults: Record<string, unknown>[] = [];
-
-    for (const artifact of artifacts) {
-      await trackToolCall({
-        tool: "filesystem.write",
-        path: artifact.path
-      });
-
-      const writeResult = await filesystem.writeFile(artifact.path, artifact.content);
-      if (!writeResult.ok) {
-        logger.warn("artifact write blocked by policy", {
-          task_id: task.id,
-          path: artifact.path,
-          reason: writeResult.decision.reason
-        });
-        await repo.appendRunEvent(run.id, "policy.denied", "warn", {
-          reason: writeResult.decision.reason,
-          message: writeResult.decision.message,
-          target: artifact.path
-        });
-
-        if (contractJson.failure_handling.stop_on_policy_denial) {
-          await repo.appendRunEvent(run.id, "run.final_payload", "error", {
-            status: "blocked",
-            summary: llmResult.output.summary,
-            deliverables: createdArtifacts,
-            evidence: {
-              tests_run: [],
-              command_results: [],
-              files_changed: createdArtifacts.length
-            },
-            roadblocks: [
-              {
-                type: "policy_denied",
-                description: writeResult.decision.message
-              }
-            ],
-            learnings: llmResult.output.learnings
-          });
-          await repo.appendRunEvent(run.id, "run.failed", "error", {
-            reason: "policy_denied"
-          });
-          process.exitCode = 1;
-          return;
-        }
-
-        continue;
-      }
-
-      await repo.createArtifact({
-        runId: run.id,
-        taskId: task.id,
-        artifactType: artifact.artifact_type ?? "markdown",
-        path: writeResult.absolutePath,
-        metadataJson: {
-          label: artifact.label ?? artifact.path
-        }
-      });
-      await repo.appendRunEvent(run.id, "artifact.created", "info", {
-        path: writeResult.absolutePath,
-        artifact_type: artifact.artifact_type ?? "markdown"
-      });
-      createdArtifacts.push(artifact.path);
-    }
-
-    for (const testCommand of contractJson.success_criteria.required_test_commands) {
-      const parts = testCommand.trim().split(/\s+/).filter(Boolean);
-      const commandName = parts[0] ?? "echo";
-      const args = parts.slice(1);
-
-      await trackToolCall({
-        tool: "command",
-        command: commandName,
-        args,
-        purpose: "required_test_command"
-      });
-
-      const result = await command.run(commandName, args, workspaceRoot);
-      commandResults.push(commandEvidence(testCommand, result));
-
-      if (!result.ok) {
-        await repo.appendRunEvent(run.id, "policy.denied", "warn", {
-          reason: result.decision.reason,
-          message: result.decision.message,
-          command: testCommand
-        });
-        testsRun.push({
-          command: testCommand,
-          denied: true
-        });
-        continue;
-      }
-
-      await repo.appendRunEvent(run.id, "tool.result", "info", {
-        command: testCommand,
-        exit_code: result.exitCode,
-        stdout: result.stdout.trim(),
-        stderr: result.stderr.trim(),
-        duration_ms: result.durationMs
-      });
-      testsRun.push({
-        command: testCommand,
-        exit_code: result.exitCode
-      });
-    }
-
-    await repo.appendRunEvent(run.id, "run.final_payload", "info", {
-      status: "completed",
-      summary: llmResult.output.summary,
-      deliverables: createdArtifacts,
-      evidence: {
-        tests_run: testsRun,
-        command_results: commandResults,
-        files_changed: createdArtifacts.length
+      systemPrompt: prompts.systemPrompt,
+      userPrompt: prompts.userPrompt,
+      contract: contractJson,
+      workspaceRoot,
+      skillRegistry,
+      startedAtMs: run.started_at ? Date.parse(run.started_at) : undefined,
+      createMessage: (systemPrompt, messages, tools) =>
+        llmClient.createMessage(systemPrompt, messages, tools),
+      executeToolUse: async (block) =>
+        executeToolUse({
+          block,
+          workspaceRoot,
+          requiredTestCommands: new Set(contractJson.success_criteria.required_test_commands),
+          deps: {
+            readFile: (targetPath) => filesystem.readFile(targetPath),
+            writeFile: (targetPath, content) => filesystem.writeFile(targetPath, content),
+            listDirectory: (targetPath) => filesystem.listDirectory(targetPath),
+            runCommand: (commandName, args, cwd, timeoutMs) =>
+              command.run(commandName, args, cwd, timeoutMs)
+          },
+          persistence: {
+            appendRunEvent: (eventType, level, payload) =>
+              repo.appendRunEvent(
+                run.id,
+                eventType as RunEventType,
+                level,
+                payload
+              ).then(() => undefined),
+            createArtifact: (params) =>
+              repo.createArtifact({
+                runId: run.id,
+                taskId: task.id,
+                artifactType: params.artifactType,
+                path: params.path,
+                metadataJson: params.metadataJson
+              })
+          },
+          skillRegistry,
+          skillExecutionContext,
+          emailAdapter,
+          emailSendPolicy,
+          slackAdapter,
+          slackSendPolicy: {
+            maxSends:
+              Number.isFinite(Number(process.env.SALVO_SLACK_MAX_SENDS_PER_RUN))
+                ? Math.max(1, Math.floor(Number(process.env.SALVO_SLACK_MAX_SENDS_PER_RUN)))
+                : 3,
+            sendsUsed: 0
+          }
+        }),
+      appendRunEvent: (eventType, level, payload) =>
+        repo.appendRunEvent(
+          run.id,
+          eventType as RunEventType,
+          level,
+          payload
+        ).then(() => undefined),
+      loadCheckpoint: async () => {
+        const state = await repo.loadRunCheckpoint(run.id, agentLoopCheckpointKey);
+        return state as import("./agent-loop").AgentLoopCheckpointState | null;
       },
-      roadblocks: [],
-      learnings: llmResult.output.learnings
+      saveCheckpoint: (state) =>
+        repo.saveRunCheckpoint(run.id, agentLoopCheckpointKey, state).then(() => undefined),
+      deleteCheckpoint: () =>
+        repo.deleteRunCheckpoint(run.id, agentLoopCheckpointKey)
     });
-    logger.info("run completed", {
-      task_id: task.id,
-      deliverables: createdArtifacts
-    });
+
+    const finalLevel = loopResult.finalPayload.status === "completed" ? "info" : "error";
+    await repo.deleteRunCheckpoint(run.id, agentLoopCheckpointKey);
+    await repo.appendRunEvent(run.id, "run.final_payload", finalLevel, loopResult.finalPayload);
+    if (loopResult.finalPayload.status !== "completed") {
+      await repo.appendRunEvent(run.id, "run.failed", "error", {
+        reason: loopResult.exitReason
+      });
+      process.exitCode = 1;
+    } else {
+      logger.info("run completed", {
+        task_id: task.id,
+        deliverables: loopResult.finalPayload.deliverables
+      });
+    }
+    return;
   } catch (error) {
     logger.error("run failed", {
       task_id: task.id,

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
   getArtifactPreview,
@@ -6,11 +6,27 @@ import {
   getRunDetail,
   getRunEvents,
   openArtifactContent,
-  createRunEventStream,
   type ApiArtifactPreview,
   type ApiRunDetail,
   type ApiRunEvent
 } from "../api/control-plane";
+
+const TIMELINE_CATEGORY_ORDER: Array<"tool" | "policy" | "artifact" | "heartbeat" | "other"> = [
+  "tool",
+  "policy",
+  "artifact",
+  "heartbeat",
+  "other"
+];
+
+const TIMELINE_CATEGORY_LABELS: Record<string, string> = {
+  tool: "Tool calls & results",
+  policy: "Policy guards",
+  artifact: "Artifact tracking",
+  heartbeat: "Daemon heartbeats",
+  other: "Miscellaneous events"
+};
+
 
 export function RunDetailPage() {
   const params = useParams<{ runId: string }>();
@@ -25,10 +41,36 @@ export function RunDetailPage() {
   const [previewBusy, setPreviewBusy] = useState<Record<string, boolean>>({});
   const [error, setError] = useState<string | null>(null);
   const artifactContentUrlsRef = useRef<Record<string, string>>({});
-  const streamRef = useRef<EventSource | null>(null);
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const lastSequenceRef = useRef<number | null>(null);
   const detailRef = useRef<ApiRunDetail | null>(null);
+
+  const timelineGroups = useMemo(() => {
+    const categoryMap = new Map<
+      "tool" | "policy" | "artifact" | "heartbeat" | "other",
+      ApiRunEvent[]
+    >();
+    for (const event of events) {
+      const category = getTimelineCategory(event.event_type);
+      const bucket = categoryMap.get(category) ?? [];
+      bucket.push(event);
+      categoryMap.set(category, bucket);
+    }
+    return Array.from(categoryMap.entries())
+      .map(([category, items]) => ({
+        category,
+        events: items.slice().sort((a, b) => a.sequence_no - b.sequence_no)
+      }))
+      .sort((a, b) => TIMELINE_CATEGORY_ORDER.indexOf(a.category) - TIMELINE_CATEGORY_ORDER.indexOf(b.category));
+  }, [events]);
+
+  const toolEvents = useMemo(() => {
+    return events
+      .filter((event) => getTimelineCategory(event.event_type) === "tool")
+      .slice()
+      .sort((a, b) => b.sequence_no - a.sequence_no)
+      .slice(0, 4);
+  }, [events]);
 
   useEffect(() => {
     artifactContentUrlsRef.current = artifactContentUrls;
@@ -131,98 +173,55 @@ export function RunDetailPage() {
 
   useEffect(() => {
     if (!runId) {
-      streamRef.current?.close();
-      streamRef.current = null;
       setStreamActive(false);
       return;
     }
 
     let active = true;
-    const source = createRunEventStream(runId);
-    streamRef.current = source;
-    setStreamActive(false);
+    let intervalId: number | null = null;
+    setStreamActive(true);
     setStreamError(null);
 
-    const handleOpen = () => {
-      if (!active) {
-        return;
-      }
-      setStreamActive(true);
-    };
-
-    const refreshEvents = async () => {
+    const refreshLiveState = async () => {
       try {
-        const nextEvents = await getRunEvents(runId);
+        const [nextEvents, nextDetail] = await Promise.all([
+          getRunEvents(runId),
+          getRunDetail(runId)
+        ]);
         if (!active) {
           return;
         }
         setEvents(nextEvents);
+        setDetail(nextDetail);
         lastSequenceRef.current = nextEvents[nextEvents.length - 1]?.sequence_no ?? null;
-      } catch (eventsError) {
+        setStreamActive(true);
+        setStreamError(null);
+        if (isTerminalRunStatus(nextDetail.run.status)) {
+          setStreamActive(false);
+          if (intervalId !== null) {
+            window.clearInterval(intervalId);
+            intervalId = null;
+          }
+        }
+      } catch (pollError) {
         if (!active) {
           return;
         }
-        setStreamError((eventsError as Error).message);
+        setStreamActive(false);
+        setStreamError((pollError as Error).message);
       }
     };
 
-    const handleMessage = async (event: MessageEvent) => {
-      if (!active) {
-        return;
-      }
-      try {
-        const payload = JSON.parse(event.data) as {
-          last_sequence?: number | null;
-          run_status?: string | null;
-        };
-        const nextSequence = payload.last_sequence ?? null;
-        if (nextSequence && nextSequence !== lastSequenceRef.current) {
-          lastSequenceRef.current = nextSequence;
-          await refreshEvents();
-        }
-        const incomingStatus = payload.run_status;
-        if (incomingStatus && incomingStatus !== detailRef.current?.run.status) {
-          try {
-            const updatedDetail = await getRunDetail(runId);
-            if (!active) {
-              return;
-            }
-            setDetail(updatedDetail);
-          } catch (detailError) {
-            if (!active) {
-              return;
-            }
-            setError((detailError as Error).message);
-          }
-        }
-        if (incomingStatus && isTerminalRunStatus(incomingStatus)) {
-          source.close();
-          setStreamActive(false);
-        }
-      } catch {
-        // Ignore malformed server payloads
-      }
-    };
-
-    const handleError = () => {
-      if (!active) {
-        return;
-      }
-      setStreamActive(false);
-      setStreamError("Live stream disconnected.");
-    };
-
-    source.addEventListener("open", handleOpen);
-    source.addEventListener("message", handleMessage);
-    source.addEventListener("error", handleError);
+    void refreshLiveState();
+    intervalId = window.setInterval(() => {
+      void refreshLiveState();
+    }, 2_000);
 
     return () => {
       active = false;
-      source.removeEventListener("open", handleOpen);
-      source.removeEventListener("message", handleMessage);
-      source.removeEventListener("error", handleError);
-      source.close();
-      streamRef.current = null;
+      if (intervalId !== null) {
+        window.clearInterval(intervalId);
+      }
       setStreamActive(false);
     };
   }, [runId]);
@@ -246,6 +245,34 @@ export function RunDetailPage() {
     return <p className="error-banner">Missing run ID.</p>;
   }
 
+  const evaluationState = detail?.evaluation
+    ? detail.evaluation.passed
+      ? "pass"
+      : detail.evaluation.hard_fail_reason
+      ? "fail"
+      : "warn"
+    : "pending";
+  const contractJson = detail?.contract.contract_json as Record<string, unknown> | undefined;
+  const contractCategory = contractJson
+    ?
+        readContractField(contractJson, "contract_category") ??
+        readContractField(contractJson, "category") ??
+        readContractField(contractJson, "family") ??
+        "-"
+    : "-";
+  const contractSubcategory = contractJson
+    ?
+        readContractField(contractJson, "contract_subcategory") ??
+        readContractField(contractJson, "subcategory") ??
+        "-"
+    : "-";
+  const contractFamilyKey = contractJson
+    ?
+        readContractField(contractJson, "contract_family_key") ??
+        readContractField(contractJson, "family_key") ??
+        "-"
+    : "-";
+
   return (
     <div className="content clip-card">
       <header className="content-header">
@@ -266,181 +293,261 @@ export function RunDetailPage() {
 
       {detail ? (
         <>
-          <section className="panel">
-            <h2>Status</h2>
-            <p>
-              Run: <strong>{detail.run.status}</strong>
-            </p>
-            <p>
-              Task: <strong>{detail.task.status}</strong>
-            </p>
-            <p>
-              Attempt: <strong>{detail.run.attempt_no}</strong>
-            </p>
+          <section className="panel run-overview-panel">
+            <div className="panel-header">
+              <h2>Run Overview</h2>
+              <p className="muted">Operational metadata for this execution.</p>
+            </div>
+            <div className="run-overview-grid">
+              <div>
+                <p className="muted">Run status</p>
+                <span className={`run-status-chip run-status-${detail.run.status?.toLowerCase() ?? "unknown"}`}>
+                  {detail.run.status}
+                </span>
+              </div>
+              <div>
+                <p className="muted">Task status</p>
+                <strong>{detail.task.status}</strong>
+              </div>
+              <div>
+                <p className="muted">Attempt</p>
+                <strong>{detail.run.attempt_no}</strong>
+              </div>
+              <div>
+                <p className="muted">Started</p>
+                <strong>{new Date(detail.run.created_at).toLocaleString()}</strong>
+              </div>
+              <div>
+                <p className="muted">Risk</p>
+                <strong>{detail.contract.risk}</strong>
+              </div>
+            </div>
           </section>
 
-          <section className="panel">
-            <h2>Contract</h2>
-            <p>
-              Contract ID: <span className="mono">{detail.contract.id}</span>
-            </p>
-            <p>
-              Risk: <strong>{detail.contract.risk}</strong>
-            </p>
-            <pre className="json-block">{JSON.stringify(detail.contract.contract_json, null, 2)}</pre>
+          <section className="panel contract-panel">
+            <div className="panel-header">
+              <h2>Contract</h2>
+              <span className="muted mono">{detail.contract.id}</span>
+            </div>
+            <div className="contract-meta-grid">
+              <div>
+                <p className="muted">Category</p>
+                <strong>{contractCategory}</strong>
+              </div>
+              <div>
+                <p className="muted">Subcategory</p>
+                <strong>{contractSubcategory}</strong>
+              </div>
+              <div>
+                <p className="muted">Family key</p>
+                <strong>{contractFamilyKey}</strong>
+              </div>
+            </div>
+            <pre className="json-block contract-json">
+              {JSON.stringify(detail.contract.contract_json, null, 2)}
+            </pre>
           </section>
 
-          <section className="panel">
-            <h2>Evaluation</h2>
+          <section className="panel evaluation-panel">
+            <div className="panel-header">
+              <h2>Evaluation Breakdown</h2>
+            </div>
             {detail.evaluation ? (
-              <>
-                <p>
-                  Outcome: <strong>{detail.evaluation.outcome}</strong>
-                </p>
-                <p>
-                  Score: <strong>{detail.evaluation.score}</strong>
-                </p>
-                <p>
-                  Hard fail reason: {detail.evaluation.hard_fail_reason ?? "none"}
-                </p>
-                <ul>
-                  {detail.evaluation.findings_json.map((finding) => (
-                    <li key={finding}>{finding}</li>
-                  ))}
-                </ul>
-              </>
+              <div className="evaluation-summary">
+                <div className={`evaluation-pill evaluation-pill-${evaluationState}`}>
+                  {evaluationState === "pass"
+                    ? "Passed"
+                    : evaluationState === "fail"
+                    ? "Failed"
+                    : "Pending"}
+                </div>
+                <div className="evaluation-metrics">
+                  <div>
+                    <p className="muted">Outcome</p>
+                    <strong>{detail.evaluation.outcome}</strong>
+                  </div>
+                  <div>
+                    <p className="muted">Score</p>
+                    <strong>{detail.evaluation.score}</strong>
+                  </div>
+                  <div>
+                    <p className="muted">Hard fail</p>
+                    <span>{detail.evaluation.hard_fail_reason ?? "none"}</span>
+                  </div>
+                </div>
+                <div className="evaluation-findings">
+                  <p className="muted">Findings</p>
+                  <ul>
+                    {detail.evaluation.findings_json.map((finding) => (
+                      <li key={finding}>{finding}</li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
             ) : (
               <p className="muted">Evaluation pending.</p>
             )}
           </section>
 
-          <section className="panel">
+          <section className="panel timeline-panel">
             <div className="panel-header">
-              <h2>Live Timeline</h2>
+              <h2>Operational Timeline</h2>
               <div className={`timeline-state ${streamActive ? "timeline-live" : "timeline-paused"}`}>
                 {streamActive ? "Live" : "Paused"}
                 {streamError ? <span className="muted mono"> — {streamError}</span> : null}
               </div>
             </div>
-            <div className="run-timeline" ref={timelineRef}>
+            <div className="timeline-grid" ref={timelineRef}>
               {events.length === 0 ? (
                 <p className="muted">Listening for run events…</p>
               ) : (
-                events.map((event) => {
-                  const timestamp = new Date(event.created_at).toLocaleTimeString();
-                  const variant = getTimelineCategory(event.event_type);
-                  return (
-                    <article
-                      key={event.id}
-                      className={`run-timeline-entry run-timeline-${variant}`}
-                    >
-                      <header className="run-timeline-entry-meta">
-                        <span className="run-timeline-event-index">#{event.sequence_no}</span>
-                        <span className="run-timeline-event-type">{event.event_type}</span>
-                        <span className="run-timeline-event-level">{event.level}</span>
-                        <span className="run-timeline-event-time">{timestamp}</span>
-                      </header>
-                      <div className="run-timeline-entry-content">
-                        <pre className="json-inline">{JSON.stringify(event.payload_json, null, 2)}</pre>
-                      </div>
-                    </article>
-                  );
-                })
+                timelineGroups.map((group) => (
+                  <div className="timeline-group" key={group.category}>
+                    <header className="timeline-group-header">
+                      <span>{TIMELINE_CATEGORY_LABELS[group.category]}</span>
+                      <span className="muted">{group.events.length} events</span>
+                    </header>
+                    <div className="timeline-group-entries">
+                      {group.events.map((event) => (
+                        <article
+                          key={event.id}
+                          className={`run-timeline-entry run-timeline-${group.category}`}
+                        >
+                          <header className="run-timeline-entry-meta">
+                            <span className="run-timeline-event-index">#{event.sequence_no}</span>
+                            <span className="run-timeline-event-type">{event.event_type}</span>
+                            <span className="run-timeline-event-level">{event.level}</span>
+                            <span className="run-timeline-event-time">
+                              {new Date(event.created_at).toLocaleTimeString()}
+                            </span>
+                          </header>
+                          <div className="run-timeline-entry-content">
+                            <pre className="json-inline">
+                              {JSON.stringify(event.payload_json, null, 2)}
+                            </pre>
+                          </div>
+                        </article>
+                      ))}
+                    </div>
+                  </div>
+                ))
               )}
             </div>
           </section>
 
-          <section id="proof" className="panel">
-            <h2>Proof of Work</h2>
-            <p className="muted">
-              Artifact records and final payload evidence for this run.
-            </p>
+          <section className="panel tool-panel">
+            <div className="panel-header">
+              <h2>Tool call visibility</h2>
+              <p className="muted">Recent tool invocations and outcome payloads.</p>
+            </div>
+            {toolEvents.length === 0 ? (
+              <p className="muted">No tool events yet.</p>
+            ) : (
+              <div className="tool-call-grid">
+                {toolEvents.map((event) => {
+                  const payload = event.payload_json as Record<string, unknown>;
+                  const candidate =
+                    (payload.tool as string) ??
+                    (payload.tool_name as string) ??
+                    (payload.name as string) ??
+                    event.event_type;
+                  const toolSignature = typeof candidate === "string" ? candidate : event.event_type;
+                  const snippet = JSON.stringify(payload, null, 2);
+                  const truncated = snippet.length > 320 ? `${snippet.slice(0, 320)}…` : snippet;
+                  return (
+                    <article className="tool-call-card" key={event.id}>
+                      <header>
+                        <strong>{toolSignature}</strong>
+                        <span className="muted">#{event.sequence_no}</span>
+                      </header>
+                      <div className="tool-call-meta">
+                        <span className="run-timeline-event-time">
+                          {new Date(event.created_at).toLocaleTimeString()}
+                        </span>
+                        <span>{event.level}</span>
+                      </div>
+                      <pre className="json-inline">{truncated}</pre>
+                    </article>
+                  );
+                })}
+              </div>
+            )}
+          </section>
 
+          <section id="proof" className="panel proof-panel">
+            <div className="panel-header">
+              <div>
+                <h2>Proof of Work</h2>
+                <p className="muted">Artifact records and final payload evidence.</p>
+              </div>
+              <span className="muted">{detail.artifacts.length} artifacts</span>
+            </div>
             {detail.artifacts.length === 0 ? (
               <p className="muted">No artifacts recorded.</p>
             ) : (
-              <table className="grid-table">
-                <thead>
-                  <tr>
-                    <th>Artifact</th>
-                    <th>Path</th>
-                    <th>Created</th>
-                    <th>Preview</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {detail.artifacts.map((artifact) => (
-                    <tr key={artifact.id}>
-                      <td>{artifact.artifact_type}</td>
-                      <td className="mono">{artifact.path}</td>
-                      <td>{new Date(artifact.created_at).toLocaleString()}</td>
-                      <td>
-                        <button
-                          type="button"
-                          className="button-link"
-                          onClick={() => {
-                            void onOpenArtifact(artifact.id);
-                          }}
-                        >
-                          Open file
-                        </button>
-                        {" "}
-                        <button
-                          type="button"
-                          className="button-link"
-                          disabled={previewBusy[artifact.id] === true}
-                          onClick={() => {
-                            void loadArtifactPreview(artifact.id);
-                          }}
-                        >
-                          {previewBusy[artifact.id] ? "Loading..." : "Preview"}
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            )}
-
-            {detail.artifacts.map((artifact) => {
-              const preview = artifactPreviews[artifact.id];
-              if (!preview) {
-                return null;
-              }
-
-              return (
-                <article className="proof-preview-card" key={`preview-${artifact.id}`}>
-                  <h3>{artifact.artifact_type} preview</h3>
-                  {preview.kind === "text" ? (
-                    <>
-                      <pre className="json-block">{preview.content}</pre>
-                      {preview.truncated ? (
-                        <p className="muted">Preview truncated to first 64 KB.</p>
+              <div className="artifact-grid">
+                {detail.artifacts.map((artifact) => {
+                  const preview = artifactPreviews[artifact.id];
+                  return (
+                    <article className="artifact-card" key={artifact.id}>
+                      <header className="artifact-card-header">
+                        <div>
+                          <p className="muted">{artifact.artifact_type}</p>
+                          <strong className="mono">{artifact.path}</strong>
+                        </div>
+                        <div className="artifact-card-actions">
+                          <button
+                            type="button"
+                            className="button-link"
+                            onClick={() => {
+                              void onOpenArtifact(artifact.id);
+                            }}
+                          >
+                            Open file
+                          </button>
+                          <button
+                            type="button"
+                            className="button-link"
+                            disabled={previewBusy[artifact.id] === true}
+                            onClick={() => {
+                              void loadArtifactPreview(artifact.id);
+                            }}
+                          >
+                            {previewBusy[artifact.id] ? "Loading..." : "Preview"}
+                          </button>
+                        </div>
+                      </header>
+                      <p className="muted">{new Date(artifact.created_at).toLocaleString()}</p>
+                      {preview ? (
+                        <div className="artifact-preview">
+                          {preview.kind === "text" ? (
+                            <pre className="json-inline">{preview.content}</pre>
+                          ) : null}
+                          {preview.kind === "image" ? (
+                            <img
+                              src={artifactContentUrls[artifact.id]}
+                              alt={`Artifact ${artifact.id}`}
+                              className="artifact-preview-image"
+                            />
+                          ) : null}
+                          {preview.kind === "binary" ? (
+                            <p className="muted">Binary artifact. Use Open file to inspect.</p>
+                          ) : null}
+                        </div>
                       ) : null}
-                    </>
-                  ) : null}
-                  {preview.kind === "image" ? (
-                    <img
-                      src={artifactContentUrls[artifact.id]}
-                      alt={`Artifact ${artifact.id}`}
-                      className="proof-preview-image"
-                    />
-                  ) : null}
-                  {preview.kind === "binary" ? (
-                    <p className="muted">
-                      Binary artifact. Use Open file to inspect.
-                    </p>
-                  ) : null}
-                </article>
-              );
-            })}
-
-            <h3>Final Payload</h3>
-            {detail.final_payload ? (
-              <pre className="json-block">{JSON.stringify(detail.final_payload, null, 2)}</pre>
-            ) : (
-              <p className="muted">Final payload not available.</p>
+                    </article>
+                  );
+                })}
+              </div>
             )}
+            <div className="final-payload-card">
+              <h3>Final Payload</h3>
+              {detail.final_payload ? (
+                <pre className="json-block">{JSON.stringify(detail.final_payload, null, 2)}</pre>
+              ) : (
+                <p className="muted">Final payload not available.</p>
+              )}
+            </div>
           </section>
 
           <section className="panel">
@@ -495,4 +602,9 @@ function getTimelineCategory(eventType: string): "tool" | "policy" | "artifact" 
     return "heartbeat";
   }
   return "other";
+}
+
+function readContractField(obj: Record<string, unknown>, key: string): string | undefined {
+  const value = obj[key];
+  return typeof value === "string" ? value : undefined;
 }

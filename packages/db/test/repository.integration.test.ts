@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Pool } from "pg";
 import { randomUUID } from "node:crypto";
+import type { AgentProfile, TaskPriority } from "@salvo/shared";
 import { SalvoRepository } from "../src/repository";
 
 const databaseUrl = process.env.SALVO_TEST_DATABASE_URL ?? process.env.SALVO_DATABASE_URL;
@@ -33,11 +34,14 @@ if (!databaseUrl) {
         public.salvo_research_findings,
         public.salvo_research_experiments,
         public.salvo_research_ingestions,
-        public.salvo_research_documents,
-        public.salvo_evaluations,
-        public.salvo_artifacts,
-        public.salvo_run_events,
-        public.salvo_runs,
+      public.salvo_research_documents,
+      public.salvo_leads,
+      public.salvo_workspace_tool_policies,
+      public.salvo_evaluations,
+      public.salvo_artifacts,
+      public.salvo_run_events,
+      public.salvo_run_checkpoints,
+      public.salvo_runs,
         public.salvo_contracts,
         public.salvo_task_chat_messages,
         public.salvo_task_chat_sessions,
@@ -97,13 +101,15 @@ if (!databaseUrl) {
     await repo.close();
   });
 
+
   test("claim semantics: two workers cannot claim the same queued task", async () => {
     const workspace = await repo.ensureWorkspace(`claim-${randomUUID()}`, process.cwd());
     const task = await repo.createTask({
       workspaceId: workspace.id,
       title: "only once",
       request: "claim me",
-      requiresApproval: false
+      requiresApproval: false,
+      priority: "urgent"
     });
 
     const [workerA, workerB] = await Promise.all([
@@ -114,6 +120,39 @@ if (!databaseUrl) {
     const claimed = [workerA, workerB].filter(Boolean);
     assert.equal(claimed.length, 1);
     assert.equal(claimed[0]?.id, task.id);
+    assert.equal(claimed[0]?.priority, "urgent");
+  });
+
+  test("claimNextTask honors priority order before created_at", async () => {
+    const workspace = await repo.ensureWorkspace(`priority-${randomUUID()}`, process.cwd());
+    const priorities: Array<{ label: string; priority: TaskPriority }> = [
+      { label: "task-low", priority: "low" },
+      { label: "task-med", priority: "medium" },
+      { label: "task-high", priority: "high" },
+      { label: "task-urgent", priority: "urgent" }
+    ];
+
+    await Promise.all(
+      priorities.map(({ label, priority }) =>
+        repo.createTask({
+          workspaceId: workspace.id,
+          title: `priority ${label}`,
+          request: `run ${label}`,
+          priority
+        })
+      )
+    );
+
+    const expected = ["urgent", "high", "medium", "low"];
+    const actual: string[] = [];
+
+    for (let i = 0; i < expected.length; i += 1) {
+      const claimed = await repo.claimNextTask(`worker-priority-${i}`);
+      assert.ok(claimed, "expected a task to be claimed");
+      actual.push(claimed?.priority ?? "");
+    }
+
+    assert.deepEqual(actual, expected);
   });
 
   test("tasks with pending dependencies block with the provided reason", async () => {
@@ -652,6 +691,102 @@ if (!databaseUrl) {
     assert.equal(familyAlpha[0].review_status, "accepted");
   });
 
+  test("relevant memory retrieval combines family bias with semantic match", async () => {
+    const workspace = await repo.ensureWorkspace(`memory-search-${randomUUID()}`, process.cwd());
+
+    await repo.createMemory({
+      workspaceId: workspace.id,
+      sourceRunIds: [randomUUID()],
+      contractFamilyKey: "family-hvac",
+      memoryType: "research_experiment",
+      title: "HVAC family baseline",
+      summary: "Family-specific baseline guidance.",
+      bodyMarkdown: "General advice for HVAC family work.",
+      tags: ["hvac"],
+      confidence: 0.55,
+      reviewStatus: "accepted"
+    });
+
+    await repo.createMemory({
+      workspaceId: workspace.id,
+      sourceRunIds: [randomUUID()],
+      contractFamilyKey: "family-ops",
+      memoryType: "research_experiment",
+      title: "Dispatch urgency wording",
+      summary: "Emergency HVAC dispatch messaging converts better.",
+      bodyMarkdown: "Use emergency dispatch wording for after-hours HVAC repairs and quote requests.",
+      tags: ["dispatch", "hvac", "after-hours"],
+      confidence: 0.9,
+      reviewStatus: "accepted"
+    });
+
+    await repo.createMemory({
+      workspaceId: workspace.id,
+      sourceRunIds: [randomUUID()],
+      contractFamilyKey: "family-random",
+      memoryType: "research_experiment",
+      title: "Unrelated memory",
+      summary: "Completely different gardening content.",
+      bodyMarkdown: "Seasonal pruning guidance for shade perennials and soil moisture management.",
+      tags: ["gardening"],
+      confidence: 1,
+      reviewStatus: "accepted"
+    });
+
+    const promptContext = await repo.listRelevantMemoryPromptContext(
+      workspace.id,
+      "Need an HVAC emergency dispatch follow-up plan for after-hours repair leads.",
+      "family-hvac",
+      5
+    );
+    const referenceContext = await repo.listRelevantMemoryContext(
+      workspace.id,
+      "Need an HVAC emergency dispatch follow-up plan for after-hours repair leads.",
+      "family-hvac",
+      5
+    );
+
+    assert.equal(promptContext.length, 2);
+    assert.equal(promptContext[0]?.title, "HVAC family baseline");
+    assert.equal(promptContext[1]?.title, "Dispatch urgency wording");
+    assert.deepEqual(
+      referenceContext.map((entry) => entry.id),
+      promptContext.map((entry) => entry.id)
+    );
+  });
+
+  test("lead funnel metrics count actual stage timestamps", async () => {
+    const workspace = await repo.ensureWorkspace(`lead-metrics-${randomUUID()}`, process.cwd());
+    await repo.upsertLeadRecord({
+      workspaceId: workspace.id,
+      leadKey: "lead-one",
+      rowContext: {
+        company: "Northwind",
+        contact: "Casey"
+      },
+      scrapedAt: new Date(),
+      qualifiedAt: new Date()
+    });
+    await repo.upsertLeadRecord({
+      workspaceId: workspace.id,
+      leadKey: "lead-two",
+      rowContext: {
+        company: "Contoso",
+        contact: "Jordan"
+      },
+      scrapedAt: new Date(),
+      qualifiedAt: new Date(),
+      contactedAt: new Date(),
+      convertedAt: new Date()
+    });
+
+    const metrics = await repo.listLeadFunnelMetrics(workspace.id);
+    assert.equal(metrics.scraped_count, 2);
+    assert.equal(metrics.qualified_count, 2);
+    assert.equal(metrics.contacted_count, 1);
+    assert.equal(metrics.converted_count, 1);
+  });
+
   test("accepted experiment publishing creates linked memory and exposes it in contract memory context", async () => {
     const workspace = await repo.ensureWorkspace(`publish-${randomUUID()}`, process.cwd());
     const sourceRunIds = [randomUUID(), randomUUID(), randomUUID()];
@@ -804,6 +939,37 @@ if (!databaseUrl) {
     assert.equal(rows.length, 1);
     assert.equal(rows[0].integration_key, "process");
     assert.equal(rows[0].config_json.command, "pnpm test");
+  });
+
+  test("workspace tool policies can be upserted and listed", async () => {
+    const workspace = await repo.ensureWorkspace(`policy-${randomUUID()}`, process.cwd());
+
+    const saved = await repo.upsertWorkspaceToolPolicy({
+      workspaceId: workspace.id,
+      policyJson: {
+        allowedReadPaths: [".", "packages/shared"],
+        allowedCommands: ["pnpm"],
+        commandTimeoutMs: 12000
+      }
+    });
+    assert.equal(saved.workspace_id, workspace.id);
+
+    const fetched = await repo.getWorkspaceToolPolicy(workspace.id);
+    assert.ok(fetched);
+    assert.equal(fetched?.workspace_id, workspace.id);
+    const fetchedPolicy = fetched?.policy_json as {
+      allowedCommands?: string[];
+      allowedReadPaths?: string[];
+    };
+    assert.equal(fetchedPolicy.allowedCommands?.[0], "pnpm");
+
+    const listed = await repo.listWorkspaceToolPolicies(workspace.id);
+    assert.equal(listed.length, 1);
+    assert.equal(listed[0].workspace_name, workspace.name);
+    const listedPolicy = listed[0].policy_json as {
+      allowedReadPaths?: string[];
+    };
+    assert.equal(listedPolicy.allowedReadPaths?.length, 2);
   });
 
   test("budget status aggregates workspace and family spend from usage events", async () => {
@@ -1010,5 +1176,102 @@ if (!databaseUrl) {
     assert.equal(rows.rows[0].config_json.apiKey, "new-key");
     assert.equal(rows.rows[0].config_json.defaultModel, "gpt-5");
     assert.equal(rows.rows[0].config_json.baseUrl, "https://legacy.example/v1");
+  });
+
+  test("run checkpoint lifecycle persists state and cleans up", async () => {
+    const { run } = await createBasicRun();
+    const checkpoint = { step: "planning", updated_by: "runner" };
+
+    const saved = await repo.saveRunCheckpoint(run.id, "progress", checkpoint);
+    assert.equal(saved.run_id, run.id);
+    assert.equal(saved.checkpoint_key, "progress");
+
+    const loaded = await repo.loadRunCheckpoint(run.id, "progress");
+    assert.deepEqual(loaded, checkpoint);
+
+    const updatedCheckpoint = { step: "complete", updated_by: "orchestrator" };
+    await repo.saveRunCheckpoint(run.id, "progress", updatedCheckpoint);
+    const refreshed = await repo.loadRunCheckpoint(run.id, "progress");
+    assert.deepEqual(refreshed, updatedCheckpoint);
+
+    await repo.deleteRunCheckpoint(run.id, "progress");
+    const removed = await repo.loadRunCheckpoint(run.id, "progress");
+    assert.equal(removed, null);
+  });
+
+  test("listAgentPerformanceSignals summarizes agent profiles by workspace", async () => {
+    const workspace = await repo.ensureWorkspace(`signals-${randomUUID()}`, process.cwd());
+    const task = await repo.createTask({
+      workspaceId: workspace.id,
+      title: "signal task",
+      request: "analyze agents",
+      requiresApproval: false
+    });
+    const contract = await repo.createContract({
+      taskId: task.id,
+      risk: "low",
+      status: "active",
+      contractJson: {
+        family_key: "routing-family",
+        category: "quality"
+      }
+    });
+
+    async function createCompletedRun(
+      agentProfile: AgentProfile,
+      score: number,
+      passed: boolean,
+      cost: number,
+      endedOffsetMs: number
+    ) {
+      const run = await repo.createRun({
+        taskId: task.id,
+        contractId: contract.id,
+        agentProfile,
+        workerId: `worker-${agentProfile}-${randomUUID()}`
+      });
+      await repo.transitionRunStatus(run.id, "starting");
+      await repo.transitionRunStatus(run.id, "running");
+      await repo.transitionRunStatus(run.id, "evaluating");
+      const endedAt = new Date(Date.now() - endedOffsetMs);
+      await repo.transitionRunStatus(run.id, "completed", { endedAt });
+      await repo.recordEvaluation({
+        runId: run.id,
+        contractId: contract.id,
+        passed,
+        score,
+        outcome: passed ? "passed" : "failed",
+        findings: []
+      });
+      await repo.appendRunEvent(run.id, "usage.reported", "info", {
+        cost_usd: cost,
+        model: "test-model"
+      });
+      return run;
+    }
+
+    await createCompletedRun("builder", 80, true, 0.6, 3000);
+    await createCompletedRun("builder", 60, false, 0.9, 5000);
+    await createCompletedRun("researcher", 95, true, 0.25, 1000);
+
+    const signals = await repo.listAgentPerformanceSignals(workspace.id, 10);
+    assert.equal(signals.length, 2);
+
+    const researcherSignal = signals[0];
+    assert.equal(researcherSignal.agentProfile, "researcher");
+    assert.equal(researcherSignal.contractFamilyKey, "routing-family");
+    assert.equal(researcherSignal.contractCategory, "quality");
+    assert.equal(researcherSignal.runCount, 1);
+    assert.equal(researcherSignal.avgScore, 95);
+    assert.equal(researcherSignal.passRate, 1);
+    assert.equal(researcherSignal.avgCostUsd, 0.25);
+    assert.ok(researcherSignal.lastUsedAt);
+
+    const builderSignal = signals.find((entry) => entry.agentProfile === "builder");
+    assert.ok(builderSignal);
+    assert.equal(builderSignal?.runCount, 2);
+    assert.equal(builderSignal?.avgScore, 70);
+    assert.equal(builderSignal?.passRate, 0.5);
+    assert.equal(builderSignal?.avgCostUsd, 0.75);
   });
 }

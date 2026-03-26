@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import type { Pool, PoolClient, QueryResultRow } from "pg";
 import {
   AGENT_PROFILES,
+  type ContractCategory,
+  DEFAULT_TASK_PRIORITY,
   DEFAULT_AGENT_TRUST_TIER_BY_PROFILE,
   assertRunTransition,
   assertTaskTransition,
@@ -37,6 +39,8 @@ import type {
   DbAgentTrustTier,
   DbBudgetLimit,
   DbBudgetStatus,
+  DbLeadFunnelMetrics,
+  DbLeadRecord,
   DbSkillSetting,
   DbSkillUsage,
   DbContractMemoryContext,
@@ -45,6 +49,8 @@ import type {
   DbIntegrationKey,
   DbRun,
   DbRunSummary,
+  DbRunCheckpoint,
+  DbWorkspaceToolPolicy,
   DbLeadRunChain,
   DbRunEvent,
   DbTask,
@@ -54,7 +60,8 @@ import type {
   TaskDependencyStatus,
   TaskChatProposal,
   ResearchIngestionCandidate,
-  RecordEvaluationInput
+  RecordEvaluationInput,
+  AgentPerformanceSignal
 } from "./types";
 
 const TERMINAL_RUN_STATUSES = new Set<RunStatus>([
@@ -74,6 +81,14 @@ const CANCELLABLE_RUN_STATUSES = new Set<RunStatus>([
 ]);
 
 const LEAD_AGENT_PROFILES: AgentProfile[] = ["lead_scraper", "lead_strategist"];
+
+const TASK_PRIORITY_ORDER_SQL = `case priority
+    when 'urgent' then 1
+    when 'high' then 2
+    when 'medium' then 3
+    when 'low' then 4
+    else 5
+  end`;
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -444,9 +459,10 @@ export class SalvoRepository {
          normalized_request,
          status,
          requires_approval,
-         preferred_agent_profile
+         preferred_agent_profile,
+         priority
        )
-       values ($1, $2, $3, $4, 'queued', $5, $6)
+       values ($1, $2, $3, $4, 'queued', $5, $6, $7)
        returning *`,
       [
         workspaceId,
@@ -454,7 +470,8 @@ export class SalvoRepository {
         request,
         normalized,
         input.requiresApproval ?? false,
-        input.preferredAgentProfile ?? null
+        input.preferredAgentProfile ?? null,
+        input.priority ?? DEFAULT_TASK_PRIORITY
       ]
     );
 
@@ -512,6 +529,66 @@ export class SalvoRepository {
     return result.rows;
   }
 
+  async listWorkspaceToolPolicies(workspaceId?: string): Promise<
+    Array<
+      DbWorkspaceToolPolicy & {
+        workspace_name: string;
+      }
+    >
+  > {
+    const result = await this.pool.query<
+      DbWorkspaceToolPolicy & {
+        workspace_name: string;
+      }
+    >(
+      `select
+         policies.id,
+         policies.workspace_id,
+         workspaces.name as workspace_name,
+         policies.policy_json,
+         policies.created_at,
+         policies.updated_at
+       from public.salvo_workspace_tool_policies policies
+       join public.salvo_workspaces workspaces on workspaces.id = policies.workspace_id
+       where ($1::uuid is null or policies.workspace_id = $1)
+       order by workspaces.name asc`,
+      [workspaceId ?? null]
+    );
+
+    return result.rows;
+  }
+
+  async getWorkspaceToolPolicy(workspaceId: string): Promise<DbWorkspaceToolPolicy | null> {
+    const result = await this.pool.query<DbWorkspaceToolPolicy>(
+      `select *
+       from public.salvo_workspace_tool_policies
+       where workspace_id = $1
+       limit 1`,
+      [workspaceId]
+    );
+    return result.rows[0] ?? null;
+  }
+
+  async upsertWorkspaceToolPolicy(input: {
+    workspaceId: string;
+    policyJson: Record<string, unknown>;
+  }): Promise<DbWorkspaceToolPolicy> {
+    const result = await this.pool.query<DbWorkspaceToolPolicy>(
+      `insert into public.salvo_workspace_tool_policies (
+         workspace_id,
+         policy_json
+       )
+       values ($1, $2::jsonb)
+       on conflict (workspace_id)
+       do update
+         set policy_json = excluded.policy_json,
+             updated_at = now()
+       returning *`,
+      [input.workspaceId, JSON.stringify(input.policyJson ?? {})]
+    );
+    return this.singleOrThrow(result.rows, "Failed to upsert workspace tool policy.");
+  }
+
   async createLeadRunChain(input: {
     scraperRunId: string;
     strategistTaskId: string;
@@ -528,6 +605,90 @@ export class SalvoRepository {
       [input.scraperRunId, input.strategistTaskId, input.rowContext ?? null]
     );
     return this.singleOrThrow(result.rows, "Failed to create lead run chain.");
+  }
+
+  async upsertLeadRecord(input: {
+    workspaceId: string;
+    leadKey: string;
+    rowContext?: Record<string, unknown> | null;
+    scraperRunId?: string | null;
+    strategistTaskId?: string | null;
+    strategistRunId?: string | null;
+    scrapedAt?: Date | null;
+    qualifiedAt?: Date | null;
+    contactedAt?: Date | null;
+    convertedAt?: Date | null;
+  }): Promise<DbLeadRecord> {
+    const result = await this.pool.query<DbLeadRecord>(
+      `insert into public.salvo_leads (
+         workspace_id,
+         lead_key,
+         row_context,
+         source_scraper_run_id,
+         source_strategist_task_id,
+         source_strategist_run_id,
+         scraped_at,
+         qualified_at,
+         contacted_at,
+         converted_at
+       )
+       values ($1, $2, $3, $4, $5, $6, coalesce($7, now()), $8, $9, $10)
+       on conflict (workspace_id, lead_key)
+       do update
+         set row_context = coalesce(excluded.row_context, row_context),
+             source_scraper_run_id = coalesce(excluded.source_scraper_run_id, source_scraper_run_id),
+             source_strategist_task_id = coalesce(excluded.source_strategist_task_id, source_strategist_task_id),
+             source_strategist_run_id = coalesce(excluded.source_strategist_run_id, source_strategist_run_id),
+             scraped_at = coalesce(excluded.scraped_at, scraped_at),
+             qualified_at = coalesce(excluded.qualified_at, qualified_at),
+             contacted_at = coalesce(excluded.contacted_at, contacted_at),
+             converted_at = coalesce(excluded.converted_at, converted_at),
+             updated_at = now()
+       returning *`,
+      [
+        input.workspaceId,
+        input.leadKey,
+        JSON.stringify(input.rowContext ?? {}),
+        input.scraperRunId ?? null,
+        input.strategistTaskId ?? null,
+        input.strategistRunId ?? null,
+        input.scrapedAt?.toISOString() ?? null,
+        input.qualifiedAt?.toISOString() ?? null,
+        input.contactedAt?.toISOString() ?? null,
+        input.convertedAt?.toISOString() ?? null
+      ]
+    );
+
+    return this.singleOrThrow(result.rows, "Failed to upsert lead record.");
+  }
+
+  async listLeadFunnelMetrics(workspaceId?: string): Promise<DbLeadFunnelMetrics> {
+    const result = await this.pool.query<{
+      scraped_count: string;
+      qualified_count: string;
+      contacted_count: string;
+      converted_count: string;
+      updated_at: string | null;
+    }>(
+      `select
+         count(*) filter (where scraped_at is not null)::integer as scraped_count,
+         count(*) filter (where qualified_at is not null)::integer as qualified_count,
+         count(*) filter (where contacted_at is not null)::integer as contacted_count,
+         count(*) filter (where converted_at is not null)::integer as converted_count,
+         coalesce(max(updated_at), now()) as updated_at
+       from public.salvo_leads
+       where ($1::uuid is null or workspace_id = $1)`,
+      [workspaceId ?? null]
+    );
+
+    const row = result.rows[0];
+    return {
+      scraped_count: Number(row?.scraped_count ?? 0),
+      qualified_count: Number(row?.qualified_count ?? 0),
+      contacted_count: Number(row?.contacted_count ?? 0),
+      converted_count: Number(row?.converted_count ?? 0),
+      updated_at: row?.updated_at ?? new Date().toISOString()
+    };
   }
 
   async findLeadRunChainByScraperRun(scraperRunId: string): Promise<DbLeadRunChain | null> {
@@ -835,12 +996,24 @@ export class SalvoRepository {
     const result = await this.pool.query<DbTask>(
       `select *
        from public.salvo_tasks
-       order by created_at desc
+       order by ${TASK_PRIORITY_ORDER_SQL}, created_at desc
        limit $1`,
       [limit]
     );
 
     return result.rows;
+  }
+
+  async countClaimableTasks(): Promise<number> {
+    const result = await this.pool.query<{ count: string }>(
+      `select count(*)::text as count
+       from public.salvo_tasks
+       where status = 'queued'
+         and cancelled_at is null
+         and (requires_approval = false or approved_at is not null)`
+    );
+
+    return Number(result.rows[0]?.count ?? "0");
   }
 
   async getTask(taskId: string): Promise<DbTask | null> {
@@ -1280,7 +1453,7 @@ export class SalvoRepository {
              where status = 'queued'
                and cancelled_at is null
                and (requires_approval = false or approved_at is not null)
-             order by created_at asc
+             order by ${TASK_PRIORITY_ORDER_SQL}, created_at asc
              for update skip locked
              limit 1
            )
@@ -1433,6 +1606,52 @@ export class SalvoRepository {
     return result.rows;
   }
 
+  async listWorkspaceRecentRuns(
+    workspaceId: string,
+    limit = 8
+  ): Promise<
+    Array<{
+      id: string;
+      task_id: string;
+      status: RunStatus;
+      created_at: string;
+      title: string;
+      contract_family_key: string;
+      contract_category: string;
+      contract_subcategory: string | null;
+    }>
+  > {
+    const result = await this.pool.query<{
+      id: string;
+      task_id: string;
+      status: RunStatus;
+      created_at: string;
+      title: string;
+      contract_family_key: string;
+      contract_category: string;
+      contract_subcategory: string | null;
+    }>(
+      `select
+         r.id,
+         r.task_id,
+         r.status,
+         r.created_at,
+         t.title,
+         coalesce(c.contract_json->>'family_key', concat('legacy_', substring(r.contract_id::text, 1, 12))) as contract_family_key,
+         coalesce(c.contract_json->>'category', 'general') as contract_category,
+         nullif(c.contract_json->>'subcategory', '') as contract_subcategory
+       from public.salvo_runs r
+       join public.salvo_tasks t on t.id = r.task_id
+       left join public.salvo_contracts c on c.id = r.contract_id
+       where t.workspace_id = $1
+       order by r.created_at desc
+       limit $2`,
+      [workspaceId, limit]
+    );
+
+    return result.rows;
+  }
+
   async listLeadRunSummaries(limit = 100): Promise<DbRunSummary[]> {
     const result = await this.pool.query<DbRunSummary>(
       `select
@@ -1531,6 +1750,29 @@ export class SalvoRepository {
     );
   }
 
+  async updateRunExecutionState(
+    runId: string,
+    updates: {
+      runnerPid?: number;
+      heartbeatAt?: Date;
+      startedAt?: Date;
+    }
+  ): Promise<void> {
+    await this.pool.query(
+      `update public.salvo_runs
+       set runner_pid = coalesce($2, runner_pid),
+           heartbeat_at = coalesce($3, heartbeat_at),
+           started_at = coalesce($4, started_at)
+       where id = $1`,
+      [
+        runId,
+        updates.runnerPid ?? null,
+        updates.heartbeatAt?.toISOString() ?? null,
+        updates.startedAt?.toISOString() ?? null
+      ]
+    );
+  }
+
   async appendRunEvent(
     runId: string,
     eventType: RunEventType,
@@ -1622,6 +1864,71 @@ export class SalvoRepository {
     );
 
     return result.rows;
+  }
+
+  async listAgentPerformanceSignals(
+    workspaceId: string,
+    limit = 20
+  ): Promise<AgentPerformanceSignal[]> {
+    const result = await this.pool.query<{
+      workspace_id: string;
+      contract_family_key: string;
+      contract_category: ContractCategory;
+      agent_profile: AgentProfile;
+      run_count: number;
+      avg_score: number;
+      pass_rate: number;
+      avg_cost_usd: number;
+      last_used_at: string | null;
+    }>(
+      `select
+         t.workspace_id,
+         coalesce(c.contract_json->>'family_key', concat('legacy_', substring(c.id::text, 1, 12))) as contract_family_key,
+         coalesce(c.contract_json->>'category', 'general') as contract_category,
+         r.agent_profile,
+         count(*)::integer as run_count,
+         coalesce(avg(e.score)::double precision, 0) as avg_score,
+         coalesce(
+           sum(case when e.passed then 1 else 0 end)::double precision / nullif(count(*), 0),
+           0
+         ) as pass_rate,
+         coalesce(avg(costs.cost_usd), 0) as avg_cost_usd,
+         max(coalesce(r.ended_at, r.updated_at, r.created_at)) as last_used_at
+       from public.salvo_runs r
+       join public.salvo_tasks t on t.id = r.task_id
+       join public.salvo_contracts c on c.id = r.contract_id
+       join public.salvo_evaluations e on e.run_id = r.id
+       left join lateral (
+         select coalesce((payload_json->>'cost_usd')::double precision, 0) as cost_usd
+         from public.salvo_run_events
+         where run_id = r.id
+           and event_type = 'usage.reported'
+         order by sequence_no desc
+         limit 1
+       ) costs on true
+       where t.workspace_id = $1
+         and r.status in ('completed', 'failed', 'blocked')
+       group by
+         t.workspace_id,
+         contract_family_key,
+         contract_category,
+         r.agent_profile
+       order by last_used_at desc nulls last
+       limit $2`,
+      [workspaceId, limit]
+    );
+
+    return result.rows.map((row) => ({
+      workspaceId: row.workspace_id,
+      contractFamilyKey: row.contract_family_key,
+      contractCategory: row.contract_category,
+      agentProfile: row.agent_profile,
+      runCount: Number(row.run_count ?? 0),
+      avgScore: Number(row.avg_score ?? 0),
+      passRate: Number(row.pass_rate ?? 0),
+      avgCostUsd: Number(row.avg_cost_usd ?? 0),
+      lastUsedAt: row.last_used_at ?? null
+    }));
   }
 
   async listBudgetLimits(): Promise<DbBudgetLimit[]> {
@@ -2476,6 +2783,52 @@ export class SalvoRepository {
     return this.singleOrThrow(result.rows, "Failed to record evaluation.");
   }
 
+  async saveRunCheckpoint(
+    runId: string,
+    checkpointKey: string,
+    checkpointState: Record<string, unknown>
+  ): Promise<DbRunCheckpoint> {
+    const result = await this.pool.query<DbRunCheckpoint>(
+      `insert into public.salvo_run_checkpoints (
+         run_id,
+         checkpoint_key,
+         checkpoint_state
+       )
+       values ($1, $2, $3::jsonb)
+       on conflict (run_id, checkpoint_key)
+       do update
+         set checkpoint_state = excluded.checkpoint_state,
+             updated_at = now()
+       returning *`,
+      [runId, checkpointKey, JSON.stringify(checkpointState)]
+    );
+
+    return this.singleOrThrow(result.rows, "Failed to save run checkpoint.");
+  }
+
+  async loadRunCheckpoint(
+    runId: string,
+    checkpointKey: string
+  ): Promise<Record<string, unknown> | null> {
+    const result = await this.pool.query<{ checkpoint_state: Record<string, unknown> }>(
+      `select checkpoint_state
+       from public.salvo_run_checkpoints
+       where run_id = $1
+         and checkpoint_key = $2`,
+      [runId, checkpointKey]
+    );
+    return result.rows[0]?.checkpoint_state ?? null;
+  }
+
+  async deleteRunCheckpoint(runId: string, checkpointKey: string): Promise<void> {
+    await this.pool.query(
+      `delete from public.salvo_run_checkpoints
+       where run_id = $1
+         and checkpoint_key = $2`,
+      [runId, checkpointKey]
+    );
+  }
+
   async getRunFinalPayload(runId: string): Promise<Record<string, unknown> | null> {
     const result = await this.pool.query<{ payload_json: Record<string, unknown> }>(
       `select payload_json
@@ -2880,7 +3233,16 @@ export class SalvoRepository {
     );
   }
 
-  async publishAcceptedResearchExperiment(experimentId: string): Promise<boolean> {
+  async publishAcceptedResearchExperiment(
+    experimentId: string,
+    memoryOverride?: {
+      title: string;
+      summary: string;
+      bodyMarkdown: string;
+      tags: string[];
+      confidence: number;
+    }
+  ): Promise<boolean> {
     return this.withTransaction(async (client) => {
       const experimentResult = await client.query<DbResearchExperiment>(
         `select *
@@ -2896,6 +3258,23 @@ export class SalvoRepository {
       if (experiment.review_status !== "accepted" || experiment.published_at) {
         return false;
       }
+
+      const defaultMemory = {
+        title: `Experiment memory: ${experiment.contract_category}${
+          experiment.contract_subcategory ? `/${experiment.contract_subcategory}` : ""
+        }`,
+        summary: `Deterministic experiment from ${experiment.sample_size} runs (experiment ${experiment.id}).`,
+        bodyMarkdown: experiment.body_markdown,
+        tags: [
+          "research",
+          "experiment",
+          `experiment:${experiment.id}`,
+          `family:${experiment.contract_family_key}`,
+          `category:${experiment.contract_category}`
+        ],
+        confidence: experiment.confidence
+      };
+      const memory = memoryOverride ?? defaultMemory;
 
       const memoryInsertResult = await client.query<{ id: string }>(
         `insert into public.salvo_memories (
@@ -2916,19 +3295,11 @@ export class SalvoRepository {
           experiment.workspace_id,
           experiment.source_run_ids,
           experiment.contract_family_key,
-          `Experiment memory: ${experiment.contract_category}${
-            experiment.contract_subcategory ? `/${experiment.contract_subcategory}` : ""
-          }`,
-          `Deterministic experiment from ${experiment.sample_size} runs (experiment ${experiment.id}).`,
-          experiment.body_markdown,
-          [
-            "research",
-            "experiment",
-            `experiment:${experiment.id}`,
-            `family:${experiment.contract_family_key}`,
-            `category:${experiment.contract_category}`
-          ],
-          experiment.confidence
+          memory.title,
+          memory.summary,
+          memory.bodyMarkdown,
+          memory.tags,
+          memory.confidence
         ]
       );
       const memoryId = this.singleOrThrow(
@@ -3259,6 +3630,121 @@ export class SalvoRepository {
        order by confidence desc, created_at desc
        limit $3`,
       [workspaceId, contractFamilyKey, limit]
+    );
+
+    return result.rows;
+  }
+
+  async listRelevantMemoryPromptContext(
+    workspaceId: string,
+    queryText: string,
+    contractFamilyKey: string | null,
+    limit = 5
+  ): Promise<DbContractMemoryPrompt[]> {
+    const normalizedQuery = queryText.trim().toLowerCase();
+    if (!normalizedQuery) {
+      if (!contractFamilyKey) {
+        return [];
+      }
+      return this.listContractMemoryPromptContext(workspaceId, contractFamilyKey, limit);
+    }
+
+    const result = await this.pool.query<DbContractMemoryPrompt>(
+      `select
+         id,
+         title,
+         summary,
+         body_markdown,
+         confidence,
+         review_status,
+         source_run_ids
+       from (
+         select
+           id,
+           title,
+           summary,
+           body_markdown,
+           confidence,
+           review_status,
+           source_run_ids,
+           created_at,
+           case
+             when contract_family_key is not distinct from $3 then 1
+             else 0
+           end as family_match,
+           greatest(
+             similarity(lower(title), $2),
+             similarity(lower(summary), $2),
+             similarity(lower(body_markdown), $2),
+             similarity(lower(coalesce(array_to_string(tags, ' '), '')), $2),
+             similarity(lower(coalesce(contract_family_key, '')), $2)
+           ) as semantic_score
+         from public.salvo_memories
+         where workspace_id = $1
+           and review_status = 'accepted'
+       ) memories
+       where family_match = 1 or semantic_score >= 0.08
+       order by family_match desc, semantic_score desc, confidence desc, created_at desc
+       limit $4`,
+      [workspaceId, normalizedQuery, contractFamilyKey, limit]
+    );
+
+    return result.rows;
+  }
+
+  async listRelevantMemoryContext(
+    workspaceId: string,
+    queryText: string,
+    contractFamilyKey: string | null,
+    limit = 5
+  ): Promise<DbContractMemoryContext[]> {
+    const normalizedQuery = queryText.trim().toLowerCase();
+    if (!normalizedQuery) {
+      if (!contractFamilyKey) {
+        return [];
+      }
+      return this.listContractMemoryContext(workspaceId, contractFamilyKey, limit);
+    }
+
+    const result = await this.pool.query<DbContractMemoryContext>(
+      `select
+         id,
+         confidence,
+         review_status,
+         source_run_ids,
+         experiment_id
+       from (
+         select
+           id,
+           confidence,
+           review_status,
+           source_run_ids,
+           (
+             select replace(tag, 'experiment:', '')
+             from unnest(tags) as t(tag)
+             where tag like 'experiment:%'
+             limit 1
+           ) as experiment_id,
+           created_at,
+           case
+             when contract_family_key is not distinct from $3 then 1
+             else 0
+           end as family_match,
+           greatest(
+             similarity(lower(title), $2),
+             similarity(lower(summary), $2),
+             similarity(lower(body_markdown), $2),
+             similarity(lower(coalesce(array_to_string(tags, ' '), '')), $2),
+             similarity(lower(coalesce(contract_family_key, '')), $2)
+           ) as semantic_score
+         from public.salvo_memories
+         where workspace_id = $1
+           and review_status = 'accepted'
+       ) memories
+       where family_match = 1 or semantic_score >= 0.08
+       order by family_match desc, semantic_score desc, confidence desc, created_at desc
+       limit $4`,
+      [workspaceId, normalizedQuery, contractFamilyKey, limit]
     );
 
     return result.rows;

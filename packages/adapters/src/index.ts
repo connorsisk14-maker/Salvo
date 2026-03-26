@@ -4,3 +4,4 @@ export * from "./llm-api";
 export * from "./process";
 export * from "./http";
 export * from "./email";
+export * from "./slack";

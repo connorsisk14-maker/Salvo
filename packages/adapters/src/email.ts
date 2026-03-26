@@ -1,6 +1,11 @@
 import nodemailer from "nodemailer";
 import type { SentMessageInfo, Transporter } from "nodemailer";
 import type { Adapter, AdapterHealth, AdapterRunRequest, AdapterRunResult } from "./types";
+import {
+  executeAdapterRunWithReliability,
+  FatalAdapterError,
+  RetryableAdapterError
+} from "./reliability";
 
 export type EmailAdapterConfig = {
   transportUrl?: string;
@@ -61,27 +66,27 @@ export class EmailAdapter implements Adapter {
   }
 
   async run(request: AdapterRunRequest): Promise<AdapterRunResult> {
-    try {
+    return executeAdapterRunWithReliability(this.key, async () => {
       const payload = this.parsePayload(request.payload);
       const transporter = this.ensureTransporter();
       const message = this.buildMessage(payload);
-      const info = await transporter.sendMail(message);
-      return {
-        ok: true,
-        detail: "Email queued for delivery.",
-        output: {
-          messageId: info.messageId,
-          accepted: info.accepted ?? [],
-          rejected: info.rejected ?? [],
-          envelope: info.envelope ?? {}
-        }
-      };
-    } catch (error) {
-      return {
-        ok: false,
-        detail: (error as Error).message
-      };
-    }
+
+      try {
+        const info = await transporter.sendMail(message);
+        return {
+          ok: true,
+          detail: "Email queued for delivery.",
+          output: {
+            messageId: info.messageId,
+            accepted: info.accepted ?? [],
+            rejected: info.rejected ?? [],
+            envelope: info.envelope ?? {}
+          }
+        };
+      } catch (error) {
+        throw new RetryableAdapterError((error as Error).message);
+      }
+    });
   }
 
   private parsePayload(payload: Record<string, unknown>): EmailPayload {
@@ -89,7 +94,7 @@ export class EmailAdapter implements Adapter {
     const text = this.readString(payload, "text");
     const html = this.readString(payload, "html");
     if (!text && !html) {
-      throw new Error("Email payload requires either `text` or `html` content.");
+      throw new FatalAdapterError("Email payload requires either `text` or `html` content.");
     }
 
     return {
@@ -106,7 +111,7 @@ export class EmailAdapter implements Adapter {
   private buildMessage(payload: EmailPayload): nodemailer.SendMailOptions {
     const from = payload.from?.trim() || this.#defaultFrom;
     if (!from) {
-      throw new Error("Email sender address is not configured.");
+      throw new FatalAdapterError("Email sender address is not configured.");
     }
 
     const toList = this.normalizeRecipients(payload.to);
@@ -114,7 +119,7 @@ export class EmailAdapter implements Adapter {
     const bccList = this.normalizeRecipients(payload.bcc);
     const primaryRecipients = toList.length > 0 ? toList : this.#defaultRecipients;
     if (primaryRecipients.length === 0) {
-      throw new Error("Email requires at least one recipient.");
+      throw new FatalAdapterError("Email requires at least one recipient.");
     }
 
     return {
@@ -166,7 +171,7 @@ export class EmailAdapter implements Adapter {
   private readRequiredString(payload: Record<string, unknown>, key: string): string {
     const value = this.readString(payload, key);
     if (!value) {
-      throw new Error(`Email payload requires ${key}.`);
+      throw new FatalAdapterError(`Email payload requires ${key}.`);
     }
     return value;
   }
@@ -185,10 +190,16 @@ export class EmailAdapter implements Adapter {
       return this.#transporter;
     }
     if (!this.#transportUrl) {
-      throw new Error("Email transport URL is not configured.");
+      throw new FatalAdapterError("Email transport URL is not configured.");
     }
-    this.#transporter = nodemailer.createTransport(this.#transportUrl);
-    return this.#transporter;
+
+    try {
+      this.#transporter = nodemailer.createTransport(this.#transportUrl);
+      return this.#transporter;
+    } catch (error) {
+      throw new FatalAdapterError(
+        `Email transport could not be created: ${(error as Error).message}`
+      );
+    }
   }
 }
-

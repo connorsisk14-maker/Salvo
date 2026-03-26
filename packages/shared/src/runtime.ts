@@ -11,6 +11,12 @@ export const TASK_STATUSES = [
 
 export type TaskStatus = (typeof TASK_STATUSES)[number];
 
+export const TASK_PRIORITIES = ["urgent", "high", "medium", "low"] as const;
+
+export type TaskPriority = (typeof TASK_PRIORITIES)[number];
+
+export const DEFAULT_TASK_PRIORITY: TaskPriority = "medium";
+
 export const CONTRACT_STATUSES = [
   "draft",
   "approved",
@@ -201,10 +207,15 @@ export type AgentProfileDefinition = {
       network_access: boolean;
       db_read: boolean;
       db_write: boolean;
+      email_send: boolean;
+      slack_send: boolean;
     };
     constraints: {
       max_runtime_minutes: number;
       max_tool_calls: number;
+      max_total_input_tokens: number;
+      max_total_output_tokens: number;
+      max_total_cost_usd: number;
       forbidden_paths?: string[];
     };
     successCriteriaNote?: string;
@@ -227,11 +238,16 @@ export const AGENT_PROFILE_DEFINITIONS: Record<AgentProfile, AgentProfileDefinit
         install_packages: true,
         network_access: true,
         db_read: true,
-        db_write: true
+        db_write: true,
+        email_send: false,
+        slack_send: false
       },
       constraints: {
         max_runtime_minutes: 30,
-        max_tool_calls: 200
+        max_tool_calls: 200,
+        max_total_input_tokens: 120_000,
+        max_total_output_tokens: 40_000,
+        max_total_cost_usd: 6
       }
     }
   },
@@ -250,11 +266,16 @@ export const AGENT_PROFILE_DEFINITIONS: Record<AgentProfile, AgentProfileDefinit
         install_packages: false,
         network_access: true,
         db_read: true,
-        db_write: false
+        db_write: false,
+        email_send: false,
+        slack_send: false
       },
       constraints: {
         max_runtime_minutes: 20,
-        max_tool_calls: 120
+        max_tool_calls: 120,
+        max_total_input_tokens: 80_000,
+        max_total_output_tokens: 24_000,
+        max_total_cost_usd: 4
       }
     }
   },
@@ -273,11 +294,16 @@ export const AGENT_PROFILE_DEFINITIONS: Record<AgentProfile, AgentProfileDefinit
         install_packages: false,
         network_access: true,
         db_read: true,
-        db_write: false
+        db_write: false,
+        email_send: false,
+        slack_send: false
       },
       constraints: {
         max_runtime_minutes: 18,
-        max_tool_calls: 120
+        max_tool_calls: 120,
+        max_total_input_tokens: 70_000,
+        max_total_output_tokens: 20_000,
+        max_total_cost_usd: 3.5
       }
     }
   },
@@ -296,11 +322,16 @@ export const AGENT_PROFILE_DEFINITIONS: Record<AgentProfile, AgentProfileDefinit
           install_packages: false,
           network_access: true,
           db_read: true,
-          db_write: false
+          db_write: false,
+          email_send: false,
+          slack_send: false
         },
         constraints: {
           max_runtime_minutes: 20,
-          max_tool_calls: 100
+          max_tool_calls: 100,
+          max_total_input_tokens: 60_000,
+          max_total_output_tokens: 18_000,
+          max_total_cost_usd: 3
         }
       }
     },
@@ -320,11 +351,16 @@ export const AGENT_PROFILE_DEFINITIONS: Record<AgentProfile, AgentProfileDefinit
         install_packages: false,
         network_access: true,
         db_read: true,
-        db_write: false
+        db_write: false,
+        email_send: false,
+        slack_send: false
       },
       constraints: {
         max_runtime_minutes: 18,
-        max_tool_calls: 90
+        max_tool_calls: 90,
+        max_total_input_tokens: 60_000,
+        max_total_output_tokens: 18_000,
+        max_total_cost_usd: 3
       },
       successCriteriaNote: "Deliver structured docs with citations and clear next steps."
     }
@@ -345,11 +381,16 @@ export const AGENT_PROFILE_DEFINITIONS: Record<AgentProfile, AgentProfileDefinit
         install_packages: false,
         network_access: true,
         db_read: true,
-        db_write: false
+        db_write: false,
+        email_send: false,
+        slack_send: false
       },
       constraints: {
         max_runtime_minutes: 18,
         max_tool_calls: 100,
+        max_total_input_tokens: 45_000,
+        max_total_output_tokens: 12_000,
+        max_total_cost_usd: 2,
         forbidden_paths: ["/etc", "/usr/local/bin"]
       },
       successCriteriaNote:
@@ -372,11 +413,16 @@ export const AGENT_PROFILE_DEFINITIONS: Record<AgentProfile, AgentProfileDefinit
         install_packages: false,
         network_access: true,
         db_read: true,
-        db_write: false
+        db_write: false,
+        email_send: false,
+        slack_send: false
       },
       constraints: {
         max_runtime_minutes: 22,
         max_tool_calls: 140,
+        max_total_input_tokens: 55_000,
+        max_total_output_tokens: 16_000,
+        max_total_cost_usd: 2.5,
         forbidden_paths: ["/etc", "/usr/local/bin"]
       },
       successCriteriaNote:
@@ -399,11 +445,16 @@ export const AGENT_PROFILE_DEFINITIONS: Record<AgentProfile, AgentProfileDefinit
         install_packages: false,
         network_access: true,
         db_read: true,
-        db_write: false
+        db_write: false,
+        email_send: false,
+        slack_send: false
       },
       constraints: {
         max_runtime_minutes: 15,
         max_tool_calls: 80,
+        max_total_input_tokens: 35_000,
+        max_total_output_tokens: 10_000,
+        max_total_cost_usd: 1.5,
         forbidden_paths: ["/etc", "/usr/local/bin"]
       },
       successCriteriaNote:
@@ -420,9 +471,11 @@ export const RUN_EVENT_TYPES = [
   "tool.result",
   "usage.reported",
   "policy.denied",
+  "resource.limit_reached",
   "artifact.created",
   "roadblock.detected",
   "run.cancel_requested",
+  "run.resumed",
   "evaluation.completed",
   "run.retry_requested",
   "run.final_payload",

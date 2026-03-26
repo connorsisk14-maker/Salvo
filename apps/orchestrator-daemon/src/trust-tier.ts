@@ -43,7 +43,8 @@ export function applyTrustTierPolicy(
         network_access: contract.capabilities.network_access && policy.networkAccess,
         install_packages: contract.capabilities.install_packages && policy.installPackages,
         run_tests: contract.capabilities.run_tests && policy.runTests,
-        db_write: contract.capabilities.db_write && policy.dbWrite
+        db_write: contract.capabilities.db_write && policy.dbWrite,
+        slack_send: contract.capabilities.slack_send && policy.networkAccess
       },
       constraints: {
         ...contract.constraints,

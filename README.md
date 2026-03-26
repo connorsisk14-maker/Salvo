@@ -132,6 +132,7 @@ Control-plane health endpoints:
 - `GET /health/research`
 - `POST /control/restart` with body `{ "target": "orchestrator" | "research" | "all" }`
 - `POST /tasks` accepts `idempotency_key` or `idempotency-key` for 24h replay
+- `POST /tasks` also accepts optional queue `priority` of `urgent`, `high`, `medium`, or `low`
 - `GET /backups/status`, `POST /control/backup` for verified database backups
 - `POST /runs/:id/retry` to re-queue failed/blocked/cancelled run tasks
 - `POST /runs/:id/cancel` (active runs get `run.cancel_requested`; daemon force-cancels and finalizes)
@@ -140,6 +141,8 @@ Control-plane health endpoints:
 - `GET /research/experiments`, `POST /research/experiments/:id/review`
 - `GET /memories`, `POST /memories/:id/review`
 - `GET /stream/overview`, `GET /stream/runs/:id` (SSE polling replacement for dashboard updates)
+
+The orchestrator and research daemons also keep a bounded worker pool of `@salvo/agent-runner` processes. Configure the pool size with `SALVO_MAX_CONCURRENT_RUNNERS` to cap how many runners each daemon starts at once so the host CPU/memory budget stays predictable.
 
 `GET /health` is public. The daemon detail endpoints and control operations require a bearer token from `SALVO_API_TOKEN`. Daemon endpoints are DB-backed via `salvo_daemon_heartbeats` and return `healthy`, `stale`, or `offline`.
 

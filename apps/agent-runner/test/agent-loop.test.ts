@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { buildContractV1 } from "@salvo/contracts";
 import type { LlmResponse, ToolUseBlock, ToolExecutionOutcome } from "@salvo/llm";
-import { runAgentLoop } from "../src/agent-loop";
+import { runAgentLoop, type AgentLoopCheckpointState } from "../src/agent-loop";
 
 function buildContract() {
   return buildContractV1({
@@ -167,6 +167,309 @@ test("runAgentLoop executes multiple tool calls from a single assistant turn", a
   assert.deepEqual(executedTools, ["read_file", "salvo_complete"]);
 });
 
+test("runAgentLoop generates a plan and emits per-step events before completion", async () => {
+  const contract = buildContract();
+  const responses: LlmResponse[] = [
+    {
+      provider: "openai",
+      model: "gpt-4o",
+      stopReason: "end_turn",
+      usage: { inputTokens: 40, outputTokens: 20 },
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            summary: "Plan the run.",
+            steps: [
+              {
+                id: "step-1",
+                title: "Inspect the workspace",
+                expected_inputs: ["README.md"],
+                expected_outputs: ["workspace notes"]
+              },
+              {
+                id: "step-2",
+                title: "Finish the run",
+                expected_inputs: ["workspace notes"],
+                expected_outputs: ["run-summary.md"]
+              }
+            ]
+          })
+        }
+      ],
+      raw: {}
+    },
+    {
+      provider: "openai",
+      model: "gpt-4o",
+      stopReason: "tool_calls",
+      usage: { inputTokens: 25, outputTokens: 10 },
+      content: [
+        {
+          type: "tool_use",
+          id: "complete-step-1",
+          name: "plan_step_complete",
+          input: {
+            step_id: "step-1",
+            summary: "Inspected the workspace.",
+            outputs: ["workspace notes"]
+          }
+        }
+      ],
+      raw: {}
+    },
+    {
+      provider: "openai",
+      model: "gpt-4o",
+      stopReason: "tool_calls",
+      usage: { inputTokens: 30, outputTokens: 12 },
+      content: [
+        {
+          type: "tool_use",
+          id: "complete-step-2",
+          name: "plan_step_complete",
+          input: {
+            step_id: "step-2",
+            summary: "Prepared the final payload.",
+            outputs: ["run-summary.md"]
+          }
+        },
+        {
+          type: "tool_use",
+          id: "tool-complete",
+          name: "salvo_complete",
+          input: completionPayload()
+        }
+      ],
+      raw: {}
+    }
+  ];
+  const events: string[] = [];
+
+  const result = await runAgentLoop({
+    provider: "openai",
+    model: "gpt-4o",
+    systemPrompt: "system",
+    userPrompt: "user",
+    contract,
+    workspaceRoot: "/tmp/workspace",
+    createMessage: async () => {
+      const next = responses.shift();
+      if (!next) {
+        throw new Error("Unexpected extra LLM call.");
+      }
+      return next;
+    },
+    executeToolUse: async (block): Promise<ToolExecutionOutcome> => ({
+      toolResult: {
+        type: "tool_result",
+        toolUseId: block.id,
+        content: JSON.stringify({ ok: true })
+      },
+      completionPayload: block.name === "salvo_complete" ? completionPayload() : undefined,
+      policyDenied: false
+    }),
+    appendRunEvent: async (eventType) => {
+      events.push(eventType);
+    }
+  });
+
+  assert.equal(result.finalPayload.status, "completed");
+  assert.deepEqual(events.filter((event) => event === "plan.generated"), ["plan.generated"]);
+  assert.deepEqual(events.filter((event) => event === "plan.step.started"), [
+    "plan.step.started",
+    "plan.step.started"
+  ]);
+  assert.deepEqual(events.filter((event) => event === "plan.step.completed"), [
+    "plan.step.completed",
+    "plan.step.completed"
+  ]);
+});
+
+test("runAgentLoop blocks completion before the active plan step is complete", async () => {
+  const contract = buildContract();
+  const responses: LlmResponse[] = [
+    {
+      provider: "anthropic",
+      model: "claude-sonnet-4",
+      stopReason: "end_turn",
+      usage: { inputTokens: 20, outputTokens: 10 },
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            summary: "Plan the run.",
+            steps: [
+              {
+                id: "step-1",
+                title: "Inspect the workspace",
+                expected_inputs: ["README.md"],
+                expected_outputs: ["workspace notes"]
+              }
+            ]
+          })
+        }
+      ],
+      raw: {}
+    },
+    {
+      provider: "anthropic",
+      model: "claude-sonnet-4",
+      stopReason: "tool_use",
+      usage: { inputTokens: 20, outputTokens: 5 },
+      content: [
+        {
+          type: "tool_use",
+          id: "tool-complete",
+          name: "salvo_complete",
+          input: completionPayload()
+        }
+      ],
+      raw: {}
+    }
+  ];
+  const events: string[] = [];
+
+  const result = await runAgentLoop({
+    provider: "anthropic",
+    model: "claude-sonnet-4",
+    systemPrompt: "system",
+    userPrompt: "user",
+    contract,
+    workspaceRoot: "/tmp/workspace",
+    createMessage: async () => {
+      const next = responses.shift();
+      if (!next) {
+        throw new Error("Unexpected extra LLM call.");
+      }
+      return next;
+    },
+    executeToolUse: async () => {
+      throw new Error("Completion tool should not execute before plan completion.");
+    },
+    appendRunEvent: async (eventType) => {
+      events.push(eventType);
+    }
+  });
+
+  assert.equal(result.finalPayload.status, "blocked");
+  assert.equal(result.exitReason, "plan_deviation");
+  assert.equal(events.includes("plan.deviation_detected"), true);
+});
+
+test("runAgentLoop resumes from a saved partial tool batch checkpoint", async () => {
+  const contract = buildContract();
+  const executedTools: string[] = [];
+  let savedCheckpoint: AgentLoopCheckpointState | null = null;
+
+  const result = await runAgentLoop({
+    provider: "anthropic",
+    model: "claude-sonnet-4",
+    systemPrompt: "system",
+    userPrompt: "user",
+    contract,
+    workspaceRoot: "/tmp/workspace",
+    createMessage: async () => {
+      throw new Error("LLM should not be called when resuming pending tool work.");
+    },
+    executeToolUse: async (block): Promise<ToolExecutionOutcome> => {
+      executedTools.push(block.name);
+      if (block.name === "salvo_complete") {
+        return {
+          toolResult: {
+            type: "tool_result",
+            toolUseId: block.id,
+            content: JSON.stringify({ ok: true })
+          },
+          completionPayload: completionPayload(),
+          policyDenied: false
+        };
+      }
+
+      return {
+        toolResult: {
+          type: "tool_result",
+          toolUseId: block.id,
+          content: JSON.stringify({ ok: true })
+        },
+        policyDenied: false
+      };
+    },
+    appendRunEvent: async () => {},
+    loadCheckpoint: async () => ({
+      schemaVersion: 1,
+      messages: [
+        {
+          role: "user",
+          content: "user"
+        }
+      ],
+      usage: {
+        provider: "anthropic",
+        model: "claude-sonnet-4",
+        input_tokens: 100,
+        output_tokens: 25,
+        cost_usd: 0.000675,
+        estimated: false,
+        pricing_unit: "usd_per_1m_tokens"
+      },
+      toolCallsUsed: 1,
+      turn: 1,
+      maxTokensRetries: 0,
+      pendingToolState: {
+        assistantContent: [
+          {
+            type: "tool_use",
+            id: "tool-1",
+            name: "read_file",
+            input: { path: "README.md" }
+          },
+          {
+            type: "tool_use",
+            id: "tool-2",
+            name: "salvo_complete",
+            input: completionPayload()
+          }
+        ],
+        toolUses: [
+          {
+            type: "tool_use",
+            id: "tool-1",
+            name: "read_file",
+            input: { path: "README.md" }
+          },
+          {
+            type: "tool_use",
+            id: "tool-2",
+            name: "salvo_complete",
+            input: completionPayload()
+          }
+        ],
+        nextToolIndex: 1,
+        toolResults: [
+          {
+            type: "tool_result",
+            toolUseId: "tool-1",
+            content: JSON.stringify({ ok: true, content: "# Readme" })
+          }
+        ],
+        testsRun: [],
+        commandResults: []
+      }
+    }),
+    saveCheckpoint: async (state) => {
+      savedCheckpoint = state;
+    },
+    deleteCheckpoint: async () => {
+      savedCheckpoint = null;
+    }
+  });
+
+  assert.equal(result.finalPayload.status, "completed");
+  assert.deepEqual(executedTools, ["salvo_complete"]);
+  assert.equal(savedCheckpoint, null);
+});
+
 test("runAgentLoop blocks when the tool call limit is exceeded", async () => {
   const contract = buildContract();
   contract.constraints.max_tool_calls = 1;
@@ -212,6 +515,82 @@ test("runAgentLoop blocks when the tool call limit is exceeded", async () => {
 
   assert.equal(result.finalPayload.status, "blocked");
   assert.equal(result.exitReason, "tool_call_limit");
+});
+
+test("runAgentLoop blocks when cumulative input token usage exceeds the run budget", async () => {
+  const contract = buildContract();
+  contract.constraints.max_total_input_tokens = 150;
+
+  const responses: LlmResponse[] = [
+    {
+      provider: "anthropic",
+      model: "claude-sonnet-4",
+      stopReason: "tool_use",
+      usage: { inputTokens: 100, outputTokens: 10 },
+      content: [
+        {
+          type: "tool_use",
+          id: "tool-1",
+          name: "read_file",
+          input: { path: "README.md" }
+        }
+      ],
+      raw: {}
+    },
+    {
+      provider: "anthropic",
+      model: "claude-sonnet-4",
+      stopReason: "tool_use",
+      usage: { inputTokens: 60, outputTokens: 10 },
+      content: [
+        {
+          type: "tool_use",
+          id: "tool-2",
+          name: "write_file",
+          input: { path: "run-summary.md", content: "# blocked" }
+        }
+      ],
+      raw: {}
+    }
+  ];
+  const executedTools: string[] = [];
+  const events: Array<{ eventType: string; payload: Record<string, unknown> }> = [];
+
+  const result = await runAgentLoop({
+    provider: "anthropic",
+    model: "claude-sonnet-4",
+    systemPrompt: "system",
+    userPrompt: "user",
+    contract,
+    workspaceRoot: "/tmp/workspace",
+    createMessage: async () => {
+      const next = responses.shift();
+      if (!next) {
+        throw new Error("Unexpected extra LLM call.");
+      }
+      return next;
+    },
+    executeToolUse: async (block) => {
+      executedTools.push(block.name);
+      return {
+        toolResult: {
+          type: "tool_result",
+          toolUseId: block.id,
+          content: JSON.stringify({ ok: true })
+        },
+        policyDenied: false
+      };
+    },
+    appendRunEvent: async (eventType, _level, payload) => {
+      events.push({ eventType, payload });
+    }
+  });
+
+  assert.equal(result.finalPayload.status, "blocked");
+  assert.equal(result.exitReason, "max_total_input_tokens");
+  assert.deepEqual(executedTools, ["read_file"]);
+  assert.equal(events.some((event) => event.eventType === "resource.limit_reached"), true);
+  assert.equal(events.at(-1)?.payload.limit_name, "max_total_input_tokens");
 });
 
 test("runAgentLoop blocks on policy denial when the contract requires it", async () => {
@@ -291,7 +670,7 @@ test("runAgentLoop blocks after the max_tokens continuation cap is exhausted", a
 
   assert.equal(result.finalPayload.status, "blocked");
   assert.equal(result.exitReason, "max_tokens");
-  assert.equal(calls, 3);
+  assert.equal(calls, 4);
 });
 
 test("runAgentLoop blocks when the runtime budget is exceeded", async () => {

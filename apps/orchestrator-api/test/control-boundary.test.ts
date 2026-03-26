@@ -37,6 +37,8 @@ if (!databaseUrl) {
         public.salvo_research_ingestions,
         public.salvo_research_documents,
         public.salvo_evaluations,
+        public.salvo_leads,
+        public.salvo_workspace_tool_policies,
         public.salvo_artifacts,
         public.salvo_run_events,
         public.salvo_runs,
@@ -231,6 +233,68 @@ if (!databaseUrl) {
     assert.equal(messages[1].role, "assistant");
     assert.equal(messages[2].role, "user");
     assert.equal(messages[3].role, "assistant");
+  });
+
+  test("task chat proposal includes workspace files, recent runs, and relevant memory context", async () => {
+    const workspaceDir = await mkdtemp(path.join(tmpdir(), "salvo-task-chat-workspace-"));
+    await writeFile(path.join(workspaceDir, "README.md"), "# Task chat context\n", "utf8");
+    await writeFile(path.join(workspaceDir, "docs.md"), "Implementation notes\n", "utf8");
+
+    const workspace = await repo.ensureWorkspace(`chat-context-${randomUUID()}`, workspaceDir);
+    const task = await repo.createTask({
+      workspaceId: workspace.id,
+      title: "Investigate task chat context",
+      request: "Fix task chat planning context",
+      requiresApproval: false
+    });
+    const contract = await repo.createContract({
+      taskId: task.id,
+      risk: "low",
+      status: "active",
+      contractJson: {
+        schema_version: 1,
+        family_key: "family_existing"
+      }
+    });
+    const run = await repo.createRun({
+      taskId: task.id,
+      contractId: contract.id,
+      agentProfile: "builder",
+      workerId: "task-chat-context"
+    });
+
+    await repo.createMemory({
+      workspaceId: workspace.id,
+      sourceRunIds: [run.id],
+      memoryType: "best_practice",
+      title: "Task chat context memory",
+      summary: "Remember to include workspace files and recent runs in task chat proposals.",
+      bodyMarkdown: "Populate planning context from the database before asking the LLM to plan.",
+      tags: ["task-chat", "planning"],
+      confidence: 0.9,
+      reviewStatus: "accepted"
+    });
+
+    const chat = await app.inject({
+      method: "POST",
+      url: "/tasks/chat",
+      payload: {
+        workspace_id: workspace.id,
+        message: "Plan a task chat context fix that uses recent runs and accepted memory excerpts."
+      }
+    });
+
+    assert.equal(chat.statusCode, 200);
+    const proposal = chat.json().proposed_contract;
+    assert.ok(proposal);
+    const context = proposal.contract_json.context as {
+      relevant_files: string[];
+      recent_runs: string[];
+      memory_excerpt_ids: string[];
+    };
+    assert.equal(context.relevant_files.includes("README.md"), true);
+    assert.equal(context.recent_runs.includes(run.id), true);
+    assert.equal(context.memory_excerpt_ids.length > 0, true);
   });
 
   test("task chat approve endpoint creates task and contract and replays idempotent approvals", async () => {
@@ -732,6 +796,117 @@ if (!databaseUrl) {
     assert.ok(llmRow);
   });
 
+  test("frontend route coverage endpoints return implemented payloads", async () => {
+    const workspace = await repo.ensureWorkspace(`route-coverage-${randomUUID()}`, process.cwd());
+    const { task, run } = await seedRun("running");
+    await repo.appendRunEvent(run.id, "run.heartbeat", "info", {
+      ok: true
+    });
+
+    const skills = await app.inject({
+      method: "GET",
+      url: `/skills?workspaceId=${workspace.id}`
+    });
+    assert.equal(skills.statusCode, 200);
+    assert.ok(Array.isArray(skills.json().skills));
+
+    const setSkill = await app.inject({
+      method: "POST",
+      url: "/skills/search_codebase/config",
+      payload: {
+        workspaceId: workspace.id,
+        enabled: false
+      }
+    });
+    assert.equal(setSkill.statusCode, 200);
+    assert.equal(setSkill.json().enabled, false);
+
+    const backups = await app.inject({
+      method: "GET",
+      url: "/backups/status"
+    });
+    assert.equal(backups.statusCode, 200);
+    assert.equal(typeof backups.json().state, "string");
+
+    const leads = await app.inject({
+      method: "GET",
+      url: "/leads"
+    });
+    assert.equal(leads.statusCode, 200);
+    assert.ok(Array.isArray(leads.json().funnel));
+
+    const events = await app.inject({
+      method: "GET",
+      url: `/runs/${run.id}/events`
+    });
+    assert.equal(events.statusCode, 200);
+    assert.ok(Array.isArray(events.json()));
+
+    const artifactPath = await createTempArtifactPath("route-coverage.md", "# proof");
+    await repo.createArtifact({
+      runId: run.id,
+      taskId: task.id,
+      artifactType: "markdown",
+      path: artifactPath,
+      metadataJson: {
+        label: "proof"
+      }
+    });
+    const artifact = (await repo.listArtifactsForRun(run.id))[0];
+    assert.ok(artifact);
+
+    const preview = await app.inject({
+      method: "GET",
+      url: `/artifacts/${artifact.id}/preview`
+    });
+    assert.equal(preview.statusCode, 200);
+    assert.equal(preview.json().kind, "text");
+
+    const content = await app.inject({
+      method: "GET",
+      url: `/artifacts/${artifact.id}/content`
+    });
+    assert.equal(content.statusCode, 200);
+    assert.ok(content.body.includes("# proof"));
+  });
+
+  test("lead funnel endpoint counts actual lead stage records", async () => {
+    const workspace = await repo.ensureWorkspace(`leads-${randomUUID()}`, process.cwd());
+    await repo.upsertLeadRecord({
+      workspaceId: workspace.id,
+      leadKey: "lead-one",
+      rowContext: {
+        company: "Acme HVAC",
+        contact: "Avery"
+      },
+      scrapedAt: new Date(),
+      qualifiedAt: new Date()
+    });
+    await repo.upsertLeadRecord({
+      workspaceId: workspace.id,
+      leadKey: "lead-two",
+      rowContext: {
+        company: "North Dallas Services",
+        contact: "Blair"
+      },
+      scrapedAt: new Date(),
+      qualifiedAt: new Date(),
+      contactedAt: new Date(),
+      convertedAt: new Date()
+    });
+
+    const leads = await app.inject({
+      method: "GET",
+      url: "/leads"
+    });
+    assert.equal(leads.statusCode, 200);
+    const funnel = leads.json().funnel as Array<{ id: string; count: number }>;
+    assert.equal(funnel.find((entry) => entry.id === "scraped")?.count, 2);
+    assert.equal(funnel.find((entry) => entry.id === "qualified")?.count, 2);
+    assert.equal(funnel.find((entry) => entry.id === "contacted")?.count, 1);
+    assert.equal(funnel.find((entry) => entry.id === "converted")?.count, 1);
+  });
+
   test("integrations endpoint exposes Google Sheets entry", async () => {
     const integrations = await app.inject({
       method: "GET",
@@ -743,6 +918,18 @@ if (!databaseUrl) {
       .find((item: { key: string }) => item.key === "google_sheets");
     assert.ok(googleRow);
     assert.equal(typeof googleRow.config.spreadsheet_id, "string");
+  });
+
+  test("integrations endpoint exposes Slack entry", async () => {
+    const integrations = await app.inject({
+      method: "GET",
+      url: "/integrations"
+    });
+    assert.equal(integrations.statusCode, 200);
+    const slackRow = integrations
+      .json()
+      .find((item: { key: string }) => item.key === "slack");
+    assert.ok(slackRow);
   });
 
   test("integration config update persists Google Sheets settings", async () => {
@@ -767,6 +954,32 @@ if (!databaseUrl) {
       .find((item: { key: string }) => item.key === "google_sheets");
     assert.equal(googleRow.config.spreadsheet_id, "sheet-xyz");
     assert.equal(googleRow.config.credentials_configured, true);
+  });
+
+  test("integration config update persists Slack settings", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/integrations/slack/config",
+      payload: {
+        botToken: "xoxb-test",
+        defaultChannel: "#alerts",
+        webhookUrl: "https://hooks.slack.test/abc"
+      }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().ok, true);
+
+    const integrations = await app.inject({
+      method: "GET",
+      url: "/integrations"
+    });
+    assert.equal(integrations.statusCode, 200);
+    const slackRow = integrations
+      .json()
+      .find((item: { key: string }) => item.key === "slack");
+    assert.equal(slackRow.config.bot_token_configured, true);
+    assert.equal(slackRow.config.default_channel, "#alerts");
+    assert.equal(slackRow.config.webhook_url_configured, true);
   });
 
   test("budget endpoints persist limits and return spend state", async () => {
@@ -963,9 +1176,53 @@ if (!databaseUrl) {
             entry.agent_profile === "builder" &&
             entry.trust_tier === "probation" &&
             entry.managed_by === "manual"
-        ),
+      ),
       true
     );
+  });
+
+  test("workspace policy endpoints expose workspaces and persist overlays", async () => {
+    const workspace = await repo.ensureWorkspace(`policy-api-${randomUUID()}`, process.cwd());
+
+    const initial = await app.inject({
+      method: "GET",
+      url: "/workspace-policies"
+    });
+    assert.equal(initial.statusCode, 200);
+    const initialPayload = initial.json();
+    assert.equal(
+      initialPayload.workspaces.some((entry: { id: string }) => entry.id === workspace.id),
+      true
+    );
+
+    const saved = await app.inject({
+      method: "POST",
+      url: "/workspace-policies",
+      payload: {
+        workspaceId: workspace.id,
+        allowedReadPaths: [".", "packages/shared"],
+        allowedWritePaths: ["packages/shared"],
+        forbiddenPaths: [".git"],
+        allowedCommands: ["pnpm", "node"],
+        allowedCommandCwds: ["."],
+        commandTimeoutMs: 9000
+      }
+    });
+    assert.equal(saved.statusCode, 200);
+    assert.equal(saved.json().ok, true);
+    assert.equal(saved.json().policy.workspace_id, workspace.id);
+
+    const afterSave = await app.inject({
+      method: "GET",
+      url: "/workspace-policies"
+    });
+    assert.equal(afterSave.statusCode, 200);
+    const savedPolicy = afterSave
+      .json()
+      .policies.find((entry: { workspace_id: string }) => entry.workspace_id === workspace.id);
+    assert.ok(savedPolicy);
+    assert.deepEqual(savedPolicy.policy_json.allowedCommands, ["pnpm", "node"]);
+    assert.equal(savedPolicy.policy_json.commandTimeoutMs, 9000);
   });
 
   test("integration config update endpoint persists llm_api settings", async () => {

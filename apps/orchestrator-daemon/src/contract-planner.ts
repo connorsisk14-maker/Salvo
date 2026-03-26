@@ -12,7 +12,11 @@ import { buildOrchestratorSoulPrompt } from "./soul";
 
 const MAX_WORKSPACE_ENTRIES = 12;
 const MAX_MEMORY_BODY_CHARS = 600;
-const DEFAULT_CONTRACT_MODEL = "claude-3-5-sonnet-latest";
+const DEFAULT_CONTRACT_MODEL_BY_PROVIDER: Record<string, string> = {
+  anthropic: "claude-3-5-sonnet-latest",
+  openai: "gpt-4o",
+  custom: "gpt-4o"
+};
 
 function readString(config: Record<string, unknown>, key: string, fallback = ""): string {
   const value = config[key];
@@ -66,6 +70,22 @@ export async function collectWorkspaceSnapshot(workspacePath: string): Promise<s
   } catch {
     return [];
   }
+}
+
+export function buildMemoryRetrievalQuery(input: {
+  task: Pick<DbTask, "title" | "original_request">;
+  contract: Pick<ContractV1, "family_key" | "category" | "subcategory">;
+}): string {
+  return [
+    input.task.title,
+    input.task.original_request,
+    input.contract.family_key,
+    input.contract.category,
+    input.contract.subcategory ?? ""
+  ]
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .join("\n");
 }
 
 export function buildContractPlanningPrompts(input: {
@@ -142,10 +162,6 @@ export function resolveContractPlannerConfig(input: {
     agentProfile: "builder"
   });
 
-  if (routing.provider !== "anthropic") {
-    return null;
-  }
-
   const apiKey =
     readString(llmConfig ?? {}, "apiKey") ||
     readString(llmConfig ?? {}, "authToken") ||
@@ -156,13 +172,21 @@ export function resolveContractPlannerConfig(input: {
     return null;
   }
 
+  const defaultBaseUrl =
+    routing.provider === "anthropic"
+      ? "https://api.anthropic.com"
+      : "https://api.openai.com";
+
   return {
-    provider: "anthropic",
+    provider: routing.provider,
     apiKey,
     baseUrl:
       readString(llmConfig ?? {}, "baseUrl", input.env.SALVO_LLM_BASE_URL) ||
-      "https://api.anthropic.com",
-    model: routing.model || DEFAULT_CONTRACT_MODEL,
+      defaultBaseUrl,
+    model:
+      routing.model ||
+      DEFAULT_CONTRACT_MODEL_BY_PROVIDER[routing.provider] ||
+      "gpt-4o",
     maxTokens: 1800,
     temperature: 0.1
   };

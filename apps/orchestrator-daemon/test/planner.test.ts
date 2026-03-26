@@ -43,6 +43,7 @@ function buildTask(overrides?: Partial<DbTask>): DbTask {
     original_request: "Task request",
     normalized_request: "Task request",
     status: "completed",
+    priority: "medium",
     requires_approval: false,
     approved_at: null,
     cancelled_at: null,
@@ -128,8 +129,8 @@ function createPlannerRepoFixture(input: {
     async listResearchContext() {
       return [];
     },
-    async listContractMemoryPromptContext(workspaceId, contractFamilyKey) {
-      return memories[`${workspaceId}:${contractFamilyKey}`] ?? [];
+    async listRelevantMemoryPromptContext(workspaceId, _queryText, contractFamilyKey) {
+      return memories[`${workspaceId}:${contractFamilyKey ?? "general"}`] ?? [];
     },
     async listIntegrationConfigs() {
       return integrationConfigs;

@@ -1,11 +1,13 @@
 import type {
   AgentProfile,
   AgentTrustTier,
+  ContractCategory,
   ContractStatus,
   RunExitReason,
   RunEventLevel,
   RunEventType,
   RunStatus,
+  TaskPriority,
   TaskStatus
 } from "@salvo/shared";
 
@@ -15,6 +17,14 @@ export type DbWorkspace = {
   local_path: string;
   description: string | null;
   created_at: string;
+};
+
+export type DbWorkspaceToolPolicy = {
+  id: string;
+  workspace_id: string;
+  policy_json: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
 };
 
 export type DbContractMemoryPrompt = {
@@ -52,6 +62,7 @@ export type DbTask = {
   updated_at: string;
   dependency_block_reason: string | null;
   dependency_blocked_at: string | null;
+  priority: TaskPriority;
 };
 
 export type TaskChatSessionStatus = "active" | "approved";
@@ -131,6 +142,26 @@ export type DbRunSummary = DbRun & {
   lead_chain_row_context: Record<string, unknown> | null;
 };
 
+export type DbRunCheckpoint = {
+  run_id: string;
+  checkpoint_key: string;
+  checkpoint_state: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+};
+
+export type AgentPerformanceSignal = {
+  workspaceId: string;
+  contractFamilyKey: string;
+  contractCategory: ContractCategory;
+  agentProfile: AgentProfile;
+  runCount: number;
+  avgScore: number;
+  passRate: number;
+  avgCostUsd: number;
+  lastUsedAt: string | null;
+};
+
 export type DbLeadRunChain = {
   id: string;
   scraper_run_id: string;
@@ -138,6 +169,30 @@ export type DbLeadRunChain = {
   strategist_run_id: string | null;
   row_context: Record<string, unknown> | null;
   created_at: string;
+};
+
+export type DbLeadRecord = {
+  id: string;
+  workspace_id: string;
+  lead_key: string;
+  row_context: Record<string, unknown>;
+  source_scraper_run_id: string | null;
+  source_strategist_task_id: string | null;
+  source_strategist_run_id: string | null;
+  scraped_at: string;
+  qualified_at: string | null;
+  contacted_at: string | null;
+  converted_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type DbLeadFunnelMetrics = {
+  scraped_count: number;
+  qualified_count: number;
+  contacted_count: number;
+  converted_count: number;
+  updated_at: string;
 };
 
 export type DbRunEvent = {
@@ -198,7 +253,8 @@ export type DbIntegrationKey =
   | "process"
   | "http"
   | "google_sheets"
-  | "email";
+  | "email"
+  | "slack";
 
 export type DbIntegrationConfig = {
   integration_key: DbIntegrationKey;
@@ -324,6 +380,7 @@ export type CreateTaskInput = {
   requiresApproval?: boolean;
   dependencies?: TaskDependencyInput[];
   preferredAgentProfile?: AgentProfile;
+  priority?: TaskPriority;
 };
 
 export type TaskDependencyInput = {

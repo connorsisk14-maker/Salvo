@@ -3,8 +3,13 @@ import cors from "@fastify/cors";
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { readFile, stat } from "node:fs/promises";
+import { readFile, readdir, stat } from "node:fs/promises";
 import path from "node:path";
+import {
+  buildContractV1,
+  validateContractV1,
+  type ContractV1
+} from "@salvo/contracts";
 import {
   createDbPool,
   SalvoRepository,
@@ -12,6 +17,7 @@ import {
   type TaskChatProposal,
   type TaskDependencyStatus
 } from "@salvo/db";
+import { LlmClient, type LlmConfig } from "@salvo/llm";
 import {
   AGENT_PROFILES,
   AGENT_TRUST_TIERS,
@@ -19,6 +25,7 @@ import {
   BackupManager,
   DFW_LEAD_ZONE_CONFIG,
   SALVO_LEAD_PIPELINE_SHEET_ID,
+  TASK_PRIORITIES,
   initializeSecrets
 } from "@salvo/shared";
 import { z } from "zod";
@@ -41,6 +48,17 @@ const taskTitleMaxLength = readPositiveIntegerEnv("SALVO_API_TASK_TITLE_MAX_LENG
 const taskRequestMaxLength = readPositiveIntegerEnv("SALVO_API_TASK_REQUEST_MAX_LENGTH", 20_000);
 const idempotencyTtlHours = readPositiveIntegerEnv("SALVO_API_IDEMPOTENCY_TTL_HOURS", 24);
 const idempotencyKeyMaxLength = readPositiveIntegerEnv("SALVO_API_IDEMPOTENCY_KEY_MAX_LENGTH", 200);
+const taskChatRelevantFileLimit = readPositiveIntegerEnv("SALVO_API_TASK_CHAT_RELEVANT_FILE_LIMIT", 12);
+const taskChatRecentRunLimit = readPositiveIntegerEnv("SALVO_API_TASK_CHAT_RECENT_RUN_LIMIT", 8);
+const taskChatMemoryLimit = readPositiveIntegerEnv("SALVO_API_TASK_CHAT_MEMORY_LIMIT", 5);
+const taskChatMemoryBodyChars = readPositiveIntegerEnv("SALVO_API_TASK_CHAT_MEMORY_BODY_CHARS", 600);
+const taskChatResearchLimit = readPositiveIntegerEnv("SALVO_API_TASK_CHAT_RESEARCH_LIMIT", 5);
+
+const TASK_CHAT_DEFAULT_MODEL_BY_PROVIDER: Record<LlmProvider, string> = {
+  anthropic: "claude-3-5-sonnet-latest",
+  openai: "gpt-4o",
+  custom: "gpt-4o"
+};
 
 const reviewStatusSchema = z.object({
   status: z.enum(["unreviewed", "accepted", "rejected"])
@@ -54,7 +72,8 @@ const taskCreateSchema = z.object({
   title: z.string().trim().min(1, "Title is required.").max(taskTitleMaxLength, `Title must be ${taskTitleMaxLength} characters or fewer.`),
   request: z.string().trim().min(1, "Request is required.").max(taskRequestMaxLength, `Request must be ${taskRequestMaxLength} characters or fewer.`),
   workspaceId: z.string().uuid("workspaceId must be a valid UUID.").optional(),
-  requiresApproval: z.boolean().optional()
+  requiresApproval: z.boolean().optional(),
+  priority: z.enum(TASK_PRIORITIES).optional()
 }).strict();
 
 const taskChatSchema = z.object({
@@ -83,6 +102,23 @@ const trustTierSchema = z.object({
   trustTier: z.enum(AGENT_TRUST_TIERS)
 }).strict();
 
+const workspaceToolPolicySchema = z
+  .object({
+    workspaceId: z.string().uuid("workspaceId must be a valid UUID."),
+    allowedReadPaths: z.array(z.string().trim().min(1).max(4096)).optional(),
+    allowedWritePaths: z.array(z.string().trim().min(1).max(4096)).optional(),
+    forbiddenPaths: z.array(z.string().trim().min(1).max(4096)).optional(),
+    allowedCommands: z.array(z.string().trim().min(1).max(256)).optional(),
+    allowedCommandCwds: z.array(z.string().trim().min(1).max(4096)).optional(),
+    commandTimeoutMs: z
+      .number()
+      .finite("commandTimeoutMs must be a number.")
+      .positive("commandTimeoutMs must be greater than 0.")
+      .max(120_000, "commandTimeoutMs must be 120000 or fewer.")
+      .optional()
+  })
+  .strict();
+
 const skillWorkspaceQuerySchema = z.object({
   workspaceId: z.string().uuid("workspaceId must be a valid UUID.").optional()
 }).strict();
@@ -95,6 +131,12 @@ const skillConfigSchema = z.object({
 const googleSheetsConfigSchema = z.object({
   spreadsheetId: z.string().trim().max(256, "spreadsheetId must be 256 characters or fewer.").optional(),
   credentialsJson: z.string().trim().min(1, "credentialsJson must not be empty.").optional()
+}).strict();
+
+const slackConfigSchema = z.object({
+  botToken: z.string().trim().max(4096, "botToken must be 4096 characters or fewer.").optional(),
+  defaultChannel: z.string().trim().max(256, "defaultChannel must be 256 characters or fewer.").optional(),
+  webhookUrl: z.string().trim().max(2048, "webhookUrl must be 2048 characters or fewer.").optional()
 }).strict();
 
 const emailConfigSchema = z.object({
@@ -122,6 +164,7 @@ const integrationConfigSchemas = {
     token: z.string().trim().max(4096, "token must be 4096 characters or fewer.").optional()
   }).strict(),
   google_sheets: googleSheetsConfigSchema,
+  slack: slackConfigSchema,
   email: emailConfigSchema
 } as const;
 
@@ -175,7 +218,7 @@ type IntegrationStatus =
   | "healthy"
   | "stale"
   | "offline";
-type EditableIntegrationKey = "supabase" | "llm_api" | "process" | "http" | "google_sheets" | "email";
+type EditableIntegrationKey = "supabase" | "llm_api" | "process" | "http" | "google_sheets" | "slack" | "email";
 type LlmProvider = "anthropic" | "openai" | "custom";
 
 type IntegrationConfigMap = {
@@ -199,6 +242,11 @@ type IntegrationConfigMap = {
   googleSheets: {
     spreadsheetId: string;
     credentialsJson: string;
+  };
+  slack: {
+    botToken: string;
+    defaultChannel: string;
+    webhookUrl: string;
   };
   email: {
     transportUrl: string;
@@ -436,6 +484,11 @@ function createDefaultConfigMap(): IntegrationConfigMap {
       spreadsheetId: process.env.SALVO_GOOGLE_SHEETS_SPREADSHEET_ID ?? "",
       credentialsJson: process.env.SALVO_GOOGLE_SHEETS_CREDENTIALS_JSON ?? ""
     },
+    slack: {
+      botToken: process.env.SALVO_SLACK_BOT_TOKEN ?? "",
+      defaultChannel: process.env.SALVO_SLACK_DEFAULT_CHANNEL ?? "",
+      webhookUrl: process.env.SALVO_SLACK_WEBHOOK_URL ?? ""
+    },
     email: {
       transportUrl: process.env.SALVO_EMAIL_TRANSPORT_URL ?? "",
       defaultFrom: process.env.SALVO_EMAIL_DEFAULT_FROM ?? "",
@@ -498,6 +551,25 @@ function applyStoredConfig(
         config,
         "credentialsJson",
         next.googleSheets.credentialsJson
+      );
+      continue;
+    }
+
+    if (row.integration_key === "slack") {
+      next.slack.botToken = readString(
+        config,
+        "botToken",
+        readString(config, "bot_token", next.slack.botToken)
+      );
+      next.slack.defaultChannel = readString(
+        config,
+        "defaultChannel",
+        readString(config, "default_channel", next.slack.defaultChannel)
+      );
+      next.slack.webhookUrl = readString(
+        config,
+        "webhookUrl",
+        readString(config, "webhook_url", next.slack.webhookUrl)
       );
       continue;
     }
@@ -711,86 +783,275 @@ function buildTaskChatFamilyKey(input: {
   return `family_${digest}`;
 }
 
-function buildTaskChatProposal(workspaceId: string, request: string): TaskChatProposal {
-  const risk = classifyTaskChatRisk(request);
-  const category = classifyTaskChatCategory(request);
+function buildTaskChatProposal(
+  workspaceId: string,
+  request: string,
+  context?: {
+    relevantFiles?: string[];
+    recentRunIds?: string[];
+    memoryExcerptIds?: string[];
+  }
+): TaskChatProposal {
   const title = buildTaskTitleFromRequest(request);
-  const contractId = randomUUID();
-  const taskId = randomUUID();
-  const createdAt = new Date().toISOString();
-  const familyKey = buildTaskChatFamilyKey({
+  const contract = buildContractV1({
+    contractId: randomUUID(),
+    taskId: randomUUID(),
+    workspaceId,
     request,
-    risk,
-    category: category.category,
-    subcategory: category.subcategory
+    taskTitle: title,
+    preferredProfile: "builder"
+  });
+  const mergedContract = validateContractV1({
+    ...contract,
+    context: {
+      ...contract.context,
+      relevant_files: context?.relevantFiles ?? [],
+      recent_runs: context?.recentRunIds ?? [],
+      memory_excerpt_ids: context?.memoryExcerptIds ?? []
+    }
   });
 
   return {
     title,
     request,
-    risk,
-    requires_approval: risk === "high",
-    contract_json: {
-      schema_version: 1,
-      contract_id: contractId,
-      task_id: taskId,
-      workspace_id: workspaceId,
-      created_at: createdAt,
-      objective: {
-        primary: title,
-        secondary: [],
-        non_goals: ["Do not modify files outside allowed scope."]
-      },
-      context: {
-        relevant_files: [],
-        recent_runs: [],
-        memory_excerpt_ids: []
-      },
-      scope: {
-        read_paths: ["."],
-        write_paths: ["."],
-        forbidden_paths: [".env", ".git", "node_modules"]
-      },
-      capabilities: {
-        filesystem_read: true,
-        filesystem_write: true,
-        run_tests: true,
-        install_packages: false,
-        network_access: false,
-        db_read: true,
-        db_write: true
-      },
-      constraints: {
-        max_runtime_minutes: 25,
-        max_tool_calls: 200,
-        no_destructive_commands: true,
-        approval_required_for: risk === "high" ? ["schema_change", "dependency_install"] : []
-      },
-      deliverables: {
-        required_artifacts: ["run-summary.md"],
-        evidence_required: true,
-        summary_required: true
-      },
-      success_criteria: {
-        required_test_commands: ["echo salvo-test"],
-        assertions: [
-          "Runner emits a final payload event.",
-          "At least one deliverable produced."
-        ]
-      },
-      failure_handling: {
-        stop_on_policy_denial: true
-      },
-      learnings_output: {
-        required: true
-      },
-      risk,
-      category: category.category,
-      subcategory: category.subcategory,
-      family_key: familyKey,
-      agent_profile: "builder"
-    }
+    risk: mergedContract.risk,
+    requires_approval: mergedContract.risk === "high",
+    contract_json: mergedContract
   };
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values.filter((value) => value.trim().length > 0))];
+}
+
+function mergeTaskChatContext(
+  contract: ContractV1,
+  context: {
+    relevantFiles: string[];
+    recentRunIds: string[];
+    memoryExcerptIds: string[];
+  }
+): ContractV1 {
+  return validateContractV1({
+    ...contract,
+    context: {
+      ...contract.context,
+      relevant_files: uniqueStrings([
+        ...context.relevantFiles,
+        ...contract.context.relevant_files
+      ]).slice(0, taskChatRelevantFileLimit),
+      recent_runs: uniqueStrings([
+        ...context.recentRunIds,
+        ...contract.context.recent_runs
+      ]).slice(0, taskChatRecentRunLimit),
+      memory_excerpt_ids: uniqueStrings([
+        ...context.memoryExcerptIds,
+        ...contract.context.memory_excerpt_ids
+      ]).slice(0, taskChatMemoryLimit)
+    }
+  });
+}
+
+async function collectTaskChatRelevantFiles(workspacePath: string): Promise<string[]> {
+  try {
+    const entries = await readdir(workspacePath, { withFileTypes: true });
+    return entries
+      .filter((entry) => entry.name !== ".git" && entry.name !== "node_modules")
+      .slice(0, taskChatRelevantFileLimit)
+      .map((entry) => entry.name);
+  } catch {
+    return [];
+  }
+}
+
+function buildTaskChatPlanningQuery(proposal: TaskChatProposal): string {
+  const contract = validateContractV1(proposal.contract_json);
+  return [
+    proposal.title,
+    proposal.request,
+    contract.family_key,
+    contract.category,
+    contract.subcategory ?? ""
+  ]
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .join("\n");
+}
+
+function extractTaskChatJsonObject(input: string): string {
+  const trimmed = input
+    .trim()
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+  const first = trimmed.indexOf("{");
+  const last = trimmed.lastIndexOf("}");
+  if (first === -1 || last === -1 || last <= first) {
+    throw new Error("LLM response did not contain a JSON object.");
+  }
+  return trimmed.slice(first, last + 1);
+}
+
+function resolveTaskChatLlmConfig(
+  integrationConfigs: Array<{ integration_key: string; config_json: Record<string, unknown> }>
+): LlmConfig | null {
+  const llmConfig = integrationConfigs.find((row) => row.integration_key === "llm_api")
+    ?.config_json;
+  const provider = normalizeProvider(
+    readString(llmConfig ?? {}, "provider", process.env.SALVO_LLM_PROVIDER)
+  );
+  const apiKey =
+    readString(llmConfig ?? {}, "apiKey") ||
+    readString(llmConfig ?? {}, "authToken") ||
+    process.env.SALVO_LLM_API_KEY ||
+    process.env.SALVO_CLAUDE_AUTH_TOKEN ||
+    "";
+
+  if (!apiKey) {
+    return null;
+  }
+
+  const baseUrl =
+    readString(llmConfig ?? {}, "baseUrl") ||
+    process.env.SALVO_LLM_BASE_URL ||
+    (provider === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com");
+  const model =
+    readString(llmConfig ?? {}, "defaultModel") ||
+    process.env.SALVO_LLM_DEFAULT_MODEL ||
+    TASK_CHAT_DEFAULT_MODEL_BY_PROVIDER[provider];
+
+  return {
+    provider,
+    apiKey,
+    baseUrl,
+    model,
+    maxTokens: 1800,
+    temperature: 0.1
+  };
+}
+
+async function createTaskChatProposal(input: {
+  repo: SalvoRepository;
+  workspaceId: string;
+  workspacePath: string;
+  request: string;
+  integrationConfigs: Array<{ integration_key: string; config_json: Record<string, unknown> }>;
+}): Promise<TaskChatProposal> {
+  const baseProposal = buildTaskChatProposal(input.workspaceId, input.request);
+  const baseContract = validateContractV1(baseProposal.contract_json);
+  const planningQuery = buildTaskChatPlanningQuery(baseProposal);
+
+  const [relevantFiles, memories, recentRuns, researchContext] = await Promise.all([
+    collectTaskChatRelevantFiles(input.workspacePath),
+    input.repo.listRelevantMemoryPromptContext(
+      input.workspaceId,
+      planningQuery,
+      baseContract.family_key,
+      taskChatMemoryLimit
+    ),
+    input.repo.listWorkspaceRecentRuns(input.workspaceId, taskChatRecentRunLimit),
+    input.repo.listResearchContext(input.workspaceId, taskChatResearchLimit)
+  ]);
+
+  const enrichedContract = mergeTaskChatContext(baseContract, {
+    relevantFiles,
+    recentRunIds: uniqueStrings([
+      ...recentRuns.map((run) => run.id),
+      ...memories.flatMap((entry) => entry.source_run_ids),
+      ...researchContext.flatMap((entry) => entry.source_run_ids)
+    ]),
+    memoryExcerptIds: memories.map((entry) => entry.id)
+  });
+  const enrichedProposal: TaskChatProposal = {
+    ...baseProposal,
+    risk: enrichedContract.risk,
+    requires_approval: enrichedContract.risk === "high",
+    contract_json: enrichedContract
+  };
+
+  const llmConfig = resolveTaskChatLlmConfig(input.integrationConfigs);
+  if (!llmConfig) {
+    return enrichedProposal;
+  }
+
+  try {
+    const response = await new LlmClient(llmConfig).createMessage(
+      [
+        "You are SALVO task-chat planner.",
+        "Return only one valid ContractV1 JSON object.",
+        "Preserve the provided contract_id, task_id, workspace_id, created_at, family_key, and agent_profile.",
+        "Use the provided workspace, recent run, and memory context to populate contract.context."
+      ].join("\n"),
+      [
+        {
+          role: "user",
+          content: JSON.stringify(
+            {
+              request: enrichedProposal.request,
+              title: enrichedProposal.title,
+              workspace: {
+                id: input.workspaceId,
+                local_path: input.workspacePath,
+                relevant_files: relevantFiles
+              },
+              recent_runs: recentRuns,
+              memory_excerpts: memories.map((memory) => ({
+                id: memory.id,
+                title: memory.title,
+                summary: memory.summary,
+                body_markdown: memory.body_markdown.slice(0, taskChatMemoryBodyChars),
+                confidence: memory.confidence,
+                source_run_ids: memory.source_run_ids
+              })),
+              research_context: researchContext.map((entry) => ({
+                id: entry.id,
+                confidence: entry.confidence,
+                source_run_ids: entry.source_run_ids
+              })),
+              base_contract: enrichedContract
+            },
+            null,
+            2
+          )
+        }
+      ]
+    );
+    const rawText = response.content
+      .filter((block) => block.type === "text")
+      .map((block) => block.text)
+      .join("\n")
+      .trim();
+    const parsedContract = validateContractV1(
+      JSON.parse(extractTaskChatJsonObject(rawText))
+    );
+    const normalizedContract = mergeTaskChatContext(
+      validateContractV1({
+        ...parsedContract,
+        contract_id: enrichedContract.contract_id,
+        task_id: enrichedContract.task_id,
+        workspace_id: enrichedContract.workspace_id,
+        created_at: enrichedContract.created_at,
+        family_key: enrichedContract.family_key,
+        agent_profile: enrichedContract.agent_profile
+      }),
+      {
+        relevantFiles,
+        recentRunIds: enrichedContract.context.recent_runs,
+        memoryExcerptIds: enrichedContract.context.memory_excerpt_ids
+      }
+    );
+
+    return {
+      title: normalizedContract.objective.primary,
+      request: enrichedProposal.request,
+      risk: normalizedContract.risk,
+      requires_approval: normalizedContract.risk === "high",
+      contract_json: normalizedContract
+    };
+  } catch {
+    return enrichedProposal;
+  }
 }
 
 function isAmbiguousTaskChatRequest(latestMessage: string, fullRequest: string): boolean {
@@ -1094,6 +1355,27 @@ export async function buildServer() {
         }
       },
       {
+        key: "slack",
+        label: "Slack Adapter",
+        status:
+          hasValue(config.slack.botToken) || hasValue(config.slack.webhookUrl)
+            ? "ready"
+            : "not_configured",
+        detail:
+          hasValue(config.slack.webhookUrl)
+            ? "Incoming webhook configured."
+            : hasValue(config.slack.botToken)
+              ? `Bot token configured${hasValue(config.slack.defaultChannel) ? ` for ${config.slack.defaultChannel}.` : "."}`
+              : "Set a bot token or incoming webhook URL.",
+        updated_at: configUpdatedByKey.get("slack") ?? now,
+        editable: true,
+        config: {
+          bot_token_configured: hasValue(config.slack.botToken),
+          default_channel: config.slack.defaultChannel,
+          webhook_url_configured: hasValue(config.slack.webhookUrl)
+        }
+      },
+      {
         key: "email",
         label: "Email Adapter",
         status:
@@ -1209,36 +1491,35 @@ export async function buildServer() {
   );
 
   app.get("/leads", async () => {
+    const leadMetrics = await repo.listLeadFunnelMetrics();
     const leadRuns = await repo.listLeadRunSummaries(12);
-    const scraperRuns = leadRuns.filter((run) => run.agent_profile === "lead_scraper");
-    const strategistRuns = leadRuns.filter((run) => run.agent_profile === "lead_strategist");
-    const completedScraperRuns = scraperRuns.filter((run) => run.status === "completed").length;
-    const completedStrategistRuns = strategistRuns.filter((run) => run.status === "completed").length;
-    const progressionCount = leadRuns.filter((run) =>
-      ["provisioning", "starting", "running", "evaluating"].includes(run.status)
-    ).length;
     const sheetId = SALVO_LEAD_PIPELINE_SHEET_ID.trim();
     const sheetUrl = sheetId ? `https://docs.google.com/spreadsheets/d/${sheetId}` : null;
-    const now = Date.now();
 
     const funnel = [
       {
-        id: "raw",
-        label: "Raw leads ingested",
-        count: scraperRuns.length * 8 + completedScraperRuns,
-        detail: `${scraperRuns.length} scraper runs visible`
+        id: "scraped",
+        label: "Scraped leads",
+        count: leadMetrics.scraped_count,
+        detail: "Real lead rows captured in salvo_leads."
       },
       {
-        id: "enriched",
-        label: "Enriched leads ready",
-        count: strategistRuns.length * 5 + completedStrategistRuns,
-        detail: `${strategistRuns.length} strategist runs captured`
+        id: "qualified",
+        label: "Qualified leads",
+        count: leadMetrics.qualified_count,
+        detail: "Rows promoted into strategist follow-up."
       },
       {
-        id: "in_progress",
-        label: "Strategist queue",
-        count: progressionCount,
-        detail: `${progressionCount} runs progressing`
+        id: "contacted",
+        label: "Contacted leads",
+        count: leadMetrics.contacted_count,
+        detail: "Rows with outreach logged."
+      },
+      {
+        id: "converted",
+        label: "Converted leads",
+        count: leadMetrics.converted_count,
+        detail: "Rows that reached conversion."
       }
     ];
 
@@ -1256,7 +1537,7 @@ export async function buildServer() {
         progress,
         status,
         scrapes_this_week: scrapesThisWeek,
-        last_updated_at: new Date(now - zone.priority * 60 * 60 * 1000).toISOString()
+        last_updated_at: new Date(Date.now() - zone.priority * 60 * 60 * 1000).toISOString()
       };
     });
 
@@ -1296,7 +1577,7 @@ export async function buildServer() {
 
     return {
       sheet_url: sheetUrl,
-      updated_at: new Date().toISOString(),
+      updated_at: leadMetrics.updated_at,
       funnel,
       zones,
       runs
@@ -1308,7 +1589,7 @@ export async function buildServer() {
     Body: Record<string, unknown>;
   }>("/integrations/:key/config", async (req, reply) => {
     const key = req.params.key;
-    if (!["supabase", "llm_api", "process", "http", "google_sheets", "email"].includes(key)) {
+    if (!["supabase", "llm_api", "process", "http", "google_sheets", "slack", "email"].includes(key)) {
       return reply.status(400).send({ ok: false, error: "Invalid integration key." });
     }
 
@@ -1386,6 +1667,30 @@ export async function buildServer() {
       }
       if (typeof body.credentialsJson === "string") {
         nextConfig.credentialsJson = body.credentialsJson.trim();
+      }
+    } else if (key === "slack") {
+      const parsedBody = parseRequestBody(integrationConfigSchemas.slack, rawBody);
+      if (!parsedBody.ok) {
+        return reply.status(400).send({
+          error: "Invalid request body.",
+          issues: parsedBody.issues
+        });
+      }
+      if (!hasConfigChanges(parsedBody.value)) {
+        return reply.status(400).send({
+          error: "Invalid request body.",
+          issues: [{ path: "body", message: "At least one config field is required." }]
+        });
+      }
+      const body = parsedBody.value;
+      if (typeof body.botToken === "string" && body.botToken.trim().length > 0) {
+        nextConfig.botToken = body.botToken.trim();
+      }
+      if (typeof body.defaultChannel === "string") {
+        nextConfig.defaultChannel = body.defaultChannel.trim();
+      }
+      if (typeof body.webhookUrl === "string") {
+        nextConfig.webhookUrl = body.webhookUrl.trim();
       }
     } else if (key === "process") {
       const parsedBody = parseRequestBody(integrationConfigSchemas.process, rawBody);
@@ -1672,6 +1977,92 @@ export async function buildServer() {
     };
   });
 
+  app.get("/workspace-policies", async () => {
+    const [workspaces, policies] = await Promise.all([
+      repo.listWorkspaces(),
+      repo.listWorkspaceToolPolicies()
+    ]);
+
+    return {
+      updated_at: new Date().toISOString(),
+      workspaces: workspaces.map((workspace) => ({
+        id: workspace.id,
+        name: workspace.name
+      })),
+      policies
+    };
+  });
+
+  app.post<{
+    Body: {
+      workspaceId: string;
+      allowedReadPaths?: string[];
+      allowedWritePaths?: string[];
+      forbiddenPaths?: string[];
+      allowedCommands?: string[];
+      allowedCommandCwds?: string[];
+      commandTimeoutMs?: number;
+    };
+  }>("/workspace-policies", async (req, reply) => {
+    const parsedBody = parseRequestBody(workspaceToolPolicySchema, req.body ?? {});
+    if (!parsedBody.ok) {
+      return reply.status(400).send({
+        error: "Invalid request body.",
+        issues: parsedBody.issues
+      });
+    }
+
+    const body = parsedBody.value;
+    const workspace = await repo.getWorkspace(body.workspaceId);
+    if (!workspace) {
+      return reply.status(404).send({
+        error: `Workspace not found: ${body.workspaceId}`
+      });
+    }
+
+    const policyJson: Record<string, unknown> = {};
+    if (body.allowedReadPaths) {
+      policyJson.allowedReadPaths = body.allowedReadPaths;
+    }
+    if (body.allowedWritePaths) {
+      policyJson.allowedWritePaths = body.allowedWritePaths;
+    }
+    if (body.forbiddenPaths) {
+      policyJson.forbiddenPaths = body.forbiddenPaths;
+    }
+    if (body.allowedCommands) {
+      policyJson.allowedCommands = body.allowedCommands;
+    }
+    if (body.allowedCommandCwds) {
+      policyJson.allowedCommandCwds = body.allowedCommandCwds;
+    }
+    if (typeof body.commandTimeoutMs === "number") {
+      policyJson.commandTimeoutMs = body.commandTimeoutMs;
+    }
+
+    const policy = await repo.upsertWorkspaceToolPolicy({
+      workspaceId: workspace.id,
+      policyJson
+    });
+    await repo.createAuditEvent({
+      actor: auditActor(req),
+      action: "workspace.tool_policy.updated",
+      target: policy.id,
+      metadata: {
+        workspace_id: policy.workspace_id,
+        policy_json: policy.policy_json
+      }
+    });
+
+    return {
+      ok: true,
+      policy: {
+        ...policy,
+        workspace_name: workspace.name
+      }
+    };
+  });
+
   app.post<{
     Body: {
       message: string;
@@ -1727,9 +2118,15 @@ export async function buildServer() {
         .map((message) => message.message_text);
     }
 
-    if (!targetWorkspaceId) {
-      targetWorkspaceId = (await repo.ensureWorkspace()).id;
+    const targetWorkspace = targetWorkspaceId
+      ? await repo.getWorkspace(targetWorkspaceId)
+      : await repo.ensureWorkspace("default", workspaceRoot);
+    if (!targetWorkspace) {
+      return reply.status(404).send({
+        error: `Workspace not found: ${targetWorkspaceId}`
+      });
     }
+    targetWorkspaceId = targetWorkspace.id;
 
     const fullRequest = [...priorUserMessages, userMessage].join("\n").trim();
     const ambiguous = isAmbiguousTaskChatRequest(userMessage, fullRequest);
@@ -1738,7 +2135,14 @@ export async function buildServer() {
     if (ambiguous) {
       response = "I need a bit more detail before I can draft a contract. What should be built, where it should live, and what done looks like?";
     } else {
-      proposedContract = buildTaskChatProposal(targetWorkspaceId, fullRequest);
+      const integrationConfigs = await repo.listIntegrationConfigs();
+      proposedContract = await createTaskChatProposal({
+        repo,
+        workspaceId: targetWorkspaceId,
+        workspacePath: targetWorkspace.local_path,
+        request: fullRequest,
+        integrationConfigs
+      });
       response = `I drafted a contract proposal for "${proposedContract.title}". Approve it to create the task and contract.`;
     }
 
@@ -1863,6 +2267,7 @@ export async function buildServer() {
       request: string;
       workspaceId?: string;
       requiresApproval?: boolean;
+      priority?: (typeof TASK_PRIORITIES)[number];
     };
   }>("/tasks", async (req, reply) => {
     const parsedBody = parseRequestBody(taskCreateSchema, req.body ?? {});
@@ -1889,7 +2294,8 @@ export async function buildServer() {
               title: body.title,
               request: body.request,
               workspaceId: body.workspaceId,
-              requiresApproval: body.requiresApproval
+              requiresApproval: body.requiresApproval,
+              priority: body.priority
             },
             {
               idempotencyKey,
@@ -1902,7 +2308,8 @@ export async function buildServer() {
               title: body.title,
               request: body.request,
               workspaceId: body.workspaceId,
-              requiresApproval: body.requiresApproval
+              requiresApproval: body.requiresApproval,
+              priority: body.priority
             }),
             duplicate: false,
             responseStatus: 201

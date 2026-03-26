@@ -14,6 +14,7 @@ export type AdapterRunResult = {
   ok: boolean;
   detail: string;
   output?: unknown;
+  retryable?: boolean;
 };
 
 export interface Adapter {

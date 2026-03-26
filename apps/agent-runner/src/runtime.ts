@@ -7,7 +7,14 @@ import {
   usageCostUsd,
   type LlmProvider as SharedLlmProvider
 } from "@salvo/shared";
-import { buildToolPolicy, type CommandExecutionResult, type FileReadResult, type ToolPolicy } from "@salvo/tools";
+import {
+  buildToolPolicy,
+  mergeToolPolicies,
+  type CommandExecutionResult,
+  type FileReadResult,
+  type ToolPolicy,
+  type ToolPolicyOverlay
+} from "@salvo/tools";
 export type RunnerLlmProvider = SharedLlmProvider;
 
 export type RunnerLlmConfig = {
@@ -76,19 +83,32 @@ function normalizePath(pathValue: string): string {
   return pathValue.replace(/\\/g, "/");
 }
 
+function readStringArray(value: Record<string, unknown>, key: string): string[] | undefined {
+  const raw = value[key];
+  if (!Array.isArray(raw)) {
+    return undefined;
+  }
+
+  const parsed = raw.flatMap((entry) =>
+    typeof entry === "string" && entry.trim().length > 0 ? [entry.trim()] : []
+  );
+  return parsed.length > 0 ? parsed : [];
+}
+
 export function validateRunnerContract(contractJson: Record<string, unknown>): ContractV1 {
   return validateContractV1(contractJson);
 }
 
 export function parseContractPolicy(
   workspaceRoot: string,
-  contract: ContractV1
+  contract: ContractV1,
+  workspacePolicyJson?: Record<string, unknown> | null
 ): ToolPolicy {
   const allowedCommands = contract.capabilities.run_tests
     ? ["echo", "ls", "cat", "pnpm", "npm", "node"]
     : ["echo", "ls", "cat"];
 
-  return buildToolPolicy(workspaceRoot, {
+  const base = buildToolPolicy(workspaceRoot, {
     allowedReadPaths: contract.scope.read_paths,
     allowedWritePaths: contract.scope.write_paths,
     forbiddenPaths: contract.scope.forbidden_paths,
@@ -96,6 +116,35 @@ export function parseContractPolicy(
     allowedCommands,
     commandTimeoutMs: contract.constraints.max_runtime_minutes * 60_000
   });
+
+  const workspacePolicy = parseWorkspacePolicyOverlay(workspacePolicyJson);
+  return mergeToolPolicies(base, workspacePolicy, workspaceRoot);
+}
+
+export function parseWorkspacePolicyOverlay(
+  policyJson: Record<string, unknown> | null | undefined
+): ToolPolicyOverlay {
+  if (!policyJson) {
+    return {};
+  }
+  if (typeof policyJson !== "object" || Array.isArray(policyJson)) {
+    return {};
+  }
+
+  const commandTimeoutMs =
+    typeof policyJson.commandTimeoutMs === "number" && Number.isFinite(policyJson.commandTimeoutMs)
+      ? policyJson.commandTimeoutMs
+      : undefined;
+
+  return {
+    allowedReadPaths: readStringArray(policyJson, "allowedReadPaths"),
+    allowedWritePaths: readStringArray(policyJson, "allowedWritePaths"),
+    forbiddenPaths: readStringArray(policyJson, "forbiddenPaths"),
+    allowedCommands: readStringArray(policyJson, "allowedCommands"),
+    allowedCommandCwds: readStringArray(policyJson, "allowedCommandCwds"),
+    commandTimeoutMs:
+      typeof commandTimeoutMs === "number" && commandTimeoutMs > 0 ? commandTimeoutMs : undefined
+  };
 }
 
 export function reserveToolCall(
@@ -134,7 +183,7 @@ export function resolveRunnerLlmConfig(input: {
   const configuredBaseUrl = readString(llmConfig, "baseUrl", input.env.SALVO_LLM_BASE_URL);
   const baseUrl =
     configuredBaseUrl ||
-    (routing.provider === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com/v1");
+    (routing.provider === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com");
   const model = routing.model;
 
   if (!apiKey) {
@@ -294,7 +343,7 @@ function parseOpenAiResponse(responseJson: Record<string, unknown>, config: Runn
   };
 }
 
-function parseAnthropicResponse(responseJson: Record<string, unknown>, config: RunnerLlmConfig): RunnerLlmResult {
+function parseAnthropicStyleResponse(responseJson: Record<string, unknown>, config: RunnerLlmConfig): RunnerLlmResult {
   const contentBlocks = Array.isArray(responseJson.content) ? responseJson.content : [];
   const text = contentBlocks
     .map((block) => (typeof (block as { text?: unknown }).text === "string" ? (block as { text: string }).text : ""))
@@ -302,7 +351,7 @@ function parseAnthropicResponse(responseJson: Record<string, unknown>, config: R
     .trim();
 
   if (!text) {
-    throw new Error("Anthropic response did not include text content.");
+    throw new Error("LLM response did not include text content.");
   }
 
   const usage = (responseJson.usage ?? {}) as {
@@ -354,13 +403,18 @@ export async function runLlmGeneration(input: {
     });
 
     if (!response.ok) {
-      throw new Error(`Anthropic request failed: ${response.status} ${await response.text()}`);
+      throw new Error(`LLM request failed: ${response.status} ${await response.text()}`);
     }
 
-    return parseAnthropicResponse((await response.json()) as Record<string, unknown>, input.config);
+    return parseAnthropicStyleResponse((await response.json()) as Record<string, unknown>, input.config);
   }
 
-  const response = await fetch(`${input.config.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+  const baseUrl = input.config.baseUrl.replace(/\/$/, "");
+  const chatCompletionsUrl = baseUrl.endsWith("/v1")
+    ? `${baseUrl}/chat/completions`
+    : `${baseUrl}/v1/chat/completions`;
+
+  const response = await fetch(chatCompletionsUrl, {
     method: "POST",
     headers: {
       "content-type": "application/json",

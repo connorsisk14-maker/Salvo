@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import path from "node:path";
 import {
   buildRunnerPrompts,
   normalizeArtifacts,
   parseRunnerModelOutput,
+  parseContractPolicy,
   reserveToolCall,
   resolveRunnerLlmConfig,
   validateRunnerContract
@@ -61,19 +63,23 @@ test("normalizeArtifacts ensures required contract deliverables exist", () => {
     objective: { primary: "Write summary", secondary: [], non_goals: [] },
     context: { relevant_files: [], recent_runs: [], memory_excerpt_ids: [] },
     scope: { read_paths: ["."], write_paths: ["."], forbidden_paths: [".git"] },
-    capabilities: {
-      filesystem_read: true,
-      filesystem_write: true,
-      run_tests: true,
-      install_packages: false,
-      network_access: false,
-      email_send: false,
-      db_read: true,
-      db_write: false
-    },
+      capabilities: {
+        filesystem_read: true,
+        filesystem_write: true,
+        run_tests: true,
+        install_packages: false,
+        network_access: false,
+        email_send: false,
+        slack_send: false,
+        db_read: true,
+        db_write: false
+      },
     constraints: {
       max_runtime_minutes: 25,
       max_tool_calls: 20,
+      max_total_input_tokens: 60_000,
+      max_total_output_tokens: 20_000,
+      max_total_cost_usd: 3,
       no_destructive_commands: true,
       approval_required_for: []
     },
@@ -118,19 +124,23 @@ test("buildRunnerPrompts includes contract and workspace context", () => {
     objective: { primary: "Write summary", secondary: [], non_goals: [] },
     context: { relevant_files: ["README.md"], recent_runs: [], memory_excerpt_ids: [] },
     scope: { read_paths: ["."], write_paths: ["."], forbidden_paths: [".git"] },
-    capabilities: {
-      filesystem_read: true,
-      filesystem_write: true,
-      run_tests: true,
-      install_packages: false,
-      network_access: false,
-      email_send: false,
-      db_read: true,
-      db_write: false
-    },
+      capabilities: {
+        filesystem_read: true,
+        filesystem_write: true,
+        run_tests: true,
+        install_packages: false,
+        network_access: false,
+        email_send: false,
+        slack_send: false,
+        db_read: true,
+        db_write: false
+      },
     constraints: {
       max_runtime_minutes: 25,
       max_tool_calls: 20,
+      max_total_input_tokens: 60_000,
+      max_total_output_tokens: 20_000,
+      max_total_cost_usd: 3,
       no_destructive_commands: true,
       approval_required_for: []
     },
@@ -172,6 +182,72 @@ test("buildRunnerPrompts includes contract and workspace context", () => {
   assert.equal(prompts.systemPrompt.includes("salvo_complete"), true);
   assert.equal(prompts.userPrompt.includes("file: README.md"), true);
   assert.equal(prompts.userPrompt.includes("\"required_artifacts\""), true);
+});
+
+test("parseContractPolicy merges workspace overlays relative to the run root", () => {
+  const contract = validateRunnerContract({
+    schema_version: 1,
+    contract_id: "d7f0c34d-954a-4ab1-a495-88e6b3f61073",
+    task_id: "abf16ef2-9f8b-4024-a0b2-4e4b8f5ec3d2",
+    workspace_id: "fa2ef394-0fa2-4a28-85a4-3977ab2a06c1",
+    created_at: new Date().toISOString(),
+    objective: { primary: "Write summary", secondary: [], non_goals: [] },
+    context: { relevant_files: [], recent_runs: [], memory_excerpt_ids: [] },
+    scope: { read_paths: ["."], write_paths: ["."], forbidden_paths: [".git"] },
+    capabilities: {
+      filesystem_read: true,
+      filesystem_write: true,
+      run_tests: true,
+      install_packages: false,
+      network_access: false,
+      email_send: false,
+      slack_send: false,
+      db_read: true,
+      db_write: false
+    },
+    constraints: {
+      max_runtime_minutes: 25,
+      max_tool_calls: 20,
+      max_total_input_tokens: 60_000,
+      max_total_output_tokens: 20_000,
+      max_total_cost_usd: 3,
+      no_destructive_commands: true,
+      approval_required_for: []
+    },
+    deliverables: {
+      required_artifacts: ["run-summary.md"],
+      evidence_required: true,
+      summary_required: true
+    },
+    success_criteria: {
+      required_test_commands: [],
+      assertions: []
+    },
+    failure_handling: { stop_on_policy_denial: true },
+    learnings_output: { required: true },
+    risk: "low",
+    category: "general",
+    family_key: "family_test",
+    agent_profile: "builder"
+  });
+
+  const policy = parseContractPolicy(
+    "/tmp/salvo-runtime",
+    contract,
+    {
+      allowedReadPaths: ["packages/shared"],
+      allowedWritePaths: ["packages/shared"],
+      allowedCommands: ["node", "pnpm"],
+      allowedCommandCwds: ["."],
+      commandTimeoutMs: 10_000
+    }
+  );
+
+  assert.deepEqual(policy.allowedReadPaths, [path.resolve("/tmp/salvo-runtime", "packages/shared")]);
+  assert.deepEqual(policy.allowedWritePaths, [path.resolve("/tmp/salvo-runtime", "packages/shared")]);
+  assert.deepEqual(policy.allowedCommands, ["node", "pnpm"]);
+  assert.deepEqual(policy.allowedCommandCwds, [path.resolve("/tmp/salvo-runtime")]);
+  assert.equal(policy.commandTimeoutMs, 10_000);
 });
 
 test("reserveToolCall throws once the contract budget is exceeded", () => {

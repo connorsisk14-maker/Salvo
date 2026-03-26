@@ -5,6 +5,11 @@ import type {
   AdapterRunResult,
   AdapterHealth
 } from "./types";
+import {
+  executeAdapterRunWithReliability,
+  FatalAdapterError,
+  RetryableAdapterError
+} from "./reliability";
 
 type GoogleServiceAccount = {
   client_email: string;
@@ -116,7 +121,7 @@ export class GoogleSheetsAdapter implements Adapter {
   }
 
   async run(request: AdapterRunRequest): Promise<AdapterRunResult> {
-    try {
+    return executeAdapterRunWithReliability(this.key, async () => {
       this.ensureConfiguration();
       const { actionDescription, output } = await this.executeAction(request.payload ?? {});
       return {
@@ -124,12 +129,7 @@ export class GoogleSheetsAdapter implements Adapter {
         detail: `Google Sheets ${actionDescription} completed.`,
         output
       };
-    } catch (error) {
-      return {
-        ok: false,
-        detail: (error as Error).message
-      };
-    }
+    });
   }
 
   private parseCredentials(): GoogleServiceAccount | null {
@@ -159,23 +159,20 @@ export class GoogleSheetsAdapter implements Adapter {
 
   private ensureConfiguration(): void {
     if (!this.#spreadsheetId) {
-      throw new Error("Spreadsheet ID is not configured.");
+      throw new FatalAdapterError("Spreadsheet ID is not configured.");
     }
     if (!this.#credentials) {
-      throw new Error(this.#credentialsError ?? "Google Sheets credentials are not configured.");
+      throw new FatalAdapterError(this.#credentialsError ?? "Google Sheets credentials are not configured.");
     }
   }
 
   private async executeAction(payload: Record<string, unknown>) {
     const action = (payload.action as RunAction | undefined) ?? "";
     if (!action) {
-      throw new Error("Google Sheets action is required.");
+      throw new FatalAdapterError("Google Sheets action is required.");
     }
 
     const range = this.requireString(payload.range, "range");
-    if (!range) {
-      throw new Error("Google Sheets range is required.");
-    }
 
     if (action === "read_range") {
       const majorDimension = this.coerceDimension((payload as ReadRangePayload).majorDimension);
@@ -234,7 +231,7 @@ export class GoogleSheetsAdapter implements Adapter {
       };
     }
 
-    throw new Error(`Unsupported Google Sheets action: ${action}`);
+    throw new FatalAdapterError(`Unsupported Google Sheets action: ${action}`);
   }
 
   private coerceDimension(value: unknown): "ROWS" | "COLUMNS" {
@@ -254,17 +251,17 @@ export class GoogleSheetsAdapter implements Adapter {
 
   private coerceRows(value: unknown): unknown[][] {
     if (!Array.isArray(value)) {
-      throw new Error("Google Sheets values must be an array of rows.");
+      throw new FatalAdapterError("Google Sheets values must be an array of rows.");
     }
     if (value.some((row) => !Array.isArray(row))) {
-      throw new Error("Each Google Sheets row must be an array of cells.");
+      throw new FatalAdapterError("Each Google Sheets row must be an array of cells.");
     }
     return value as unknown[][];
   }
 
   private requireString(value: unknown, label: string): string {
     if (typeof value !== "string" || !value.trim()) {
-      throw new Error(`Google Sheets ${label} must be a non-empty string.`);
+      throw new FatalAdapterError(`Google Sheets ${label} must be a non-empty string.`);
     }
     return value.trim();
   }
@@ -292,28 +289,38 @@ export class GoogleSheetsAdapter implements Adapter {
       headers["content-type"] = "application/json";
     }
 
-    const response = await this.#fetch(fullUrl, {
-      ...init,
-      headers: {
-        ...headers,
-        ...(init.headers ?? {})
-      }
-    });
-
-    const text = await response.text();
-    if (!response.ok) {
-      const message = text || `Google Sheets API responded with ${response.status}.`;
-      throw new Error(message);
-    }
-
-    if (!text) {
-      return {};
-    }
-
     try {
-      return JSON.parse(text) as Record<string, unknown>;
-    } catch {
-      return {};
+      const response = await this.#fetch(fullUrl, {
+        ...init,
+        headers: {
+          ...headers,
+          ...(init.headers ?? {})
+        }
+      });
+
+      const text = await response.text();
+      if (!response.ok) {
+        const message = text || `Google Sheets API responded with ${response.status}.`;
+        if (response.status >= 500) {
+          throw new RetryableAdapterError(message);
+        }
+        throw new FatalAdapterError(message);
+      }
+
+      if (!text) {
+        return {};
+      }
+
+      try {
+        return JSON.parse(text) as Record<string, unknown>;
+      } catch {
+        return {};
+      }
+    } catch (error) {
+      if (error instanceof FatalAdapterError || error instanceof RetryableAdapterError) {
+        throw error;
+      }
+      throw new RetryableAdapterError((error as Error).message);
     }
   }
 
@@ -323,13 +330,17 @@ export class GoogleSheetsAdapter implements Adapter {
     }
 
     if (!this.#credentials) {
-      throw new Error("Google Sheets credentials are not configured.");
+      throw new FatalAdapterError("Google Sheets credentials are not configured.");
     }
 
-    const tokenResponse = await this.#tokenProvider(this.#credentials, this.#fetch);
-    this.#cachedToken = tokenResponse.token;
-    this.#tokenExpiresAt = Date.now() + tokenResponse.expiresIn * 1000;
-    return this.#cachedToken;
+    try {
+      const tokenResponse = await this.#tokenProvider(this.#credentials, this.#fetch);
+      this.#cachedToken = tokenResponse.token;
+      this.#tokenExpiresAt = Date.now() + tokenResponse.expiresIn * 1000;
+      return this.#cachedToken;
+    } catch (error) {
+      throw new RetryableAdapterError((error as Error).message);
+    }
   }
 
   private static async requestTokenWithJwt(
@@ -366,12 +377,14 @@ export class GoogleSheetsAdapter implements Adapter {
 
     if (!response.ok) {
       const message = await response.text();
-      throw new Error(message || `Google OAuth token request failed with ${response.status}.`);
+      throw new RetryableAdapterError(
+        message || `Google OAuth token request failed with ${response.status}.`
+      );
     }
 
     const json = (await response.json()) as { access_token?: string; expires_in?: number };
     if (!json.access_token) {
-      throw new Error("Google OAuth response did not include an access token.");
+      throw new FatalAdapterError("Google OAuth response did not include an access token.");
     }
 
     return {

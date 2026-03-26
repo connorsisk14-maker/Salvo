@@ -14,6 +14,14 @@ import {
 
 type ReviewFilter = "unreviewed" | "accepted" | "rejected";
 
+function matchesQuery(query: string, ...values: Array<string | null | undefined>): boolean {
+  if (!query) {
+    return true;
+  }
+
+  return values.some((value) => typeof value === "string" && value.toLowerCase().includes(query));
+}
+
 export function ResearchReviewPage() {
   const [filter, setFilter] = useState<ReviewFilter>("unreviewed");
   const [docs, setDocs] = useState<ApiResearchDoc[]>([]);
@@ -21,6 +29,7 @@ export function ResearchReviewPage() {
   const [memories, setMemories] = useState<ApiMemory[]>([]);
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
 
   async function refresh(nextFilter = filter) {
     try {
@@ -109,6 +118,32 @@ export function ResearchReviewPage() {
     [docs.length, experiments.length, memories.length]
   );
 
+  const normalizedQuery = query.trim().toLowerCase();
+
+  const filteredDocs = useMemo(() => {
+    return docs.filter((doc) =>
+      matchesQuery(normalizedQuery, doc.title, doc.topic, doc.id, doc.source_run_ids.join(" "))
+    );
+  }, [docs, normalizedQuery]);
+
+  const filteredExperiments = useMemo(() => {
+    return experiments.filter((experiment) =>
+      matchesQuery(
+        normalizedQuery,
+        experiment.contract_category,
+        experiment.contract_subcategory,
+        experiment.contract_family_key,
+        experiment.body_markdown
+      )
+    );
+  }, [experiments, normalizedQuery]);
+
+  const filteredMemories = useMemo(() => {
+    return memories.filter((memory) =>
+      matchesQuery(normalizedQuery, memory.title, memory.memory_type, memory.id, memory.source_run_ids.join(" "))
+    );
+  }, [memories, normalizedQuery]);
+
   return (
     <div className="content clip-card">
       <header className="content-header">
@@ -130,11 +165,21 @@ export function ResearchReviewPage() {
               <option value="rejected">rejected</option>
             </select>
           </label>
+          <label>
+            Search memory graph
+            <input
+              type="search"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="Search titles, families, topics, run IDs"
+            />
+          </label>
         </div>
 
         <p className="muted">
-          Showing {reviewCounts.docs} research docs, {reviewCounts.experiments} experiments, and{" "}
-          {reviewCounts.memories} memory entries.
+          Showing {filteredDocs.length} of {reviewCounts.docs} research docs, {filteredExperiments.length} of{" "}
+          {reviewCounts.experiments} experiments, and {filteredMemories.length} of {reviewCounts.memories} memory
+          entries.
         </p>
       </section>
 
@@ -151,7 +196,7 @@ export function ResearchReviewPage() {
             </tr>
           </thead>
           <tbody>
-            {docs.map((doc) => (
+            {filteredDocs.map((doc) => (
               <tr key={doc.id}>
                 <td>
                   <strong>{doc.title}</strong>
@@ -184,6 +229,13 @@ export function ResearchReviewPage() {
                 </td>
               </tr>
             ))}
+            {filteredDocs.length === 0 ? (
+              <tr>
+                <td colSpan={5} className="muted">
+                  No research documents match this filter.
+                </td>
+              </tr>
+            ) : null}
           </tbody>
         </table>
       </section>
@@ -202,7 +254,7 @@ export function ResearchReviewPage() {
             </tr>
           </thead>
           <tbody>
-            {experiments.map((experiment) => (
+            {filteredExperiments.map((experiment) => (
               <tr key={experiment.id}>
                 <td>
                   <strong>{experiment.contract_category}</strong>
@@ -251,12 +303,19 @@ export function ResearchReviewPage() {
                 </td>
               </tr>
             ))}
+            {filteredExperiments.length === 0 ? (
+              <tr>
+                <td colSpan={6} className="muted">
+                  No research experiments match this filter.
+                </td>
+              </tr>
+            ) : null}
           </tbody>
         </table>
       </section>
 
       <section className="panel">
-        <h2>Memory Entries</h2>
+        <h2>Memory Browser</h2>
         <table className="grid-table">
           <thead>
             <tr>
@@ -268,7 +327,7 @@ export function ResearchReviewPage() {
             </tr>
           </thead>
           <tbody>
-            {memories.map((memory) => (
+            {filteredMemories.map((memory) => (
               <tr key={memory.id}>
                 <td>
                   <strong>{memory.title}</strong>
@@ -301,6 +360,13 @@ export function ResearchReviewPage() {
                 </td>
               </tr>
             ))}
+            {filteredMemories.length === 0 ? (
+              <tr>
+                <td colSpan={5} className="muted">
+                  No memories match this filter.
+                </td>
+              </tr>
+            ) : null}
           </tbody>
         </table>
       </section>

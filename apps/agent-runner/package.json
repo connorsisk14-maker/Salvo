@@ -14,6 +14,7 @@
     "@salvo/contracts": "workspace:*",
     "@salvo/db": "workspace:*",
     "@salvo/llm": "workspace:*",
+    "@salvo/skills": "workspace:*",
     "@salvo/shared": "workspace:*",
     "@salvo/tools": "workspace:*"
   },

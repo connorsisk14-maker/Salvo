@@ -22,6 +22,14 @@ export type ExperimentMetrics = {
   };
 };
 
+export type ExperimentInsights = {
+  bestScoreRun?: string;
+  worstScoreRun?: string;
+  mostEventfulRun?: string;
+  notablePolicyDenials: string[];
+  recommendedAction: string;
+};
+
 function toFixedNumber(value: number, places = 4): number {
   return Number(value.toFixed(places));
 }
@@ -83,6 +91,48 @@ export function deriveExperimentMetrics(
   };
 }
 
+export function deriveExperimentInsights(
+  input: ReadonlyArray<ExperimentSample>,
+  metrics: ExperimentMetrics
+): ExperimentInsights {
+  const samples = normalizeExperimentSamples(input);
+  if (samples.length === 0) {
+    return {
+      notablePolicyDenials: [],
+      recommendedAction: "Insufficient experiment data to generate insights."
+    };
+  }
+
+  const bestScore = samples.reduce((acc, item) => (item.score >= acc.score ? item : acc));
+  const worstScore = samples.reduce((acc, item) => (item.score <= acc.score ? item : acc));
+  const mostEvents = samples.reduce(
+    (acc, item) => (item.event_count >= acc.event_count ? item : acc),
+    samples[0]
+  );
+  const policyDeniedRuns = samples
+    .filter((item) => item.policy_denial_count > 0)
+    .map((item) => item.run_id);
+
+  let recommendedAction = "Maintain the current experiment cadence.";
+  if (metrics.pass_rate >= 0.9) {
+    recommendedAction = "Pass rate is high; consider publishing this experiment summary.";
+  } else if (metrics.pass_rate < 0.5) {
+    recommendedAction = "Low pass rate observed; investigate failing runs before publishing.";
+  } else if (metrics.policy_denial_rate > 0.25) {
+    recommendedAction = "High policy denial rate; review denied runs for policy gaps.";
+  } else if (metrics.sample_size < 20) {
+    recommendedAction = "Collect more runs to stabilize metrics and raise confidence.";
+  }
+
+  return {
+    bestScoreRun: bestScore.run_id,
+    worstScoreRun: worstScore.run_id,
+    mostEventfulRun: mostEvents.run_id,
+    notablePolicyDenials: policyDeniedRuns,
+    recommendedAction
+  };
+}
+
 export function deriveExperimentConfidence(metrics: ExperimentMetrics): number {
   const rawScore =
     0.45 * metrics.pass_rate +
@@ -96,6 +146,7 @@ export function buildExperimentMarkdown(input: {
   category: string;
   subcategory: string | null;
   metrics: ExperimentMetrics;
+  insights: ExperimentInsights;
 }): string {
   return [
     `# Experiment Report: ${input.category}${input.subcategory ? `/${input.subcategory}` : ""}`,
@@ -114,6 +165,13 @@ export function buildExperimentMarkdown(input: {
     `- Pass Rate: ${toFixedNumber(input.metrics.pass_rate * 100, 2)}%`,
     `- Average Score: ${toFixedNumber(input.metrics.average_score, 2)}`,
     `- Policy Denial Rate: ${toFixedNumber(input.metrics.policy_denial_rate * 100, 2)}%`,
-    `- Average Event Count: ${toFixedNumber(input.metrics.average_event_count, 2)}`
+    `- Average Event Count: ${toFixedNumber(input.metrics.average_event_count, 2)}`,
+    "",
+    "## Research Insights",
+    `- Highest scoring run: ${input.insights.bestScoreRun ?? "n/a"}`,
+    `- Lowest scoring run: ${input.insights.worstScoreRun ?? "n/a"}`,
+    `- Most eventful run: ${input.insights.mostEventfulRun ?? "n/a"}`,
+    `- Policy denials observed: ${input.insights.notablePolicyDenials.length} (${input.insights.notablePolicyDenials.join(", ") || "none"})`,
+    `- Recommendation: ${input.insights.recommendedAction}`
   ].join("\n");
 }
