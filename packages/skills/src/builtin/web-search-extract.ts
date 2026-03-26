@@ -24,10 +24,19 @@ type WebSearchExtractOutput = {
 };
 
 type HttpFetcher = {
-  fetch(url: string): Promise<{ ok: boolean; status: number; json(): Promise<unknown>; text(): Promise<string> }>;
+  baseUrl?: string;
+  request?(input: {
+    path?: string;
+    url?: string;
+    query?: Record<string, string | number | boolean | undefined>;
+  }): Promise<{ ok: boolean; status: number; json(): Promise<unknown>; text(): Promise<string> }>;
+  fetch?(
+    url: string,
+    init?: RequestInit
+  ): Promise<{ ok: boolean; status: number; json(): Promise<unknown>; text(): Promise<string> }>;
 };
 
-const SEARCH_ENDPOINT = "https://search.salvo.local/api/business";
+const SEARCH_PATH = "/api/business";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -35,19 +44,25 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function resolveFetcher(context: SkillExecutionContext): HttpFetcher {
   const candidate = ((context.adapters ?? {}) as Record<string, unknown>).http;
-  if (!candidate || typeof (candidate as HttpFetcher).fetch !== "function") {
+  if (!candidate) {
     throw new Error("http adapter not configured");
   }
-  return candidate as HttpFetcher;
+  const fetcher = candidate as HttpFetcher;
+  if (typeof fetcher.request !== "function" && typeof fetcher.fetch !== "function") {
+    throw new Error("http adapter not configured");
+  }
+  return fetcher;
 }
 
-function buildUrl(query: string, location: string, limit: number): string {
-  const searchParams = new URLSearchParams({
-    q: query,
-    loc: location,
-    limit: limit.toString()
-  });
-  return `${SEARCH_ENDPOINT}?${searchParams.toString()}`;
+function buildUrl(baseUrl: string, query: string, location: string, limit: number): string {
+  const url = new URL(
+    SEARCH_PATH.replace(/^\/+/, ""),
+    baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`
+  );
+  url.searchParams.set("q", query);
+  url.searchParams.set("loc", location);
+  url.searchParams.set("limit", limit.toString());
+  return url.toString();
 }
 
 function normalizeResult(source: unknown): SearchResult | null {
@@ -107,18 +122,32 @@ export const webSearchExtractSkill: Skill<WebSearchExtractInput, WebSearchExtrac
         ? Math.min(Math.max(Math.floor(input.limit), 1), 50)
         : 10;
     const fetcher = resolveFetcher(context);
-    const url = buildUrl(input.query.trim(), location, limit);
+    const query = input.query.trim();
+    const requestUrl =
+      typeof fetcher.baseUrl === "string" && fetcher.baseUrl.trim().length > 0
+        ? buildUrl(fetcher.baseUrl.trim(), query, location, limit)
+        : SEARCH_PATH;
 
     const resultEvents: SkillEvent[] = [];
     let results: SearchResult[] = [];
 
     try {
-      const response = await fetcher.fetch(url);
+      const response =
+        typeof fetcher.request === "function"
+          ? await fetcher.request({
+              path: SEARCH_PATH,
+              query: {
+                q: query,
+                loc: location,
+                limit
+              }
+            })
+          : await fetcher.fetch!(requestUrl);
       if (!response.ok) {
         resultEvents.push({
           type: "web_search_extract.rate_limit",
           level: "warn",
-          payload: { status: response.status, url }
+          payload: { status: response.status, url: requestUrl }
         });
         return {
           ok: false,
@@ -143,7 +172,7 @@ export const webSearchExtractSkill: Skill<WebSearchExtractInput, WebSearchExtrac
       resultEvents.push({
         type: "web_search_extract.failure",
         level: "error",
-        payload: { message: (error as Error).message, url }
+        payload: { message: (error as Error).message, url: requestUrl }
       });
       return {
         ok: false,

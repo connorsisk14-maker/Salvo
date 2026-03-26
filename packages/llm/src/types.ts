@@ -9,19 +9,39 @@ export type LlmPricing = {
 };
 
 export const MODEL_CATALOG = {
+  "gpt-5.4-mini": {
+    provider: "openai",
+    inputUsdPer1mTokens: 0.25,
+    outputUsdPer1mTokens: 2
+  },
+  "gpt-5.4": {
+    provider: "openai",
+    inputUsdPer1mTokens: 2.5,
+    outputUsdPer1mTokens: 15
+  },
   "gpt-5-mini": {
     provider: "openai",
-    inputUsdPer1mTokens: 0.3,
-    outputUsdPer1mTokens: 1.2
+    inputUsdPer1mTokens: 0.25,
+    outputUsdPer1mTokens: 2
   },
   "gpt-5-nano": {
     provider: "openai",
     inputUsdPer1mTokens: 0.05,
-    outputUsdPer1mTokens: 0.2
+    outputUsdPer1mTokens: 0.4
   },
   "gpt-5": {
     provider: "openai",
     inputUsdPer1mTokens: 1.25,
+    outputUsdPer1mTokens: 10
+  },
+  "gpt-4o-mini": {
+    provider: "openai",
+    inputUsdPer1mTokens: 0.15,
+    outputUsdPer1mTokens: 0.6
+  },
+  "gpt-4o": {
+    provider: "openai",
+    inputUsdPer1mTokens: 2.5,
     outputUsdPer1mTokens: 10
   },
   "claude-3-5-haiku": {
@@ -125,7 +145,8 @@ export type LlmStreamChunk =
 export function resolveModelPricing(model: string): LlmPricing | null {
   const normalizedModel = model.toLowerCase();
 
-  for (const [catalogModel, pricing] of Object.entries(MODEL_CATALOG)) {
+  const orderedEntries = Object.entries(MODEL_CATALOG).sort((left, right) => right[0].length - left[0].length);
+  for (const [catalogModel, pricing] of orderedEntries) {
     if (normalizedModel.includes(catalogModel)) {
       return pricing;
     }

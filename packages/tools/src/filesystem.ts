@@ -46,6 +46,28 @@ export class FilesystemAdapter {
     };
   }
 
+  async ensureDir(targetPath: string): Promise<void> {
+    const absolutePath = this.resolvePath(targetPath);
+    const decision = evaluateWritePathPolicy(absolutePath, this.policy);
+    if (!decision.allowed) {
+      throw new Error(decision.message);
+    }
+
+    await fs.mkdir(absolutePath, { recursive: true });
+  }
+
+  async ensureDirectory(targetPath: string): Promise<void> {
+    await this.ensureDir(targetPath);
+  }
+
+  async mkdir(targetPath: string): Promise<void> {
+    await this.ensureDir(targetPath);
+  }
+
+  async createDirectory(targetPath: string): Promise<void> {
+    await this.ensureDir(targetPath);
+  }
+
   async listDirectory(targetPath = "."): Promise<FileReadResult> {
     const absolutePath = this.resolvePath(targetPath);
     const decision = evaluateReadPathPolicy(absolutePath, this.policy);

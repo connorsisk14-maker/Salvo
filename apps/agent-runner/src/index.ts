@@ -1,8 +1,9 @@
 import path from "node:path";
 import { mkdir } from "node:fs/promises";
-import { EmailAdapter } from "@salvo/adapters";
+import { EmailAdapter, HttpAdapter } from "@salvo/adapters";
 import { createDbPool, SalvoRepository } from "@salvo/db";
-import { buildToolDefinitions, executeToolUse, LlmClient } from "@salvo/llm";
+import { executeToolUse, LlmClient } from "@salvo/llm";
+import { createBuiltinSkillRegistry } from "@salvo/skills";
 import { CommandAdapter, FilesystemAdapter } from "@salvo/tools";
 import { createLogger, initializeSecrets, type RunEventType } from "@salvo/shared";
 import {
@@ -99,6 +100,22 @@ async function main(): Promise<void> {
         ]
       })
     : undefined;
+  const httpConfig =
+    integrationConfigs.find((row) => row.integration_key === "http")?.config_json ?? {};
+  const httpBaseUrl = readIntegrationString(httpConfig, "baseUrl");
+  const httpToken = readIntegrationString(httpConfig, "token") || undefined;
+  const httpAdapter = httpBaseUrl ? new HttpAdapter(httpBaseUrl, httpToken) : undefined;
+  const skillRegistry = createBuiltinSkillRegistry();
+  const skillExecutionContext = {
+    workspacePath: workspaceRoot,
+    runId: run.id,
+    adapters: {
+      filesystem,
+      command,
+      ...(httpAdapter ? { http: httpAdapter } : {})
+    },
+    repo: {}
+  };
   const promptContext = await collectPromptContext({
     relevantFiles: contractJson.context.relevant_files,
     listDirectory: (targetPath) => filesystem.listDirectory(targetPath),
@@ -175,13 +192,10 @@ async function main(): Promise<void> {
       userPrompt: prompts.userPrompt,
       contract: contractJson,
       workspaceRoot,
+      skillRegistry,
       startedAtMs: run.started_at ? Date.parse(run.started_at) : undefined,
-      createMessage: (systemPrompt, messages) =>
-        llmClient.createMessage(
-          systemPrompt,
-          messages,
-          buildToolDefinitions(contractJson)
-        ),
+      createMessage: (systemPrompt, messages, tools) =>
+        llmClient.createMessage(systemPrompt, messages, tools),
       executeToolUse: async (block) =>
         executeToolUse({
           block,
@@ -211,6 +225,8 @@ async function main(): Promise<void> {
                 metadataJson: params.metadataJson
               })
           },
+          skillRegistry,
+          skillExecutionContext,
           emailAdapter,
           emailSendPolicy
         }),

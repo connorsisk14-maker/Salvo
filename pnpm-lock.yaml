@@ -39,6 +39,9 @@ importers:
       '@salvo/shared':
         specifier: workspace:*
         version: link:../../packages/shared
+      '@salvo/skills':
+        specifier: workspace:*
+        version: link:../../packages/skills
       '@salvo/tools':
         specifier: workspace:*
         version: link:../../packages/tools

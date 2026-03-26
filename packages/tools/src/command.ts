@@ -83,4 +83,22 @@ export class CommandAdapter {
       });
     });
   }
+
+  async runCommand(request: {
+    command: string;
+    args: string[];
+    cwd: string;
+    timeoutMs?: number;
+  }): Promise<CommandExecutionResult> {
+    return this.run(request.command, request.args, request.cwd, request.timeoutMs);
+  }
+
+  async execute(request: {
+    command: string;
+    args: string[];
+    cwd: string;
+    timeoutMs?: number;
+  }): Promise<CommandExecutionResult> {
+    return this.runCommand(request);
+  }
 }

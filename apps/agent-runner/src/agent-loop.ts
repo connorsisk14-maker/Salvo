@@ -28,6 +28,13 @@ export type AgentLoopInput = {
   contract: ContractV1;
   workspaceRoot: string;
   completionToolName?: string;
+  skillRegistry?: {
+    list(): Array<{
+      name: string;
+      description: string;
+      inputSchema: Record<string, unknown>;
+    }>;
+  };
   startedAtMs?: number;
   now?: () => number;
   createMessage: (
@@ -611,6 +618,7 @@ export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResu
   const completionToolName = input.completionToolName?.trim() || "salvo_complete";
   const tools = buildToolDefinitions(input.contract, {
     completionToolName,
+    skillRegistry: input.skillRegistry,
     additionalDefinitions: [PLAN_STEP_COMPLETE_TOOL]
   });
   const checkpoint = await input.loadCheckpoint?.();
