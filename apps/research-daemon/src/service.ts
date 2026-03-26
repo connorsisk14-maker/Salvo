@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 import { ResearchRepository } from "@salvo/db";
+import type { LlmConfig } from "@salvo/llm";
+import { resolveLlmProviderAndModel } from "@salvo/shared";
 import {
   buildExperimentMarkdown,
   deriveExperimentConfidence,
@@ -7,6 +9,11 @@ import {
   deriveExperimentMetrics,
   normalizeExperimentSamples
 } from "./analysis";
+import {
+  buildFallbackResearchMemoryDraft,
+  synthesizeResearchMemory,
+  type ResearchMemoryDraft
+} from "./synthesis";
 
 export type ResearchCycleStats = {
   ingested: number;
@@ -112,7 +119,11 @@ export class ResearchAnalysisService {
     let published = 0;
 
     for (const experiment of accepted) {
-      const didPublish = await this.repo.publishAcceptedResearchExperiment(experiment.id);
+      const synthesizedMemory = await this.buildResearchMemoryDraft(experiment);
+      const didPublish = await this.repo.publishAcceptedResearchExperiment(
+        experiment.id,
+        synthesizedMemory ?? undefined
+      );
       if (didPublish) {
         published += 1;
       }
@@ -130,5 +141,62 @@ export class ResearchAnalysisService {
       experiments,
       published
     };
+  }
+
+  private readString(config: Record<string, unknown>, key: string, fallback = ""): string {
+    const value = config[key];
+    return typeof value === "string" ? value : fallback;
+  }
+
+  private async resolveLlmConfig(): Promise<LlmConfig | null> {
+    const integrationConfigs = await this.repo.listIntegrationConfigs();
+    const llmConfig =
+      integrationConfigs.find((row) => row.integration_key === "llm_api")?.config_json ?? {};
+    const providerModel = resolveLlmProviderAndModel({
+      llmConfig,
+      env: process.env,
+      agentProfile: "researcher"
+    });
+    const apiKey =
+      this.readString(llmConfig, "apiKey", process.env.SALVO_LLM_API_KEY) ||
+      this.readString(llmConfig, "authToken", process.env.SALVO_CLAUDE_AUTH_TOKEN);
+    const baseUrl = this.readString(llmConfig, "baseUrl", process.env.SALVO_LLM_BASE_URL);
+
+    if (!apiKey || !baseUrl) {
+      return null;
+    }
+
+    return {
+      provider: providerModel.provider,
+      apiKey,
+      baseUrl,
+      model: providerModel.model,
+      maxTokens: 900,
+      temperature: 0.1
+    };
+  }
+
+  private async buildResearchMemoryDraft(
+    experiment: Awaited<ReturnType<ResearchRepository["listAcceptedUnpublishedResearchExperiments"]>>[number]
+  ): Promise<ResearchMemoryDraft | null> {
+    const llmConfig = await this.resolveLlmConfig();
+    if (!llmConfig) {
+      return buildFallbackResearchMemoryDraft(experiment);
+    }
+
+    const researchContext = await this.repo.listResearchContext(experiment.workspace_id, 5);
+    const memoryContext = await this.repo.listMemoryContext(experiment.workspace_id, 5);
+
+    try {
+      const synthesized = await synthesizeResearchMemory({
+        experiment,
+        researchContext,
+        memoryContext,
+        llmConfig
+      });
+      return synthesized ?? buildFallbackResearchMemoryDraft(experiment);
+    } catch {
+      return buildFallbackResearchMemoryDraft(experiment);
+    }
   }
 }

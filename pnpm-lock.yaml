@@ -126,6 +126,9 @@ importers:
       '@salvo/db':
         specifier: workspace:*
         version: link:../../packages/db
+      '@salvo/llm':
+        specifier: workspace:*
+        version: link:../../packages/llm
       '@salvo/shared':
         specifier: workspace:*
         version: link:../../packages/shared

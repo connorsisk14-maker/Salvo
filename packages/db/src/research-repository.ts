@@ -84,7 +84,52 @@ export class ResearchRepository {
     return this.repo.listAcceptedUnpublishedResearchExperiments(limit);
   }
 
-  async publishAcceptedResearchExperiment(experimentId: string): Promise<boolean> {
-    return this.repo.publishAcceptedResearchExperiment(experimentId);
+  async publishAcceptedResearchExperiment(
+    experimentId: string,
+    memoryOverride?: {
+      title: string;
+      summary: string;
+      bodyMarkdown: string;
+      tags: string[];
+      confidence: number;
+    }
+  ): Promise<boolean> {
+    return this.repo.publishAcceptedResearchExperiment(experimentId, memoryOverride);
+  }
+
+  async listIntegrationConfigs(): Promise<
+    Array<{
+      integration_key: string;
+      config_json: Record<string, unknown>;
+    }>
+  > {
+    return this.repo.listIntegrationConfigs();
+  }
+
+  async listResearchContext(
+    workspaceId: string,
+    limit = 5
+  ): Promise<
+    Array<{
+      id: string;
+      source_run_ids: string[];
+      confidence: number;
+      review_status: "unreviewed" | "accepted" | "rejected";
+    }>
+  > {
+    return this.repo.listResearchContext(workspaceId, limit);
+  }
+
+  async listMemoryContext(
+    workspaceId: string,
+    limit = 5
+  ): Promise<
+    Array<{
+      id: string;
+      confidence: number;
+      review_status: "unreviewed" | "accepted" | "rejected";
+    }>
+  > {
+    return this.repo.listMemoryContext(workspaceId, limit);
   }
 }

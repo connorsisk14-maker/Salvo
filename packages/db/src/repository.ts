@@ -3086,7 +3086,16 @@ export class SalvoRepository {
     );
   }
 
-  async publishAcceptedResearchExperiment(experimentId: string): Promise<boolean> {
+  async publishAcceptedResearchExperiment(
+    experimentId: string,
+    memoryOverride?: {
+      title: string;
+      summary: string;
+      bodyMarkdown: string;
+      tags: string[];
+      confidence: number;
+    }
+  ): Promise<boolean> {
     return this.withTransaction(async (client) => {
       const experimentResult = await client.query<DbResearchExperiment>(
         `select *
@@ -3102,6 +3111,23 @@ export class SalvoRepository {
       if (experiment.review_status !== "accepted" || experiment.published_at) {
         return false;
       }
+
+      const defaultMemory = {
+        title: `Experiment memory: ${experiment.contract_category}${
+          experiment.contract_subcategory ? `/${experiment.contract_subcategory}` : ""
+        }`,
+        summary: `Deterministic experiment from ${experiment.sample_size} runs (experiment ${experiment.id}).`,
+        bodyMarkdown: experiment.body_markdown,
+        tags: [
+          "research",
+          "experiment",
+          `experiment:${experiment.id}`,
+          `family:${experiment.contract_family_key}`,
+          `category:${experiment.contract_category}`
+        ],
+        confidence: experiment.confidence
+      };
+      const memory = memoryOverride ?? defaultMemory;
 
       const memoryInsertResult = await client.query<{ id: string }>(
         `insert into public.salvo_memories (
@@ -3122,19 +3148,11 @@ export class SalvoRepository {
           experiment.workspace_id,
           experiment.source_run_ids,
           experiment.contract_family_key,
-          `Experiment memory: ${experiment.contract_category}${
-            experiment.contract_subcategory ? `/${experiment.contract_subcategory}` : ""
-          }`,
-          `Deterministic experiment from ${experiment.sample_size} runs (experiment ${experiment.id}).`,
-          experiment.body_markdown,
-          [
-            "research",
-            "experiment",
-            `experiment:${experiment.id}`,
-            `family:${experiment.contract_family_key}`,
-            `category:${experiment.contract_category}`
-          ],
-          experiment.confidence
+          memory.title,
+          memory.summary,
+          memory.bodyMarkdown,
+          memory.tags,
+          memory.confidence
         ]
       );
       const memoryId = this.singleOrThrow(
