@@ -11,6 +11,7 @@ import type {
   ProviderMessageRequest,
   ProviderToolDefinition
 } from "./types";
+import { createLogger, withTelemetrySpan } from "@salvo/shared";
 
 const DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com";
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com";
@@ -24,6 +25,10 @@ type OpenAiToolCallAccumulator = {
   name: string;
   argumentsText: string;
 };
+
+const logger = createLogger({
+  component: "llm-client"
+});
 
 export class LlmRequestError extends Error {
   constructor(
@@ -386,10 +391,23 @@ export class LlmClient {
     messages: LlmMessage[],
     tools?: LlmToolDefinition[]
   ): Promise<LlmResponse> {
-    if (this.config.provider === "openai" || this.config.provider === "custom") {
-      return this.createMessageOpenAi(system, messages, tools);
-    }
-    return this.createMessageAnthropic(system, messages, tools);
+    return withTelemetrySpan(
+      {
+        logger,
+        name: "llm.create_message",
+        attributes: {
+          provider: this.config.provider,
+          model: this.config.model,
+          tool_count: tools?.length ?? 0
+        }
+      },
+      async () => {
+        if (this.config.provider === "openai" || this.config.provider === "custom") {
+          return this.createMessageOpenAi(system, messages, tools);
+        }
+        return this.createMessageAnthropic(system, messages, tools);
+      }
+    );
   }
 
   async *streamMessage(
@@ -397,12 +415,27 @@ export class LlmClient {
     messages: LlmMessage[],
     tools?: LlmToolDefinition[]
   ): AsyncGenerator<LlmStreamChunk> {
-    if (this.config.provider === "openai" || this.config.provider === "custom") {
-      yield* this.streamMessageOpenAi(system, messages, tools);
-      return;
-    }
+    const startedAt = Date.now();
+    logger.info("llm.stream.started", {
+      provider: this.config.provider,
+      model: this.config.model,
+      tool_count: tools?.length ?? 0
+    });
 
-    yield* this.streamMessageAnthropic(system, messages, tools);
+    try {
+      if (this.config.provider === "openai" || this.config.provider === "custom") {
+        yield* this.streamMessageOpenAi(system, messages, tools);
+        return;
+      }
+
+      yield* this.streamMessageAnthropic(system, messages, tools);
+    } finally {
+      logger.info("llm.stream.completed", {
+        provider: this.config.provider,
+        model: this.config.model,
+        duration_ms: Date.now() - startedAt
+      });
+    }
   }
 
   private async createMessageAnthropic(
@@ -419,20 +452,17 @@ export class LlmClient {
       tools: toProviderTools(tools)
     };
 
-    const response = await this.fetchImpl(
-      buildApiUrl(this.config.baseUrl, DEFAULT_ANTHROPIC_BASE_URL, "/messages"),
-      {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-api-key": this.config.apiKey,
-          "anthropic-version":
-            this.config.headers?.["anthropic-version"] ?? DEFAULT_ANTHROPIC_VERSION,
-          ...this.config.headers
-        },
-        body: JSON.stringify(body)
-      }
-    );
+    const response = await this.fetchImpl(buildApiUrl(this.config.baseUrl, DEFAULT_ANTHROPIC_BASE_URL, "/messages"), {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": this.config.apiKey,
+        "anthropic-version":
+          this.config.headers?.["anthropic-version"] ?? DEFAULT_ANTHROPIC_VERSION,
+        ...this.config.headers
+      },
+      body: JSON.stringify(body)
+    });
 
     if (!response.ok) {
       throw buildHttpError(response.status, await response.text());

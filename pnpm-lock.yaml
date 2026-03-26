@@ -280,6 +280,9 @@ importers:
       '@salvo/contracts':
         specifier: workspace:*
         version: link:../contracts
+      '@salvo/shared':
+        specifier: workspace:*
+        version: link:../shared
     devDependencies:
       '@types/node':
         specifier: ^22.15.2

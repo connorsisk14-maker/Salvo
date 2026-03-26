@@ -18,7 +18,8 @@ import {
   estimateRunCost,
   initializeSecrets,
   isTerminalRunStatus,
-  resolveLlmProviderAndModel
+  resolveLlmProviderAndModel,
+  withTelemetrySpan
 } from "@salvo/shared";
 import {
   buildHeuristicContract,
@@ -301,25 +302,38 @@ export class OrchestratorDaemon {
     if (this.claimInFlight || this.stopped) {
       return;
     }
-    this.claimInFlight = true;
-    try {
-      while (this.activeRuns.size < this.maxConcurrentRunners) {
-        const task = await this.repo.claimNextTask(workerId);
-        if (!task) {
-          return;
-        }
-        logger.info("task claimed", {
-          task_id: task.id,
-          workspace_id: task.workspace_id,
-          priority: task.priority,
+
+    await withTelemetrySpan(
+      {
+        logger,
+        name: "orchestrator.claim_loop",
+        attributes: {
           active_runs: this.activeRuns.size,
           max_concurrent_runs: this.maxConcurrentRunners
-        });
-        await this.processClaimedTask(task);
+        }
+      },
+      async () => {
+        this.claimInFlight = true;
+        try {
+          while (this.activeRuns.size < this.maxConcurrentRunners) {
+            const task = await this.repo.claimNextTask(workerId);
+            if (!task) {
+              return;
+            }
+            logger.info("task claimed", {
+              task_id: task.id,
+              workspace_id: task.workspace_id,
+              priority: task.priority,
+              active_runs: this.activeRuns.size,
+              max_concurrent_runs: this.maxConcurrentRunners
+            });
+            await this.processClaimedTask(task);
+          }
+        } finally {
+          this.claimInFlight = false;
+        }
       }
-    } finally {
-      this.claimInFlight = false;
-    }
+    );
   }
 
   protected async processClaimedTask(task: DbTask): Promise<void> {
@@ -826,85 +840,98 @@ export class OrchestratorDaemon {
   }
 
   protected async launchRun(run: DbRun): Promise<void> {
-    if (this.activeRuns.has(run.id)) {
-      return;
-    }
-
-    const child = this.spawnRunnerProcess(run);
-    this.activeRuns.set(run.id, child);
-    void this.publishHeartbeat().catch((error) => {
-      logger.warn("failed to publish heartbeat after runner spawn", {
-        run_id: run.id,
-        error
-      });
-    });
-    logger.info("runner spawned", {
-      run_id: run.id,
-      task_id: run.task_id,
-      child_pid: child.pid
-    });
-
-    child.on("error", async (error) => {
-      this.activeRuns.delete(run.id);
-      void this.publishHeartbeat().catch(() => {});
-      this.triggerClaimRefill();
-      logger.error("runner process error", {
-        run_id: run.id,
-        task_id: run.task_id,
-        error
-      });
-      await this.repo.appendRunEvent(run.id, "run.failed", "error", {
-        reason: "runner_spawn_error",
-        error: error.message
-      });
-      const current = await this.repo.getRun(run.id);
-      if (current && !isTerminalRunStatus(current.status)) {
-        await this.repo.transitionRunStatus(run.id, "failed", {
-          exitReason: "runner_crash",
-          outcomeSummary: `Runner spawn failed: ${error.message}`,
-          endedAt: new Date()
-        });
-      }
-      await this.repo.transitionTaskStatus(run.task_id, "failed");
-    });
-
-    child.on("close", async (code, signal) => {
-      this.activeRuns.delete(run.id);
-      void this.publishHeartbeat().catch(() => {});
-      this.triggerClaimRefill();
-      logger.info("runner process closed", {
-        run_id: run.id,
-        task_id: run.task_id,
-        exit_code: code,
-        signal
-      });
-
-      try {
-        const current = await this.repo.getRun(run.id);
-        if (!current || isTerminalRunStatus(current.status)) {
-          return;
-        }
-
-        if (current.status === "starting" || current.status === "provisioning") {
-          await this.failRunBeforeExecution(current, code ?? null, signal ?? null);
-          return;
-        }
-
-        if (await this.resumeRunFromCheckpoint(current, code ?? null, signal ?? null)) {
-          return;
-        }
-
-        await this.evaluateRun(run.id);
-      } catch (error) {
-        logger.error("runner close handling failed", {
+    await withTelemetrySpan(
+      {
+        logger,
+        name: "orchestrator.launch_run",
+        attributes: {
           run_id: run.id,
           task_id: run.task_id,
-          exit_code: code,
-          signal,
-          error
+          agent_profile: run.agent_profile
+        }
+      },
+      async () => {
+        if (this.activeRuns.has(run.id)) {
+          return;
+        }
+
+        const child = this.spawnRunnerProcess(run);
+        this.activeRuns.set(run.id, child);
+        void this.publishHeartbeat().catch((error) => {
+          logger.warn("failed to publish heartbeat after runner spawn", {
+            run_id: run.id,
+            error
+          });
+        });
+        logger.info("runner spawned", {
+          run_id: run.id,
+          task_id: run.task_id,
+          child_pid: child.pid
+        });
+
+        child.on("error", async (error) => {
+          this.activeRuns.delete(run.id);
+          void this.publishHeartbeat().catch(() => {});
+          this.triggerClaimRefill();
+          logger.error("runner process error", {
+            run_id: run.id,
+            task_id: run.task_id,
+            error
+          });
+          await this.repo.appendRunEvent(run.id, "run.failed", "error", {
+            reason: "runner_spawn_error",
+            error: error.message
+          });
+          const current = await this.repo.getRun(run.id);
+          if (current && !isTerminalRunStatus(current.status)) {
+            await this.repo.transitionRunStatus(run.id, "failed", {
+              exitReason: "runner_crash",
+              outcomeSummary: `Runner spawn failed: ${error.message}`,
+              endedAt: new Date()
+            });
+          }
+          await this.repo.transitionTaskStatus(run.task_id, "failed");
+        });
+
+        child.on("close", async (code, signal) => {
+          this.activeRuns.delete(run.id);
+          void this.publishHeartbeat().catch(() => {});
+          this.triggerClaimRefill();
+          logger.info("runner process closed", {
+            run_id: run.id,
+            task_id: run.task_id,
+            exit_code: code,
+            signal
+          });
+
+          try {
+            const current = await this.repo.getRun(run.id);
+            if (!current || isTerminalRunStatus(current.status)) {
+              return;
+            }
+
+            if (current.status === "starting" || current.status === "provisioning") {
+              await this.failRunBeforeExecution(current, code ?? null, signal ?? null);
+              return;
+            }
+
+            if (await this.resumeRunFromCheckpoint(current, code ?? null, signal ?? null)) {
+              return;
+            }
+
+            await this.evaluateRun(run.id);
+          } catch (error) {
+            logger.error("runner close handling failed", {
+              run_id: run.id,
+              task_id: run.task_id,
+              exit_code: code,
+              signal,
+              error
+            });
+          }
         });
       }
-    });
+    );
   }
 
   protected async failRunBeforeExecution(
@@ -990,6 +1017,15 @@ export class OrchestratorDaemon {
   }
 
   protected async evaluateRun(runId: string): Promise<void> {
+    await withTelemetrySpan(
+      {
+        logger,
+        name: "orchestrator.evaluate_run",
+        attributes: {
+          run_id: runId
+        }
+      },
+      async () => {
     const detail = await this.repo.getRunDetail(runId);
     if (!detail) {
       return;
@@ -1132,6 +1168,8 @@ export class OrchestratorDaemon {
     });
 
     await this.handleLeadRunChain(detail, finalPayload, runId, evaluation.passed);
+      }
+    );
   }
 
   private async handleLeadRunChain(

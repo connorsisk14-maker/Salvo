@@ -8,7 +8,8 @@
   },
   "dependencies": {
     "@salvo/adapters": "workspace:*",
-    "@salvo/contracts": "workspace:*"
+    "@salvo/contracts": "workspace:*",
+    "@salvo/shared": "workspace:*"
   },
   "scripts": {
     "build": "tsc --project tsconfig.json",
