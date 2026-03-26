@@ -36,6 +36,9 @@ export function IntegrationsPage() {
   const [httpToken, setHttpToken] = useState("");
   const [googleSpreadsheetId, setGoogleSpreadsheetId] = useState("");
   const [googleCredentials, setGoogleCredentials] = useState("");
+  const [slackBotToken, setSlackBotToken] = useState("");
+  const [slackDefaultChannel, setSlackDefaultChannel] = useState("");
+  const [slackWebhookUrl, setSlackWebhookUrl] = useState("");
   const [emailTransportUrl, setEmailTransportUrl] = useState("");
   const [emailDefaultFrom, setEmailDefaultFrom] = useState("");
   const [emailDefaultRecipients, setEmailDefaultRecipients] = useState("");
@@ -75,13 +78,14 @@ export function IntegrationsPage() {
   const processIntegration = integrationMap.get("process");
   const http = integrationMap.get("http");
   const googleSheetsIntegration = integrationMap.get("google_sheets");
+  const slackIntegration = integrationMap.get("slack");
   const email = integrationMap.get("email");
 
   useEffect(() => {
     if (initialized.current) {
       return;
     }
-    if (!supabase && !llmApi && !processIntegration && !http && !googleSheetsIntegration && !email) {
+    if (!supabase && !llmApi && !processIntegration && !http && !googleSheetsIntegration && !slackIntegration && !email) {
       return;
     }
 
@@ -94,6 +98,11 @@ export function IntegrationsPage() {
     const processConfig = (processIntegration?.config ?? {}) as { command?: string };
     const httpConfig = (http?.config ?? {}) as { base_url?: string };
     const googleConfig = (googleSheetsIntegration?.config ?? {}) as { spreadsheet_id?: string };
+    const slackConfig = (slackIntegration?.config ?? {}) as {
+      bot_token_configured?: boolean;
+      default_channel?: string;
+      webhook_url_configured?: boolean;
+    };
     const emailConfig = (email?.config ?? {}) as {
       default_from?: string;
       default_recipients?: string[];
@@ -106,13 +115,16 @@ export function IntegrationsPage() {
     setProcessCommand(processConfig.command ?? "");
     setHttpBaseUrl(httpConfig.base_url ?? "");
     setGoogleSpreadsheetId(googleConfig.spreadsheet_id ?? "");
+    setSlackBotToken("");
+    setSlackDefaultChannel(slackConfig.default_channel ?? "");
+    setSlackWebhookUrl("");
     setEmailDefaultFrom(emailConfig.default_from ?? "");
     setEmailDefaultRecipients((emailConfig.default_recipients ?? []).join(", "));
     initialized.current = true;
-  }, [email, googleSheetsIntegration, http, llmApi, processIntegration, supabase]);
+  }, [email, googleSheetsIntegration, http, llmApi, processIntegration, slackIntegration, supabase]);
 
   async function saveConfig(
-    key: "supabase" | "llm_api" | "process" | "http" | "google_sheets" | "email",
+    key: "supabase" | "llm_api" | "process" | "http" | "google_sheets" | "slack" | "email",
     payload: Record<string, unknown>
   ) {
     setBusyKey(key);
@@ -129,6 +141,10 @@ export function IntegrationsPage() {
       }
       if (key === "google_sheets") {
         setGoogleCredentials("");
+      }
+      if (key === "slack") {
+        setSlackBotToken("");
+        setSlackWebhookUrl("");
       }
       if (key === "email") {
         setEmailTransportUrl("");
@@ -385,6 +401,63 @@ export function IntegrationsPage() {
             </p>
             <button className="button-link" type="submit" disabled={busyKey === "google_sheets"}>
               {busyKey === "google_sheets" ? "Saving..." : "Save Google Sheets"}
+            </button>
+          </form>
+
+          <form
+            className="integration-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              const payload: Record<string, unknown> = {};
+              if (slackBotToken.trim().length > 0) {
+                payload.botToken = slackBotToken.trim();
+              }
+              if (slackDefaultChannel.trim().length > 0) {
+                payload.defaultChannel = slackDefaultChannel.trim();
+              }
+              if (slackWebhookUrl.trim().length > 0) {
+                payload.webhookUrl = slackWebhookUrl.trim();
+              }
+              if (Object.keys(payload).length === 0) {
+                setError("Provide a Slack bot token, default channel, or webhook URL.");
+                return;
+              }
+              void saveConfig("slack", payload);
+            }}
+          >
+            <h3>Slack Adapter</h3>
+            <label>
+              Bot token
+              <input
+                value={slackBotToken}
+                onChange={(event) => setSlackBotToken(event.target.value)}
+                placeholder="xoxb-..."
+                type="password"
+              />
+            </label>
+            <label>
+              Default channel
+              <input
+                value={slackDefaultChannel}
+                onChange={(event) => setSlackDefaultChannel(event.target.value)}
+                placeholder="#alerts"
+              />
+            </label>
+            <label>
+              Incoming webhook URL
+              <input
+                value={slackWebhookUrl}
+                onChange={(event) => setSlackWebhookUrl(event.target.value)}
+                placeholder="https://hooks.slack.com/services/..."
+                type="password"
+              />
+            </label>
+            <p className="muted">
+              Bot configured:{" "}
+              {String(((slackIntegration?.config ?? {}) as { bot_token_configured?: boolean }).bot_token_configured ?? false)}
+            </p>
+            <button className="button-link" type="submit" disabled={busyKey === "slack"}>
+              {busyKey === "slack" ? "Saving..." : "Save Slack Adapter"}
             </button>
           </form>
 

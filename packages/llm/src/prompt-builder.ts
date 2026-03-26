@@ -35,7 +35,9 @@ function formatCapabilityList(contract: ContractV1): string {
     ["install_packages", contract.capabilities.install_packages],
     ["network_access", contract.capabilities.network_access],
     ["db_read", contract.capabilities.db_read],
-    ["db_write", contract.capabilities.db_write]
+    ["db_write", contract.capabilities.db_write],
+    ["email_send", contract.capabilities.email_send],
+    ["slack_send", contract.capabilities.slack_send]
   ];
 
   return capabilityEntries

@@ -62,6 +62,20 @@ test("buildToolDefinitions adds send_email when email_send capability is enabled
   ]);
 });
 
+test("buildToolDefinitions adds send_slack_message when slack_send capability is enabled", () => {
+  const contract = buildContract();
+  contract.capabilities.slack_send = true;
+
+  assert.deepEqual(toolNames(contract), [
+    "read_file",
+    "list_directory",
+    "write_file",
+    "run_command",
+    "send_slack_message",
+    "salvo_complete"
+  ]);
+});
+
 test("buildToolDefinitions always includes salvo_complete", () => {
   const contract = buildContract();
   contract.capabilities.filesystem_read = false;

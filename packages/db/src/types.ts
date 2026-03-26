@@ -221,7 +221,8 @@ export type DbIntegrationKey =
   | "process"
   | "http"
   | "google_sheets"
-  | "email";
+  | "email"
+  | "slack";
 
 export type DbIntegrationConfig = {
   integration_key: DbIntegrationKey;

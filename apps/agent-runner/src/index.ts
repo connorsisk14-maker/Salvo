@@ -1,6 +1,6 @@
 import path from "node:path";
 import { mkdir } from "node:fs/promises";
-import { EmailAdapter, HttpAdapter } from "@salvo/adapters";
+import { EmailAdapter, HttpAdapter, SlackAdapter } from "@salvo/adapters";
 import { createDbPool, SalvoRepository } from "@salvo/db";
 import { executeToolUse, LlmClient } from "@salvo/llm";
 import { createBuiltinSkillRegistry } from "@salvo/skills";
@@ -100,6 +100,24 @@ async function main(): Promise<void> {
         ]
       })
     : undefined;
+  const slackConfig =
+    integrationConfigs.find((row) => row.integration_key === "slack")?.config_json ?? {};
+  const slackBotToken =
+    readIntegrationString(slackConfig, "botToken") ||
+    readIntegrationString(slackConfig, "bot_token");
+  const slackWebhookUrl =
+    readIntegrationString(slackConfig, "webhookUrl") ||
+    readIntegrationString(slackConfig, "webhook_url");
+  const slackAdapter =
+    slackBotToken || slackWebhookUrl
+      ? new SlackAdapter({
+          botToken: slackBotToken,
+          defaultChannel:
+            readIntegrationString(slackConfig, "defaultChannel") ||
+            readIntegrationString(slackConfig, "default_channel"),
+          webhookUrl: slackWebhookUrl
+        })
+      : undefined;
   const httpConfig =
     integrationConfigs.find((row) => row.integration_key === "http")?.config_json ?? {};
   const httpBaseUrl = readIntegrationString(httpConfig, "baseUrl");
@@ -112,7 +130,8 @@ async function main(): Promise<void> {
     adapters: {
       filesystem,
       command,
-      ...(httpAdapter ? { http: httpAdapter } : {})
+      ...(httpAdapter ? { http: httpAdapter } : {}),
+      ...(slackAdapter ? { slack: slackAdapter } : {})
     },
     repo: {}
   };
@@ -228,7 +247,15 @@ async function main(): Promise<void> {
           skillRegistry,
           skillExecutionContext,
           emailAdapter,
-          emailSendPolicy
+          emailSendPolicy,
+          slackAdapter,
+          slackSendPolicy: {
+            maxSends:
+              Number.isFinite(Number(process.env.SALVO_SLACK_MAX_SENDS_PER_RUN))
+                ? Math.max(1, Math.floor(Number(process.env.SALVO_SLACK_MAX_SENDS_PER_RUN)))
+                : 3,
+            sendsUsed: 0
+          }
         }),
       appendRunEvent: (eventType, level, payload) =>
         repo.appendRunEvent(

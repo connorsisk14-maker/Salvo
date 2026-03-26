@@ -69,6 +69,55 @@ const RUN_COMMAND_INPUT_SCHEMA = {
   required: ["command"]
 } satisfies Record<string, unknown>;
 
+const SEND_SLACK_MESSAGE_INPUT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    channel: {
+      type: "string",
+      minLength: 1,
+      description: "Slack channel ID, channel name, or DM recipient user ID."
+    },
+    userId: {
+      type: "string",
+      minLength: 1,
+      description: "Optional Slack user ID to open a direct message with."
+    },
+    webhookUrl: {
+      type: "string",
+      minLength: 1,
+      description: "Optional incoming webhook URL that overrides the configured webhook."
+    },
+    text: {
+      type: "string",
+      minLength: 1,
+      description: "Plain-text Slack message body."
+    },
+    blocks: {
+      type: "array",
+      description: "Optional Slack Block Kit payload blocks.",
+      items: {
+        type: "object",
+        additionalProperties: true
+      }
+    },
+    attachments: {
+      type: "array",
+      description: "Optional Slack attachments.",
+      items: {
+        type: "object",
+        additionalProperties: true
+      }
+    },
+    threadTs: {
+      type: "string",
+      minLength: 1,
+      description: "Optional Slack thread timestamp."
+    }
+  },
+  required: ["text"]
+} satisfies Record<string, unknown>;
+
 const ROADBLOCK_SCHEMA = {
   type: "object",
   additionalProperties: false,
@@ -339,6 +388,11 @@ const BASE_TOOL_DEFINITIONS = {
     description: "Send an email through the configured email adapter.",
     inputSchema: SEND_EMAIL_INPUT_SCHEMA
   },
+  send_slack_message: {
+    name: "send_slack_message",
+    description: "Send a Slack message through the configured Slack adapter.",
+    inputSchema: SEND_SLACK_MESSAGE_INPUT_SCHEMA
+  },
   salvo_complete: {
     name: "salvo_complete",
     description: "Submit the terminal run payload after the contract work is complete.",
@@ -411,6 +465,10 @@ export function buildToolDefinitions(
 
   if (contract.capabilities.email_send) {
     definitions.push(BASE_TOOL_DEFINITIONS.send_email);
+  }
+
+  if (contract.capabilities.slack_send) {
+    definitions.push(BASE_TOOL_DEFINITIONS.send_slack_message);
   }
 
   appendSkillDefinitions(definitions, options, completionToolName);

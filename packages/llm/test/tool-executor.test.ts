@@ -7,7 +7,7 @@ import {
   type ToolExecutorDeps,
   type ToolExecutorPersistence
 } from "../src/index";
-import type { EmailAdapter } from "@salvo/adapters";
+import type { EmailAdapter, SlackAdapter } from "@salvo/adapters";
 
 function createHarness(
   overrides: Partial<ToolExecutorDeps> = {}
@@ -618,6 +618,66 @@ test("executeToolUse enforces the per-run email send limit", async () => {
       (event) =>
         event.eventType === "policy.denied" && event.payload.reason === "email_send_limit"
     ),
+    true
+  );
+});
+
+test("executeToolUse sends Slack messages through the configured adapter", async () => {
+  const harness = createHarness();
+  const slackAdapter = {
+    key: "slack",
+    async health() {
+      return {
+        status: "ready",
+        detail: "ok"
+      };
+    },
+    async run() {
+      return {
+        ok: true,
+        detail: "sent",
+        output: {
+          transport: "bot",
+          channel: "#alerts",
+          message_ts: "1710000000.000100"
+        }
+      };
+    }
+  } as unknown as SlackAdapter;
+
+  const outcome = await executeToolUse({
+    block: {
+      type: "tool_use",
+      id: "slack-1",
+      name: "send_slack_message",
+      input: {
+        text: "Build complete",
+        channel: "#alerts"
+      }
+    },
+    workspaceRoot: "/tmp/salvo",
+    runId: "run-slack",
+    deps: harness.deps,
+    persistence: harness.persistence,
+    slackAdapter,
+    slackSendPolicy: {
+      maxSends: 2,
+      sendsUsed: 0
+    }
+  });
+
+  assert.equal(outcome.policyDenied, false);
+  assert.equal(outcome.toolResult.isError, undefined);
+  assert.deepEqual(JSON.parse(outcome.toolResult.content), {
+    ok: true,
+    tool: "send_slack_message",
+    channel: "#alerts",
+    message_ts: "1710000000.000100",
+    transport: "bot",
+    detail: "sent"
+  });
+  assert.equal(
+    harness.events.some((event) => event.eventType === "tool.result" && event.payload.tool === "send_slack_message"),
     true
   );
 });

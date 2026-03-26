@@ -29,7 +29,8 @@ export const ContractCapabilitiesSchema = z.object({
   network_access: z.boolean(),
   db_read: z.boolean(),
   db_write: z.boolean(),
-  email_send: z.boolean()
+  email_send: z.boolean().default(false),
+  slack_send: z.boolean().default(false)
 });
 
 export const ContractV1Schema = z.object({
@@ -255,7 +256,8 @@ export function buildContractV1(input: BuildContractInput): ContractV1 {
       network_access: false,
       db_read: true,
       db_write: true,
-      email_send: false
+      email_send: false,
+      slack_send: false
     },
     constraints: {
       max_runtime_minutes: 25,

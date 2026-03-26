@@ -61,16 +61,17 @@ test("normalizeArtifacts ensures required contract deliverables exist", () => {
     objective: { primary: "Write summary", secondary: [], non_goals: [] },
     context: { relevant_files: [], recent_runs: [], memory_excerpt_ids: [] },
     scope: { read_paths: ["."], write_paths: ["."], forbidden_paths: [".git"] },
-    capabilities: {
-      filesystem_read: true,
-      filesystem_write: true,
-      run_tests: true,
-      install_packages: false,
-      network_access: false,
-      email_send: false,
-      db_read: true,
-      db_write: false
-    },
+      capabilities: {
+        filesystem_read: true,
+        filesystem_write: true,
+        run_tests: true,
+        install_packages: false,
+        network_access: false,
+        email_send: false,
+        slack_send: false,
+        db_read: true,
+        db_write: false
+      },
     constraints: {
       max_runtime_minutes: 25,
       max_tool_calls: 20,
@@ -121,16 +122,17 @@ test("buildRunnerPrompts includes contract and workspace context", () => {
     objective: { primary: "Write summary", secondary: [], non_goals: [] },
     context: { relevant_files: ["README.md"], recent_runs: [], memory_excerpt_ids: [] },
     scope: { read_paths: ["."], write_paths: ["."], forbidden_paths: [".git"] },
-    capabilities: {
-      filesystem_read: true,
-      filesystem_write: true,
-      run_tests: true,
-      install_packages: false,
-      network_access: false,
-      email_send: false,
-      db_read: true,
-      db_write: false
-    },
+      capabilities: {
+        filesystem_read: true,
+        filesystem_write: true,
+        run_tests: true,
+        install_packages: false,
+        network_access: false,
+        email_send: false,
+        slack_send: false,
+        db_read: true,
+        db_write: false
+      },
     constraints: {
       max_runtime_minutes: 25,
       max_tool_calls: 20,

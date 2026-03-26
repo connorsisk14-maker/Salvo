@@ -116,6 +116,12 @@ const googleSheetsConfigSchema = z.object({
   credentialsJson: z.string().trim().min(1, "credentialsJson must not be empty.").optional()
 }).strict();
 
+const slackConfigSchema = z.object({
+  botToken: z.string().trim().max(4096, "botToken must be 4096 characters or fewer.").optional(),
+  defaultChannel: z.string().trim().max(256, "defaultChannel must be 256 characters or fewer.").optional(),
+  webhookUrl: z.string().trim().max(2048, "webhookUrl must be 2048 characters or fewer.").optional()
+}).strict();
+
 const emailConfigSchema = z.object({
   transportUrl: z.string().trim().max(2048, "transportUrl must be 2048 characters or fewer.").optional(),
   defaultFrom: z.string().trim().max(320, "defaultFrom must be 320 characters or fewer.").optional(),
@@ -141,6 +147,7 @@ const integrationConfigSchemas = {
     token: z.string().trim().max(4096, "token must be 4096 characters or fewer.").optional()
   }).strict(),
   google_sheets: googleSheetsConfigSchema,
+  slack: slackConfigSchema,
   email: emailConfigSchema
 } as const;
 
@@ -194,7 +201,7 @@ type IntegrationStatus =
   | "healthy"
   | "stale"
   | "offline";
-type EditableIntegrationKey = "supabase" | "llm_api" | "process" | "http" | "google_sheets" | "email";
+type EditableIntegrationKey = "supabase" | "llm_api" | "process" | "http" | "google_sheets" | "slack" | "email";
 type LlmProvider = "anthropic" | "openai" | "custom";
 
 type IntegrationConfigMap = {
@@ -218,6 +225,11 @@ type IntegrationConfigMap = {
   googleSheets: {
     spreadsheetId: string;
     credentialsJson: string;
+  };
+  slack: {
+    botToken: string;
+    defaultChannel: string;
+    webhookUrl: string;
   };
   email: {
     transportUrl: string;
@@ -455,6 +467,11 @@ function createDefaultConfigMap(): IntegrationConfigMap {
       spreadsheetId: process.env.SALVO_GOOGLE_SHEETS_SPREADSHEET_ID ?? "",
       credentialsJson: process.env.SALVO_GOOGLE_SHEETS_CREDENTIALS_JSON ?? ""
     },
+    slack: {
+      botToken: process.env.SALVO_SLACK_BOT_TOKEN ?? "",
+      defaultChannel: process.env.SALVO_SLACK_DEFAULT_CHANNEL ?? "",
+      webhookUrl: process.env.SALVO_SLACK_WEBHOOK_URL ?? ""
+    },
     email: {
       transportUrl: process.env.SALVO_EMAIL_TRANSPORT_URL ?? "",
       defaultFrom: process.env.SALVO_EMAIL_DEFAULT_FROM ?? "",
@@ -517,6 +534,25 @@ function applyStoredConfig(
         config,
         "credentialsJson",
         next.googleSheets.credentialsJson
+      );
+      continue;
+    }
+
+    if (row.integration_key === "slack") {
+      next.slack.botToken = readString(
+        config,
+        "botToken",
+        readString(config, "bot_token", next.slack.botToken)
+      );
+      next.slack.defaultChannel = readString(
+        config,
+        "defaultChannel",
+        readString(config, "default_channel", next.slack.defaultChannel)
+      );
+      next.slack.webhookUrl = readString(
+        config,
+        "webhookUrl",
+        readString(config, "webhook_url", next.slack.webhookUrl)
       );
       continue;
     }
@@ -1302,6 +1338,27 @@ export async function buildServer() {
         }
       },
       {
+        key: "slack",
+        label: "Slack Adapter",
+        status:
+          hasValue(config.slack.botToken) || hasValue(config.slack.webhookUrl)
+            ? "ready"
+            : "not_configured",
+        detail:
+          hasValue(config.slack.webhookUrl)
+            ? "Incoming webhook configured."
+            : hasValue(config.slack.botToken)
+              ? `Bot token configured${hasValue(config.slack.defaultChannel) ? ` for ${config.slack.defaultChannel}.` : "."}`
+              : "Set a bot token or incoming webhook URL.",
+        updated_at: configUpdatedByKey.get("slack") ?? now,
+        editable: true,
+        config: {
+          bot_token_configured: hasValue(config.slack.botToken),
+          default_channel: config.slack.defaultChannel,
+          webhook_url_configured: hasValue(config.slack.webhookUrl)
+        }
+      },
+      {
         key: "email",
         label: "Email Adapter",
         status:
@@ -1516,7 +1573,7 @@ export async function buildServer() {
     Body: Record<string, unknown>;
   }>("/integrations/:key/config", async (req, reply) => {
     const key = req.params.key;
-    if (!["supabase", "llm_api", "process", "http", "google_sheets", "email"].includes(key)) {
+    if (!["supabase", "llm_api", "process", "http", "google_sheets", "slack", "email"].includes(key)) {
       return reply.status(400).send({ ok: false, error: "Invalid integration key." });
     }
 
@@ -1594,6 +1651,30 @@ export async function buildServer() {
       }
       if (typeof body.credentialsJson === "string") {
         nextConfig.credentialsJson = body.credentialsJson.trim();
+      }
+    } else if (key === "slack") {
+      const parsedBody = parseRequestBody(integrationConfigSchemas.slack, rawBody);
+      if (!parsedBody.ok) {
+        return reply.status(400).send({
+          error: "Invalid request body.",
+          issues: parsedBody.issues
+        });
+      }
+      if (!hasConfigChanges(parsedBody.value)) {
+        return reply.status(400).send({
+          error: "Invalid request body.",
+          issues: [{ path: "body", message: "At least one config field is required." }]
+        });
+      }
+      const body = parsedBody.value;
+      if (typeof body.botToken === "string" && body.botToken.trim().length > 0) {
+        nextConfig.botToken = body.botToken.trim();
+      }
+      if (typeof body.defaultChannel === "string") {
+        nextConfig.defaultChannel = body.defaultChannel.trim();
+      }
+      if (typeof body.webhookUrl === "string") {
+        nextConfig.webhookUrl = body.webhookUrl.trim();
       }
     } else if (key === "process") {
       const parsedBody = parseRequestBody(integrationConfigSchemas.process, rawBody);

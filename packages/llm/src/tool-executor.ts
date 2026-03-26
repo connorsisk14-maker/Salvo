@@ -1,6 +1,6 @@
 import path from "node:path";
 import type { LlmContentBlock } from "./types";
-import type { EmailAdapter } from "@salvo/adapters";
+import type { EmailAdapter, SlackAdapter } from "@salvo/adapters";
 
 export type ToolUseBlock = Extract<LlmContentBlock, { type: "tool_use" }>;
 export type ToolResultBlock = Extract<LlmContentBlock, { type: "tool_result" }>;
@@ -136,6 +136,11 @@ export type ExecuteToolUseInput = {
   persistence: ToolExecutorPersistence;
   emailAdapter?: EmailAdapter;
   emailSendPolicy?: {
+    maxSends: number;
+    sendsUsed: number;
+  };
+  slackAdapter?: SlackAdapter;
+  slackSendPolicy?: {
     maxSends: number;
     sendsUsed: number;
   };
@@ -718,6 +723,127 @@ export async function executeToolUse(input: ExecuteToolUseInput): Promise<ToolEx
           accepted: metadata.accepted,
           rejected: metadata.rejected,
           message_id: metadata.messageId,
+          detail: result.detail
+        },
+        !result.ok
+      ),
+      policyDenied: false
+    };
+  }
+
+  if (input.block.name === "send_slack_message") {
+    if (!input.slackAdapter) {
+      const message = "Slack adapter is not configured.";
+      const toolResult = buildToolResult(
+        input.block.id,
+        {
+          ok: false,
+          error: "slack_adapter_unconfigured",
+          tool: input.block.name,
+          message
+        },
+        true
+      );
+      await emitToolResult(input.persistence, {
+        tool: input.block.name,
+        tool_use_id: input.block.id,
+        error: "slack_adapter_unconfigured",
+        message
+      });
+      return {
+        toolResult,
+        policyDenied: false
+      };
+    }
+
+    if (
+      input.slackSendPolicy &&
+      input.slackSendPolicy.maxSends > 0 &&
+      input.slackSendPolicy.sendsUsed >= input.slackSendPolicy.maxSends
+    ) {
+      const message = `Slack send limit reached for this run (${input.slackSendPolicy.maxSends}).`;
+      const toolResult = buildToolResult(
+        input.block.id,
+        {
+          ok: false,
+          error: "slack_send_limit_exceeded",
+          tool: input.block.name,
+          message
+        },
+        true
+      );
+      await emitToolResult(input.persistence, {
+        tool: input.block.name,
+        tool_use_id: input.block.id,
+        error: "slack_send_limit_exceeded",
+        message
+      });
+      await input.persistence.appendRunEvent("policy.denied", "warn", {
+        reason: "slack_send_limit",
+        message,
+        max_sends: input.slackSendPolicy.maxSends
+      });
+      return {
+        toolResult,
+        policyDenied: true
+      };
+    }
+
+    if (input.slackSendPolicy) {
+      input.slackSendPolicy.sendsUsed += 1;
+    }
+
+    const runId = input.runId ?? input.block.id;
+    const payload = input.block.input ?? {};
+    const result = await input.slackAdapter.run({
+      runId,
+      payload
+    });
+    const slackOutput = isRecord(result.output) ? result.output : {};
+    const metadata = {
+      success: result.ok,
+      detail: result.detail,
+      channel: typeof slackOutput.channel === "string" ? slackOutput.channel : payload.channel,
+      messageTs:
+        typeof slackOutput.message_ts === "string"
+          ? slackOutput.message_ts
+          : typeof slackOutput.ts === "string"
+            ? slackOutput.ts
+            : undefined,
+      transport: typeof slackOutput.transport === "string" ? slackOutput.transport : undefined,
+      text: typeof payload.text === "string" ? payload.text : undefined
+    };
+
+    await input.persistence.createArtifact({
+      artifactType: "slack",
+      path: `slack-${runId}-${input.block.id}.json`,
+      metadataJson: metadata
+    });
+
+    await emitToolResult(input.persistence, {
+      tool: input.block.name,
+      tool_use_id: input.block.id,
+      ok: result.ok,
+      channel: metadata.channel,
+      message_ts: metadata.messageTs,
+      transport: metadata.transport
+    });
+
+    return {
+      toolResult: buildToolResult(
+        input.block.id,
+        {
+          ok: result.ok,
+          tool: input.block.name,
+          ...(result.ok
+            ? {}
+            : {
+                error: "slack_send_failed",
+                message: result.detail
+              }),
+          channel: metadata.channel,
+          message_ts: metadata.messageTs,
+          transport: metadata.transport,
           detail: result.detail
         },
         !result.ok

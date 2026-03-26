@@ -673,7 +673,7 @@ export function saveTrustTier(input: {
 }
 
 export function updateIntegrationConfig(
-  key: "supabase" | "llm_api" | "process" | "http" | "google_sheets" | "email",
+  key: "supabase" | "llm_api" | "process" | "http" | "google_sheets" | "slack" | "email",
   input: Record<string, unknown>
 ): Promise<ApiActionResponse> {
   return request<ApiActionResponse>(`/integrations/${key}/config`, {

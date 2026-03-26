@@ -881,6 +881,18 @@ if (!databaseUrl) {
     assert.equal(typeof googleRow.config.spreadsheet_id, "string");
   });
 
+  test("integrations endpoint exposes Slack entry", async () => {
+    const integrations = await app.inject({
+      method: "GET",
+      url: "/integrations"
+    });
+    assert.equal(integrations.statusCode, 200);
+    const slackRow = integrations
+      .json()
+      .find((item: { key: string }) => item.key === "slack");
+    assert.ok(slackRow);
+  });
+
   test("integration config update persists Google Sheets settings", async () => {
     const response = await app.inject({
       method: "POST",
@@ -903,6 +915,32 @@ if (!databaseUrl) {
       .find((item: { key: string }) => item.key === "google_sheets");
     assert.equal(googleRow.config.spreadsheet_id, "sheet-xyz");
     assert.equal(googleRow.config.credentials_configured, true);
+  });
+
+  test("integration config update persists Slack settings", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/integrations/slack/config",
+      payload: {
+        botToken: "xoxb-test",
+        defaultChannel: "#alerts",
+        webhookUrl: "https://hooks.slack.test/abc"
+      }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().ok, true);
+
+    const integrations = await app.inject({
+      method: "GET",
+      url: "/integrations"
+    });
+    assert.equal(integrations.statusCode, 200);
+    const slackRow = integrations
+      .json()
+      .find((item: { key: string }) => item.key === "slack");
+    assert.equal(slackRow.config.bot_token_configured, true);
+    assert.equal(slackRow.config.default_channel, "#alerts");
+    assert.equal(slackRow.config.webhook_url_configured, true);
   });
 
   test("budget endpoints persist limits and return spend state", async () => {

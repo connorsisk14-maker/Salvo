@@ -18,7 +18,8 @@ const capabilityLabels: Record<string, string> = {
   network_access: "Network access",
   db_read: "Database read",
   db_write: "Database write",
-  email_send: "Email sending"
+  email_send: "Email sending",
+  slack_send: "Slack messaging"
 };
 
 type PolicyDraft = {
