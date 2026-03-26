@@ -6,7 +6,6 @@ import {
   getRunDetail,
   getRunEvents,
   openArtifactContent,
-  createRunEventStream,
   type ApiArtifactPreview,
   type ApiRunDetail,
   type ApiRunEvent
@@ -42,7 +41,6 @@ export function RunDetailPage() {
   const [previewBusy, setPreviewBusy] = useState<Record<string, boolean>>({});
   const [error, setError] = useState<string | null>(null);
   const artifactContentUrlsRef = useRef<Record<string, string>>({});
-  const streamRef = useRef<EventSource | null>(null);
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const lastSequenceRef = useRef<number | null>(null);
   const detailRef = useRef<ApiRunDetail | null>(null);
@@ -175,98 +173,55 @@ export function RunDetailPage() {
 
   useEffect(() => {
     if (!runId) {
-      streamRef.current?.close();
-      streamRef.current = null;
       setStreamActive(false);
       return;
     }
 
     let active = true;
-    const source = createRunEventStream(runId);
-    streamRef.current = source;
-    setStreamActive(false);
+    let intervalId: number | null = null;
+    setStreamActive(true);
     setStreamError(null);
 
-    const handleOpen = () => {
-      if (!active) {
-        return;
-      }
-      setStreamActive(true);
-    };
-
-    const refreshEvents = async () => {
+    const refreshLiveState = async () => {
       try {
-        const nextEvents = await getRunEvents(runId);
+        const [nextEvents, nextDetail] = await Promise.all([
+          getRunEvents(runId),
+          getRunDetail(runId)
+        ]);
         if (!active) {
           return;
         }
         setEvents(nextEvents);
+        setDetail(nextDetail);
         lastSequenceRef.current = nextEvents[nextEvents.length - 1]?.sequence_no ?? null;
-      } catch (eventsError) {
+        setStreamActive(true);
+        setStreamError(null);
+        if (isTerminalRunStatus(nextDetail.run.status)) {
+          setStreamActive(false);
+          if (intervalId !== null) {
+            window.clearInterval(intervalId);
+            intervalId = null;
+          }
+        }
+      } catch (pollError) {
         if (!active) {
           return;
         }
-        setStreamError((eventsError as Error).message);
+        setStreamActive(false);
+        setStreamError((pollError as Error).message);
       }
     };
 
-    const handleMessage = async (event: MessageEvent) => {
-      if (!active) {
-        return;
-      }
-      try {
-        const payload = JSON.parse(event.data) as {
-          last_sequence?: number | null;
-          run_status?: string | null;
-        };
-        const nextSequence = payload.last_sequence ?? null;
-        if (nextSequence && nextSequence !== lastSequenceRef.current) {
-          lastSequenceRef.current = nextSequence;
-          await refreshEvents();
-        }
-        const incomingStatus = payload.run_status;
-        if (incomingStatus && incomingStatus !== detailRef.current?.run.status) {
-          try {
-            const updatedDetail = await getRunDetail(runId);
-            if (!active) {
-              return;
-            }
-            setDetail(updatedDetail);
-          } catch (detailError) {
-            if (!active) {
-              return;
-            }
-            setError((detailError as Error).message);
-          }
-        }
-        if (incomingStatus && isTerminalRunStatus(incomingStatus)) {
-          source.close();
-          setStreamActive(false);
-        }
-      } catch {
-        // Ignore malformed server payloads
-      }
-    };
-
-    const handleError = () => {
-      if (!active) {
-        return;
-      }
-      setStreamActive(false);
-      setStreamError("Live stream disconnected.");
-    };
-
-    source.addEventListener("open", handleOpen);
-    source.addEventListener("message", handleMessage);
-    source.addEventListener("error", handleError);
+    void refreshLiveState();
+    intervalId = window.setInterval(() => {
+      void refreshLiveState();
+    }, 2_000);
 
     return () => {
       active = false;
-      source.removeEventListener("open", handleOpen);
-      source.removeEventListener("message", handleMessage);
-      source.removeEventListener("error", handleError);
-      source.close();
-      streamRef.current = null;
+      if (intervalId !== null) {
+        window.clearInterval(intervalId);
+      }
       setStreamActive(false);
     };
   }, [runId]);

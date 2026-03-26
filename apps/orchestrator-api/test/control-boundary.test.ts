@@ -233,6 +233,68 @@ if (!databaseUrl) {
     assert.equal(messages[3].role, "assistant");
   });
 
+  test("task chat proposal includes workspace files, recent runs, and relevant memory context", async () => {
+    const workspaceDir = await mkdtemp(path.join(tmpdir(), "salvo-task-chat-workspace-"));
+    await writeFile(path.join(workspaceDir, "README.md"), "# Task chat context\n", "utf8");
+    await writeFile(path.join(workspaceDir, "docs.md"), "Implementation notes\n", "utf8");
+
+    const workspace = await repo.ensureWorkspace(`chat-context-${randomUUID()}`, workspaceDir);
+    const task = await repo.createTask({
+      workspaceId: workspace.id,
+      title: "Investigate task chat context",
+      request: "Fix task chat planning context",
+      requiresApproval: false
+    });
+    const contract = await repo.createContract({
+      taskId: task.id,
+      risk: "low",
+      status: "active",
+      contractJson: {
+        schema_version: 1,
+        family_key: "family_existing"
+      }
+    });
+    const run = await repo.createRun({
+      taskId: task.id,
+      contractId: contract.id,
+      agentProfile: "builder",
+      workerId: "task-chat-context"
+    });
+
+    await repo.createMemory({
+      workspaceId: workspace.id,
+      sourceRunIds: [run.id],
+      memoryType: "best_practice",
+      title: "Task chat context memory",
+      summary: "Remember to include workspace files and recent runs in task chat proposals.",
+      bodyMarkdown: "Populate planning context from the database before asking the LLM to plan.",
+      tags: ["task-chat", "planning"],
+      confidence: 0.9,
+      reviewStatus: "accepted"
+    });
+
+    const chat = await app.inject({
+      method: "POST",
+      url: "/tasks/chat",
+      payload: {
+        workspace_id: workspace.id,
+        message: "Plan a task chat context fix that uses recent runs and accepted memory excerpts."
+      }
+    });
+
+    assert.equal(chat.statusCode, 200);
+    const proposal = chat.json().proposed_contract;
+    assert.ok(proposal);
+    const context = proposal.contract_json.context as {
+      relevant_files: string[];
+      recent_runs: string[];
+      memory_excerpt_ids: string[];
+    };
+    assert.equal(context.relevant_files.includes("README.md"), true);
+    assert.equal(context.recent_runs.includes(run.id), true);
+    assert.equal(context.memory_excerpt_ids.length > 0, true);
+  });
+
   test("task chat approve endpoint creates task and contract and replays idempotent approvals", async () => {
     const chat = await app.inject({
       method: "POST",
@@ -730,6 +792,80 @@ if (!databaseUrl) {
       .json()
       .find((item: { key: string }) => item.key === "llm_api");
     assert.ok(llmRow);
+  });
+
+  test("frontend route coverage endpoints return implemented payloads", async () => {
+    const workspace = await repo.ensureWorkspace(`route-coverage-${randomUUID()}`, process.cwd());
+    const { task, run } = await seedRun("running");
+    await repo.appendRunEvent(run.id, "run.heartbeat", "info", {
+      ok: true
+    });
+
+    const skills = await app.inject({
+      method: "GET",
+      url: `/skills?workspaceId=${workspace.id}`
+    });
+    assert.equal(skills.statusCode, 200);
+    assert.ok(Array.isArray(skills.json().skills));
+
+    const setSkill = await app.inject({
+      method: "POST",
+      url: "/skills/search_codebase/config",
+      payload: {
+        workspaceId: workspace.id,
+        enabled: false
+      }
+    });
+    assert.equal(setSkill.statusCode, 200);
+    assert.equal(setSkill.json().enabled, false);
+
+    const backups = await app.inject({
+      method: "GET",
+      url: "/backups/status"
+    });
+    assert.equal(backups.statusCode, 200);
+    assert.equal(typeof backups.json().state, "string");
+
+    const leads = await app.inject({
+      method: "GET",
+      url: "/leads"
+    });
+    assert.equal(leads.statusCode, 200);
+    assert.ok(Array.isArray(leads.json().funnel));
+
+    const events = await app.inject({
+      method: "GET",
+      url: `/runs/${run.id}/events`
+    });
+    assert.equal(events.statusCode, 200);
+    assert.ok(Array.isArray(events.json()));
+
+    const artifactPath = await createTempArtifactPath("route-coverage.md", "# proof");
+    await repo.createArtifact({
+      runId: run.id,
+      taskId: task.id,
+      artifactType: "markdown",
+      path: artifactPath,
+      metadataJson: {
+        label: "proof"
+      }
+    });
+    const artifact = (await repo.listArtifactsForRun(run.id))[0];
+    assert.ok(artifact);
+
+    const preview = await app.inject({
+      method: "GET",
+      url: `/artifacts/${artifact.id}/preview`
+    });
+    assert.equal(preview.statusCode, 200);
+    assert.equal(preview.json().kind, "text");
+
+    const content = await app.inject({
+      method: "GET",
+      url: `/artifacts/${artifact.id}/content`
+    });
+    assert.equal(content.statusCode, 200);
+    assert.ok(content.body.includes("# proof"));
   });
 
   test("integrations endpoint exposes Google Sheets entry", async () => {

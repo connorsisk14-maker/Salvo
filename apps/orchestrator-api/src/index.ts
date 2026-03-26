@@ -3,8 +3,13 @@ import cors from "@fastify/cors";
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { readFile, stat } from "node:fs/promises";
+import { readFile, readdir, stat } from "node:fs/promises";
 import path from "node:path";
+import {
+  buildContractV1,
+  validateContractV1,
+  type ContractV1
+} from "@salvo/contracts";
 import {
   createDbPool,
   SalvoRepository,
@@ -12,6 +17,7 @@ import {
   type TaskChatProposal,
   type TaskDependencyStatus
 } from "@salvo/db";
+import { LlmClient, type LlmConfig } from "@salvo/llm";
 import {
   AGENT_PROFILES,
   AGENT_TRUST_TIERS,
@@ -42,6 +48,17 @@ const taskTitleMaxLength = readPositiveIntegerEnv("SALVO_API_TASK_TITLE_MAX_LENG
 const taskRequestMaxLength = readPositiveIntegerEnv("SALVO_API_TASK_REQUEST_MAX_LENGTH", 20_000);
 const idempotencyTtlHours = readPositiveIntegerEnv("SALVO_API_IDEMPOTENCY_TTL_HOURS", 24);
 const idempotencyKeyMaxLength = readPositiveIntegerEnv("SALVO_API_IDEMPOTENCY_KEY_MAX_LENGTH", 200);
+const taskChatRelevantFileLimit = readPositiveIntegerEnv("SALVO_API_TASK_CHAT_RELEVANT_FILE_LIMIT", 12);
+const taskChatRecentRunLimit = readPositiveIntegerEnv("SALVO_API_TASK_CHAT_RECENT_RUN_LIMIT", 8);
+const taskChatMemoryLimit = readPositiveIntegerEnv("SALVO_API_TASK_CHAT_MEMORY_LIMIT", 5);
+const taskChatMemoryBodyChars = readPositiveIntegerEnv("SALVO_API_TASK_CHAT_MEMORY_BODY_CHARS", 600);
+const taskChatResearchLimit = readPositiveIntegerEnv("SALVO_API_TASK_CHAT_RESEARCH_LIMIT", 5);
+
+const TASK_CHAT_DEFAULT_MODEL_BY_PROVIDER: Record<LlmProvider, string> = {
+  anthropic: "claude-3-5-sonnet-latest",
+  openai: "gpt-4o",
+  custom: "gpt-4o"
+};
 
 const reviewStatusSchema = z.object({
   status: z.enum(["unreviewed", "accepted", "rejected"])
@@ -713,86 +730,275 @@ function buildTaskChatFamilyKey(input: {
   return `family_${digest}`;
 }
 
-function buildTaskChatProposal(workspaceId: string, request: string): TaskChatProposal {
-  const risk = classifyTaskChatRisk(request);
-  const category = classifyTaskChatCategory(request);
+function buildTaskChatProposal(
+  workspaceId: string,
+  request: string,
+  context?: {
+    relevantFiles?: string[];
+    recentRunIds?: string[];
+    memoryExcerptIds?: string[];
+  }
+): TaskChatProposal {
   const title = buildTaskTitleFromRequest(request);
-  const contractId = randomUUID();
-  const taskId = randomUUID();
-  const createdAt = new Date().toISOString();
-  const familyKey = buildTaskChatFamilyKey({
+  const contract = buildContractV1({
+    contractId: randomUUID(),
+    taskId: randomUUID(),
+    workspaceId,
     request,
-    risk,
-    category: category.category,
-    subcategory: category.subcategory
+    taskTitle: title,
+    preferredProfile: "builder"
+  });
+  const mergedContract = validateContractV1({
+    ...contract,
+    context: {
+      ...contract.context,
+      relevant_files: context?.relevantFiles ?? [],
+      recent_runs: context?.recentRunIds ?? [],
+      memory_excerpt_ids: context?.memoryExcerptIds ?? []
+    }
   });
 
   return {
     title,
     request,
-    risk,
-    requires_approval: risk === "high",
-    contract_json: {
-      schema_version: 1,
-      contract_id: contractId,
-      task_id: taskId,
-      workspace_id: workspaceId,
-      created_at: createdAt,
-      objective: {
-        primary: title,
-        secondary: [],
-        non_goals: ["Do not modify files outside allowed scope."]
-      },
-      context: {
-        relevant_files: [],
-        recent_runs: [],
-        memory_excerpt_ids: []
-      },
-      scope: {
-        read_paths: ["."],
-        write_paths: ["."],
-        forbidden_paths: [".env", ".git", "node_modules"]
-      },
-      capabilities: {
-        filesystem_read: true,
-        filesystem_write: true,
-        run_tests: true,
-        install_packages: false,
-        network_access: false,
-        db_read: true,
-        db_write: true
-      },
-      constraints: {
-        max_runtime_minutes: 25,
-        max_tool_calls: 200,
-        no_destructive_commands: true,
-        approval_required_for: risk === "high" ? ["schema_change", "dependency_install"] : []
-      },
-      deliverables: {
-        required_artifacts: ["run-summary.md"],
-        evidence_required: true,
-        summary_required: true
-      },
-      success_criteria: {
-        required_test_commands: ["echo salvo-test"],
-        assertions: [
-          "Runner emits a final payload event.",
-          "At least one deliverable produced."
-        ]
-      },
-      failure_handling: {
-        stop_on_policy_denial: true
-      },
-      learnings_output: {
-        required: true
-      },
-      risk,
-      category: category.category,
-      subcategory: category.subcategory,
-      family_key: familyKey,
-      agent_profile: "builder"
-    }
+    risk: mergedContract.risk,
+    requires_approval: mergedContract.risk === "high",
+    contract_json: mergedContract
   };
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values.filter((value) => value.trim().length > 0))];
+}
+
+function mergeTaskChatContext(
+  contract: ContractV1,
+  context: {
+    relevantFiles: string[];
+    recentRunIds: string[];
+    memoryExcerptIds: string[];
+  }
+): ContractV1 {
+  return validateContractV1({
+    ...contract,
+    context: {
+      ...contract.context,
+      relevant_files: uniqueStrings([
+        ...context.relevantFiles,
+        ...contract.context.relevant_files
+      ]).slice(0, taskChatRelevantFileLimit),
+      recent_runs: uniqueStrings([
+        ...context.recentRunIds,
+        ...contract.context.recent_runs
+      ]).slice(0, taskChatRecentRunLimit),
+      memory_excerpt_ids: uniqueStrings([
+        ...context.memoryExcerptIds,
+        ...contract.context.memory_excerpt_ids
+      ]).slice(0, taskChatMemoryLimit)
+    }
+  });
+}
+
+async function collectTaskChatRelevantFiles(workspacePath: string): Promise<string[]> {
+  try {
+    const entries = await readdir(workspacePath, { withFileTypes: true });
+    return entries
+      .filter((entry) => entry.name !== ".git" && entry.name !== "node_modules")
+      .slice(0, taskChatRelevantFileLimit)
+      .map((entry) => entry.name);
+  } catch {
+    return [];
+  }
+}
+
+function buildTaskChatPlanningQuery(proposal: TaskChatProposal): string {
+  const contract = validateContractV1(proposal.contract_json);
+  return [
+    proposal.title,
+    proposal.request,
+    contract.family_key,
+    contract.category,
+    contract.subcategory ?? ""
+  ]
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .join("\n");
+}
+
+function extractTaskChatJsonObject(input: string): string {
+  const trimmed = input
+    .trim()
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+  const first = trimmed.indexOf("{");
+  const last = trimmed.lastIndexOf("}");
+  if (first === -1 || last === -1 || last <= first) {
+    throw new Error("LLM response did not contain a JSON object.");
+  }
+  return trimmed.slice(first, last + 1);
+}
+
+function resolveTaskChatLlmConfig(
+  integrationConfigs: Array<{ integration_key: string; config_json: Record<string, unknown> }>
+): LlmConfig | null {
+  const llmConfig = integrationConfigs.find((row) => row.integration_key === "llm_api")
+    ?.config_json;
+  const provider = normalizeProvider(
+    readString(llmConfig ?? {}, "provider", process.env.SALVO_LLM_PROVIDER)
+  );
+  const apiKey =
+    readString(llmConfig ?? {}, "apiKey") ||
+    readString(llmConfig ?? {}, "authToken") ||
+    process.env.SALVO_LLM_API_KEY ||
+    process.env.SALVO_CLAUDE_AUTH_TOKEN ||
+    "";
+
+  if (!apiKey) {
+    return null;
+  }
+
+  const baseUrl =
+    readString(llmConfig ?? {}, "baseUrl") ||
+    process.env.SALVO_LLM_BASE_URL ||
+    (provider === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com");
+  const model =
+    readString(llmConfig ?? {}, "defaultModel") ||
+    process.env.SALVO_LLM_DEFAULT_MODEL ||
+    TASK_CHAT_DEFAULT_MODEL_BY_PROVIDER[provider];
+
+  return {
+    provider,
+    apiKey,
+    baseUrl,
+    model,
+    maxTokens: 1800,
+    temperature: 0.1
+  };
+}
+
+async function createTaskChatProposal(input: {
+  repo: SalvoRepository;
+  workspaceId: string;
+  workspacePath: string;
+  request: string;
+  integrationConfigs: Array<{ integration_key: string; config_json: Record<string, unknown> }>;
+}): Promise<TaskChatProposal> {
+  const baseProposal = buildTaskChatProposal(input.workspaceId, input.request);
+  const baseContract = validateContractV1(baseProposal.contract_json);
+  const planningQuery = buildTaskChatPlanningQuery(baseProposal);
+
+  const [relevantFiles, memories, recentRuns, researchContext] = await Promise.all([
+    collectTaskChatRelevantFiles(input.workspacePath),
+    input.repo.listRelevantMemoryPromptContext(
+      input.workspaceId,
+      planningQuery,
+      baseContract.family_key,
+      taskChatMemoryLimit
+    ),
+    input.repo.listWorkspaceRecentRuns(input.workspaceId, taskChatRecentRunLimit),
+    input.repo.listResearchContext(input.workspaceId, taskChatResearchLimit)
+  ]);
+
+  const enrichedContract = mergeTaskChatContext(baseContract, {
+    relevantFiles,
+    recentRunIds: uniqueStrings([
+      ...recentRuns.map((run) => run.id),
+      ...memories.flatMap((entry) => entry.source_run_ids),
+      ...researchContext.flatMap((entry) => entry.source_run_ids)
+    ]),
+    memoryExcerptIds: memories.map((entry) => entry.id)
+  });
+  const enrichedProposal: TaskChatProposal = {
+    ...baseProposal,
+    risk: enrichedContract.risk,
+    requires_approval: enrichedContract.risk === "high",
+    contract_json: enrichedContract
+  };
+
+  const llmConfig = resolveTaskChatLlmConfig(input.integrationConfigs);
+  if (!llmConfig) {
+    return enrichedProposal;
+  }
+
+  try {
+    const response = await new LlmClient(llmConfig).createMessage(
+      [
+        "You are SALVO task-chat planner.",
+        "Return only one valid ContractV1 JSON object.",
+        "Preserve the provided contract_id, task_id, workspace_id, created_at, family_key, and agent_profile.",
+        "Use the provided workspace, recent run, and memory context to populate contract.context."
+      ].join("\n"),
+      [
+        {
+          role: "user",
+          content: JSON.stringify(
+            {
+              request: enrichedProposal.request,
+              title: enrichedProposal.title,
+              workspace: {
+                id: input.workspaceId,
+                local_path: input.workspacePath,
+                relevant_files: relevantFiles
+              },
+              recent_runs: recentRuns,
+              memory_excerpts: memories.map((memory) => ({
+                id: memory.id,
+                title: memory.title,
+                summary: memory.summary,
+                body_markdown: memory.body_markdown.slice(0, taskChatMemoryBodyChars),
+                confidence: memory.confidence,
+                source_run_ids: memory.source_run_ids
+              })),
+              research_context: researchContext.map((entry) => ({
+                id: entry.id,
+                confidence: entry.confidence,
+                source_run_ids: entry.source_run_ids
+              })),
+              base_contract: enrichedContract
+            },
+            null,
+            2
+          )
+        }
+      ]
+    );
+    const rawText = response.content
+      .filter((block) => block.type === "text")
+      .map((block) => block.text)
+      .join("\n")
+      .trim();
+    const parsedContract = validateContractV1(
+      JSON.parse(extractTaskChatJsonObject(rawText))
+    );
+    const normalizedContract = mergeTaskChatContext(
+      validateContractV1({
+        ...parsedContract,
+        contract_id: enrichedContract.contract_id,
+        task_id: enrichedContract.task_id,
+        workspace_id: enrichedContract.workspace_id,
+        created_at: enrichedContract.created_at,
+        family_key: enrichedContract.family_key,
+        agent_profile: enrichedContract.agent_profile
+      }),
+      {
+        relevantFiles,
+        recentRunIds: enrichedContract.context.recent_runs,
+        memoryExcerptIds: enrichedContract.context.memory_excerpt_ids
+      }
+    );
+
+    return {
+      title: normalizedContract.objective.primary,
+      request: enrichedProposal.request,
+      risk: normalizedContract.risk,
+      requires_approval: normalizedContract.risk === "high",
+      contract_json: normalizedContract
+    };
+  } catch {
+    return enrichedProposal;
+  }
 }
 
 function isAmbiguousTaskChatRequest(latestMessage: string, fullRequest: string): boolean {
@@ -1729,9 +1935,15 @@ export async function buildServer() {
         .map((message) => message.message_text);
     }
 
-    if (!targetWorkspaceId) {
-      targetWorkspaceId = (await repo.ensureWorkspace()).id;
+    const targetWorkspace = targetWorkspaceId
+      ? await repo.getWorkspace(targetWorkspaceId)
+      : await repo.ensureWorkspace("default", workspaceRoot);
+    if (!targetWorkspace) {
+      return reply.status(404).send({
+        error: `Workspace not found: ${targetWorkspaceId}`
+      });
     }
+    targetWorkspaceId = targetWorkspace.id;
 
     const fullRequest = [...priorUserMessages, userMessage].join("\n").trim();
     const ambiguous = isAmbiguousTaskChatRequest(userMessage, fullRequest);
@@ -1740,7 +1952,14 @@ export async function buildServer() {
     if (ambiguous) {
       response = "I need a bit more detail before I can draft a contract. What should be built, where it should live, and what done looks like?";
     } else {
-      proposedContract = buildTaskChatProposal(targetWorkspaceId, fullRequest);
+      const integrationConfigs = await repo.listIntegrationConfigs();
+      proposedContract = await createTaskChatProposal({
+        repo,
+        workspaceId: targetWorkspaceId,
+        workspacePath: targetWorkspace.local_path,
+        request: fullRequest,
+        integrationConfigs
+      });
       response = `I drafted a contract proposal for "${proposedContract.title}". Approve it to create the task and contract.`;
     }
 

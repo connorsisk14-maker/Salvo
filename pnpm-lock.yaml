@@ -61,9 +61,15 @@ importers:
       '@fastify/cors':
         specifier: ^10.0.2
         version: 10.1.0
+      '@salvo/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
       '@salvo/db':
         specifier: workspace:*
         version: link:../../packages/db
+      '@salvo/llm':
+        specifier: workspace:*
+        version: link:../../packages/llm
       '@salvo/shared':
         specifier: workspace:*
         version: link:../../packages/shared

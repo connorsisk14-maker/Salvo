@@ -1459,6 +1459,52 @@ export class SalvoRepository {
     return result.rows;
   }
 
+  async listWorkspaceRecentRuns(
+    workspaceId: string,
+    limit = 8
+  ): Promise<
+    Array<{
+      id: string;
+      task_id: string;
+      status: RunStatus;
+      created_at: string;
+      title: string;
+      contract_family_key: string;
+      contract_category: string;
+      contract_subcategory: string | null;
+    }>
+  > {
+    const result = await this.pool.query<{
+      id: string;
+      task_id: string;
+      status: RunStatus;
+      created_at: string;
+      title: string;
+      contract_family_key: string;
+      contract_category: string;
+      contract_subcategory: string | null;
+    }>(
+      `select
+         r.id,
+         r.task_id,
+         r.status,
+         r.created_at,
+         t.title,
+         coalesce(c.contract_json->>'family_key', concat('legacy_', substring(r.contract_id::text, 1, 12))) as contract_family_key,
+         coalesce(c.contract_json->>'category', 'general') as contract_category,
+         nullif(c.contract_json->>'subcategory', '') as contract_subcategory
+       from public.salvo_runs r
+       join public.salvo_tasks t on t.id = r.task_id
+       left join public.salvo_contracts c on c.id = r.contract_id
+       where t.workspace_id = $1
+       order by r.created_at desc
+       limit $2`,
+      [workspaceId, limit]
+    );
+
+    return result.rows;
+  }
+
   async listLeadRunSummaries(limit = 100): Promise<DbRunSummary[]> {
     const result = await this.pool.query<DbRunSummary>(
       `select
