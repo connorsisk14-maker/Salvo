@@ -19,6 +19,14 @@ export type DbWorkspace = {
   created_at: string;
 };
 
+export type DbWorkspaceToolPolicy = {
+  id: string;
+  workspace_id: string;
+  policy_json: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+};
+
 export type DbContractMemoryPrompt = {
   id: string;
   title: string;

@@ -36,6 +36,7 @@ if (!databaseUrl) {
         public.salvo_research_ingestions,
       public.salvo_research_documents,
       public.salvo_leads,
+      public.salvo_workspace_tool_policies,
       public.salvo_evaluations,
       public.salvo_artifacts,
       public.salvo_run_events,
@@ -938,6 +939,37 @@ if (!databaseUrl) {
     assert.equal(rows.length, 1);
     assert.equal(rows[0].integration_key, "process");
     assert.equal(rows[0].config_json.command, "pnpm test");
+  });
+
+  test("workspace tool policies can be upserted and listed", async () => {
+    const workspace = await repo.ensureWorkspace(`policy-${randomUUID()}`, process.cwd());
+
+    const saved = await repo.upsertWorkspaceToolPolicy({
+      workspaceId: workspace.id,
+      policyJson: {
+        allowedReadPaths: [".", "packages/shared"],
+        allowedCommands: ["pnpm"],
+        commandTimeoutMs: 12000
+      }
+    });
+    assert.equal(saved.workspace_id, workspace.id);
+
+    const fetched = await repo.getWorkspaceToolPolicy(workspace.id);
+    assert.ok(fetched);
+    assert.equal(fetched?.workspace_id, workspace.id);
+    const fetchedPolicy = fetched?.policy_json as {
+      allowedCommands?: string[];
+      allowedReadPaths?: string[];
+    };
+    assert.equal(fetchedPolicy.allowedCommands?.[0], "pnpm");
+
+    const listed = await repo.listWorkspaceToolPolicies(workspace.id);
+    assert.equal(listed.length, 1);
+    assert.equal(listed[0].workspace_name, workspace.name);
+    const listedPolicy = listed[0].policy_json as {
+      allowedReadPaths?: string[];
+    };
+    assert.equal(listedPolicy.allowedReadPaths?.length, 2);
   });
 
   test("budget status aggregates workspace and family spend from usage events", async () => {

@@ -50,6 +50,7 @@ import type {
   DbRun,
   DbRunSummary,
   DbRunCheckpoint,
+  DbWorkspaceToolPolicy,
   DbLeadRunChain,
   DbRunEvent,
   DbTask,
@@ -526,6 +527,66 @@ export class SalvoRepository {
     );
 
     return result.rows;
+  }
+
+  async listWorkspaceToolPolicies(workspaceId?: string): Promise<
+    Array<
+      DbWorkspaceToolPolicy & {
+        workspace_name: string;
+      }
+    >
+  > {
+    const result = await this.pool.query<
+      DbWorkspaceToolPolicy & {
+        workspace_name: string;
+      }
+    >(
+      `select
+         policies.id,
+         policies.workspace_id,
+         workspaces.name as workspace_name,
+         policies.policy_json,
+         policies.created_at,
+         policies.updated_at
+       from public.salvo_workspace_tool_policies policies
+       join public.salvo_workspaces workspaces on workspaces.id = policies.workspace_id
+       where ($1::uuid is null or policies.workspace_id = $1)
+       order by workspaces.name asc`,
+      [workspaceId ?? null]
+    );
+
+    return result.rows;
+  }
+
+  async getWorkspaceToolPolicy(workspaceId: string): Promise<DbWorkspaceToolPolicy | null> {
+    const result = await this.pool.query<DbWorkspaceToolPolicy>(
+      `select *
+       from public.salvo_workspace_tool_policies
+       where workspace_id = $1
+       limit 1`,
+      [workspaceId]
+    );
+    return result.rows[0] ?? null;
+  }
+
+  async upsertWorkspaceToolPolicy(input: {
+    workspaceId: string;
+    policyJson: Record<string, unknown>;
+  }): Promise<DbWorkspaceToolPolicy> {
+    const result = await this.pool.query<DbWorkspaceToolPolicy>(
+      `insert into public.salvo_workspace_tool_policies (
+         workspace_id,
+         policy_json
+       )
+       values ($1, $2::jsonb)
+       on conflict (workspace_id)
+       do update
+         set policy_json = excluded.policy_json,
+             updated_at = now()
+       returning *`,
+      [input.workspaceId, JSON.stringify(input.policyJson ?? {})]
+    );
+    return this.singleOrThrow(result.rows, "Failed to upsert workspace tool policy.");
   }
 
   async createLeadRunChain(input: {

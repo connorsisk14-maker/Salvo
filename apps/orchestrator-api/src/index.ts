@@ -102,6 +102,23 @@ const trustTierSchema = z.object({
   trustTier: z.enum(AGENT_TRUST_TIERS)
 }).strict();
 
+const workspaceToolPolicySchema = z
+  .object({
+    workspaceId: z.string().uuid("workspaceId must be a valid UUID."),
+    allowedReadPaths: z.array(z.string().trim().min(1).max(4096)).optional(),
+    allowedWritePaths: z.array(z.string().trim().min(1).max(4096)).optional(),
+    forbiddenPaths: z.array(z.string().trim().min(1).max(4096)).optional(),
+    allowedCommands: z.array(z.string().trim().min(1).max(256)).optional(),
+    allowedCommandCwds: z.array(z.string().trim().min(1).max(4096)).optional(),
+    commandTimeoutMs: z
+      .number()
+      .finite("commandTimeoutMs must be a number.")
+      .positive("commandTimeoutMs must be greater than 0.")
+      .max(120_000, "commandTimeoutMs must be 120000 or fewer.")
+      .optional()
+  })
+  .strict();
+
 const skillWorkspaceQuerySchema = z.object({
   workspaceId: z.string().uuid("workspaceId must be a valid UUID.").optional()
 }).strict();
@@ -1957,6 +1974,92 @@ export async function buildServer() {
     return {
       ok: true,
       tier
+    };
+  });
+
+  app.get("/workspace-policies", async () => {
+    const [workspaces, policies] = await Promise.all([
+      repo.listWorkspaces(),
+      repo.listWorkspaceToolPolicies()
+    ]);
+
+    return {
+      updated_at: new Date().toISOString(),
+      workspaces: workspaces.map((workspace) => ({
+        id: workspace.id,
+        name: workspace.name
+      })),
+      policies
+    };
+  });
+
+  app.post<{
+    Body: {
+      workspaceId: string;
+      allowedReadPaths?: string[];
+      allowedWritePaths?: string[];
+      forbiddenPaths?: string[];
+      allowedCommands?: string[];
+      allowedCommandCwds?: string[];
+      commandTimeoutMs?: number;
+    };
+  }>("/workspace-policies", async (req, reply) => {
+    const parsedBody = parseRequestBody(workspaceToolPolicySchema, req.body ?? {});
+    if (!parsedBody.ok) {
+      return reply.status(400).send({
+        error: "Invalid request body.",
+        issues: parsedBody.issues
+      });
+    }
+
+    const body = parsedBody.value;
+    const workspace = await repo.getWorkspace(body.workspaceId);
+    if (!workspace) {
+      return reply.status(404).send({
+        error: `Workspace not found: ${body.workspaceId}`
+      });
+    }
+
+    const policyJson: Record<string, unknown> = {};
+    if (body.allowedReadPaths) {
+      policyJson.allowedReadPaths = body.allowedReadPaths;
+    }
+    if (body.allowedWritePaths) {
+      policyJson.allowedWritePaths = body.allowedWritePaths;
+    }
+    if (body.forbiddenPaths) {
+      policyJson.forbiddenPaths = body.forbiddenPaths;
+    }
+    if (body.allowedCommands) {
+      policyJson.allowedCommands = body.allowedCommands;
+    }
+    if (body.allowedCommandCwds) {
+      policyJson.allowedCommandCwds = body.allowedCommandCwds;
+    }
+    if (typeof body.commandTimeoutMs === "number") {
+      policyJson.commandTimeoutMs = body.commandTimeoutMs;
+    }
+
+    const policy = await repo.upsertWorkspaceToolPolicy({
+      workspaceId: workspace.id,
+      policyJson
+    });
+    await repo.createAuditEvent({
+      actor: auditActor(req),
+      action: "workspace.tool_policy.updated",
+      target: policy.id,
+      metadata: {
+        workspace_id: policy.workspace_id,
+        policy_json: policy.policy_json
+      }
+    });
+
+    return {
+      ok: true,
+      policy: {
+        ...policy,
+        workspace_name: workspace.name
+      }
     };
   });
 

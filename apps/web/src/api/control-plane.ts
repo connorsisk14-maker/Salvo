@@ -348,6 +348,24 @@ export type ApiTrustTierOverview = {
   tiers: ApiTrustTier[];
 };
 
+export type ApiWorkspaceToolPolicy = {
+  id: string;
+  workspace_id: string;
+  workspace_name: string;
+  policy_json: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ApiWorkspaceToolPolicyOverview = {
+  updated_at: string;
+  workspaces: Array<{
+    id: string;
+    name: string;
+  }>;
+  policies: ApiWorkspaceToolPolicy[];
+};
+
 export type ApiRunDetail = {
   run: ApiRun;
   task: ApiTask;
@@ -667,6 +685,25 @@ export function saveTrustTier(input: {
   trustTier: ApiTrustTier["trust_tier"];
 }): Promise<ApiActionResponse & { tier?: ApiTrustTier }> {
   return request<ApiActionResponse & { tier?: ApiTrustTier }>("/trust-tiers", {
+    method: "POST",
+    body: JSON.stringify(input)
+  });
+}
+
+export function getWorkspaceToolPolicyOverview(): Promise<ApiWorkspaceToolPolicyOverview> {
+  return request<ApiWorkspaceToolPolicyOverview>("/workspace-policies");
+}
+
+export function saveWorkspaceToolPolicy(input: {
+  workspaceId: string;
+  allowedReadPaths?: string[];
+  allowedWritePaths?: string[];
+  forbiddenPaths?: string[];
+  allowedCommands?: string[];
+  allowedCommandCwds?: string[];
+  commandTimeoutMs?: number;
+}): Promise<ApiActionResponse & { policy?: ApiWorkspaceToolPolicy }> {
+  return request<ApiActionResponse & { policy?: ApiWorkspaceToolPolicy }>("/workspace-policies", {
     method: "POST",
     body: JSON.stringify(input)
   });

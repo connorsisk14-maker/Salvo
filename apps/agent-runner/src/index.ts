@@ -67,6 +67,7 @@ async function main(): Promise<void> {
   const resumeCheckpoint = await repo.loadRunCheckpoint(run.id, agentLoopCheckpointKey);
   const resumeFromCheckpoint = run.status === "running" && resumeCheckpoint !== null;
   const integrationConfigs = await repo.listIntegrationConfigs();
+  const workspacePolicy = await repo.getWorkspaceToolPolicy(task.workspace_id);
   const llmConfig = resolveRunnerLlmConfig({
     integrationConfigs,
     env: process.env,
@@ -80,7 +81,7 @@ async function main(): Promise<void> {
 
   await mkdir(workspaceRoot, { recursive: true });
 
-  const policy = parseContractPolicy(workspaceRoot, contractJson);
+  const policy = parseContractPolicy(workspaceRoot, contractJson, workspacePolicy?.policy_json);
   const filesystem = new FilesystemAdapter(workspaceRoot, policy);
   const command = new CommandAdapter(policy);
   const emailConfig =

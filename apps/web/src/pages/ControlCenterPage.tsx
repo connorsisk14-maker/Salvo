@@ -10,9 +10,11 @@ import {
   getOrchestratorHealth,
   getResearchHealth,
   getTrustTierOverview,
+  getWorkspaceToolPolicyOverview,
   listRuns,
   listTasks,
   saveBudgetLimit,
+  saveWorkspaceToolPolicy,
   saveTrustTier,
   triggerBackup,
   type ApiBackupStatus,
@@ -23,7 +25,9 @@ import {
   type ApiTask,
   type ApiTaskPriority,
   type ApiTrustTier,
-  type ApiTrustTierOverview
+  type ApiTrustTierOverview,
+  type ApiWorkspaceToolPolicy,
+  type ApiWorkspaceToolPolicyOverview
 } from "../api/control-plane";
 
 function renderHeartbeatDate(value?: string): string {
@@ -72,6 +76,86 @@ function formatTaskPriority(priority?: ApiTaskPriority | null): string {
   return option?.label ?? "Medium";
 }
 
+type WorkspacePolicyDraft = {
+  allowedReadPaths: string;
+  allowedWritePaths: string;
+  forbiddenPaths: string;
+  allowedCommands: string;
+  allowedCommandCwds: string;
+  commandTimeoutMs: string;
+};
+
+const EMPTY_POLICY_DRAFT: WorkspacePolicyDraft = {
+  allowedReadPaths: "",
+  allowedWritePaths: "",
+  forbiddenPaths: "",
+  allowedCommands: "",
+  allowedCommandCwds: "",
+  commandTimeoutMs: ""
+};
+
+function renderPolicyList(value: unknown): string {
+  if (!Array.isArray(value)) {
+    return "";
+  }
+  return value
+    .filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
+    .join("\n");
+}
+
+function splitPolicyList(value: string): string[] | undefined {
+  const rows = value
+    .split(/[\n,]/)
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+  return rows.length > 0 ? rows : undefined;
+}
+
+function policyDraftFromJson(policyJson: Record<string, unknown>): WorkspacePolicyDraft {
+  return {
+    allowedReadPaths: renderPolicyList(policyJson.allowedReadPaths),
+    allowedWritePaths: renderPolicyList(policyJson.allowedWritePaths),
+    forbiddenPaths: renderPolicyList(policyJson.forbiddenPaths),
+    allowedCommands: renderPolicyList(policyJson.allowedCommands),
+    allowedCommandCwds: renderPolicyList(policyJson.allowedCommandCwds),
+    commandTimeoutMs:
+      typeof policyJson.commandTimeoutMs === "number" && Number.isFinite(policyJson.commandTimeoutMs)
+        ? String(policyJson.commandTimeoutMs)
+        : ""
+  };
+}
+
+function policyDraftToPayload(draft: WorkspacePolicyDraft): Record<string, unknown> {
+  const payload: Record<string, unknown> = {};
+  const allowedReadPaths = splitPolicyList(draft.allowedReadPaths);
+  const allowedWritePaths = splitPolicyList(draft.allowedWritePaths);
+  const forbiddenPaths = splitPolicyList(draft.forbiddenPaths);
+  const allowedCommands = splitPolicyList(draft.allowedCommands);
+  const allowedCommandCwds = splitPolicyList(draft.allowedCommandCwds);
+  const commandTimeoutMs = Number(draft.commandTimeoutMs);
+
+  if (allowedReadPaths) {
+    payload.allowedReadPaths = allowedReadPaths;
+  }
+  if (allowedWritePaths) {
+    payload.allowedWritePaths = allowedWritePaths;
+  }
+  if (forbiddenPaths) {
+    payload.forbiddenPaths = forbiddenPaths;
+  }
+  if (allowedCommands) {
+    payload.allowedCommands = allowedCommands;
+  }
+  if (allowedCommandCwds) {
+    payload.allowedCommandCwds = allowedCommandCwds;
+  }
+  if (Number.isFinite(commandTimeoutMs) && commandTimeoutMs > 0) {
+    payload.commandTimeoutMs = commandTimeoutMs;
+  }
+
+  return payload;
+}
+
 export function ControlCenterPage() {
   const [title, setTitle] = useState("Create run summary scaffolding");
   const [request, setRequest] = useState(
@@ -85,19 +169,27 @@ export function ControlCenterPage() {
   const [backupStatus, setBackupStatus] = useState<ApiBackupStatus | null>(null);
   const [budgetOverview, setBudgetOverview] = useState<ApiBudgetOverview | null>(null);
   const [trustTierOverview, setTrustTierOverview] = useState<ApiTrustTierOverview | null>(null);
+  const [workspacePolicyOverview, setWorkspacePolicyOverview] =
+    useState<ApiWorkspaceToolPolicyOverview | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [backupSubmitting, setBackupSubmitting] = useState(false);
   const [budgetSubmitting, setBudgetSubmitting] = useState(false);
   const [trustTierSavingKey, setTrustTierSavingKey] = useState<string | null>(null);
+  const [workspacePolicySavingKey, setWorkspacePolicySavingKey] = useState<string | null>(null);
   const [restartTarget, setRestartTarget] = useState<ApiRestartTarget | null>(null);
   const [restartMessage, setRestartMessage] = useState<string | null>(null);
   const [backupMessage, setBackupMessage] = useState<string | null>(null);
   const [budgetMessage, setBudgetMessage] = useState<string | null>(null);
   const [trustTierMessage, setTrustTierMessage] = useState<string | null>(null);
+  const [workspacePolicyMessage, setWorkspacePolicyMessage] = useState<string | null>(null);
   const [budgetWorkspaceId, setBudgetWorkspaceId] = useState("");
   const [budgetFamilyKey, setBudgetFamilyKey] = useState("");
   const [budgetLimitUsd, setBudgetLimitUsd] = useState("25");
   const [trustTierEdits, setTrustTierEdits] = useState<Record<string, ApiTrustTier["trust_tier"]>>({});
+  const [workspacePolicyWorkspaceId, setWorkspacePolicyWorkspaceId] = useState("");
+  const [workspacePolicyDrafts, setWorkspacePolicyDrafts] = useState<
+    Record<string, WorkspacePolicyDraft>
+  >({});
   const [error, setError] = useState<string | null>(null);
   const [taskPriority, setTaskPriority] = useState<ApiTaskPriority>("medium");
 
@@ -123,6 +215,16 @@ export function ControlCenterPage() {
     }
     return "healthy";
   }, [trustTierOverview]);
+  const selectedWorkspacePolicy = useMemo<ApiWorkspaceToolPolicy | null>(
+    () =>
+      workspacePolicyOverview?.policies.find(
+        (entry) => entry.workspace_id === workspacePolicyWorkspaceId
+      ) ?? null,
+    [workspacePolicyOverview, workspacePolicyWorkspaceId]
+  );
+  const selectedWorkspacePolicyDraft =
+    workspacePolicyDrafts[workspacePolicyWorkspaceId] ??
+    (selectedWorkspacePolicy ? policyDraftFromJson(selectedWorkspacePolicy.policy_json) : EMPTY_POLICY_DRAFT);
 
   async function refresh() {
     try {
@@ -133,7 +235,8 @@ export function ControlCenterPage() {
         nextResearchHealth,
         nextBackupStatus,
         nextBudgetOverview,
-        nextTrustTierOverview
+        nextTrustTierOverview,
+        nextWorkspacePolicyOverview
       ] =
         await Promise.all([
           listTasks(),
@@ -142,7 +245,8 @@ export function ControlCenterPage() {
           getResearchHealth(),
           getBackupStatus(),
           getBudgetOverview(),
-          getTrustTierOverview()
+          getTrustTierOverview(),
+          getWorkspaceToolPolicyOverview()
         ]);
       setTasks(nextTasks);
       setRuns(nextRuns);
@@ -151,6 +255,7 @@ export function ControlCenterPage() {
       setBackupStatus(nextBackupStatus);
       setBudgetOverview(nextBudgetOverview);
       setTrustTierOverview(nextTrustTierOverview);
+      setWorkspacePolicyOverview(nextWorkspacePolicyOverview);
       setBudgetWorkspaceId((current) =>
         nextBudgetOverview.workspaces.some((workspace) => workspace.id === current)
           ? current
@@ -162,6 +267,20 @@ export function ControlCenterPage() {
           const key = trustTierRowKey(tier.workspace_id, tier.agent_profile);
           const existing = current[key];
           next[key] = existing && existing !== tier.trust_tier ? existing : tier.trust_tier;
+        }
+        return next;
+      });
+      setWorkspacePolicyWorkspaceId((current) =>
+        nextWorkspacePolicyOverview.workspaces.some((workspace) => workspace.id === current)
+          ? current
+          : (nextWorkspacePolicyOverview.workspaces[0]?.id ?? "")
+      );
+      setWorkspacePolicyDrafts((current) => {
+        const next: Record<string, WorkspacePolicyDraft> = { ...current };
+        for (const policy of nextWorkspacePolicyOverview.policies) {
+          if (!next[policy.workspace_id]) {
+            next[policy.workspace_id] = policyDraftFromJson(policy.policy_json);
+          }
         }
         return next;
       });
@@ -302,6 +421,43 @@ export function ControlCenterPage() {
       setTrustTierMessage(`Trust tier update failed: ${(trustTierError as Error).message}`);
     } finally {
       setTrustTierSavingKey(null);
+    }
+  }
+
+  async function onSaveWorkspacePolicy(event: FormEvent) {
+    event.preventDefault();
+    if (!workspacePolicyWorkspaceId) {
+      setWorkspacePolicyMessage("Select a workspace before saving a policy.");
+      return;
+    }
+
+    const draft = workspacePolicyDrafts[workspacePolicyWorkspaceId] ?? EMPTY_POLICY_DRAFT;
+    setWorkspacePolicySavingKey(workspacePolicyWorkspaceId);
+    try {
+      const response = await saveWorkspaceToolPolicy({
+        workspaceId: workspacePolicyWorkspaceId,
+        ...policyDraftToPayload(draft)
+      });
+      if (!response.ok) {
+        throw new Error("Workspace policy update failed.");
+      }
+
+      setWorkspacePolicyMessage(
+        `Policy saved for ${
+          workspacePolicyOverview?.workspaces.find((workspace) => workspace.id === workspacePolicyWorkspaceId)?.name ??
+          workspacePolicyWorkspaceId
+        }.`
+      );
+      setWorkspacePolicyDrafts((current) => ({
+        ...current,
+        [workspacePolicyWorkspaceId]: draft
+      }));
+      await refresh();
+      setError(null);
+    } catch (policyError) {
+      setWorkspacePolicyMessage(`Workspace policy update failed: ${(policyError as Error).message}`);
+    } finally {
+      setWorkspacePolicySavingKey(null);
     }
   }
 
@@ -676,6 +832,180 @@ export function ControlCenterPage() {
             )}
           </tbody>
         </table>
+      </section>
+
+      <section className="panel">
+        <div className="health-card-head">
+          <h2>Workspace Policy</h2>
+          <span className={`status-pill status-${workspacePolicyOverview?.policies.length ? "healthy" : "pending"}`}>
+            {workspacePolicyOverview?.policies.length ? "overlay" : "pending"}
+          </span>
+        </div>
+        <div className="health-grid">
+          <article className="health-card">
+            <h3>Coverage</h3>
+            <p className="muted">Workspaces: {workspacePolicyOverview?.workspaces.length ?? 0}</p>
+            <p className="muted">Policy rows: {workspacePolicyOverview?.policies.length ?? 0}</p>
+            <p className="muted">
+              Selected workspace:{" "}
+              <span className="mono">
+                {workspacePolicyOverview?.workspaces.find((workspace) => workspace.id === workspacePolicyWorkspaceId)
+                  ?.name ?? (workspacePolicyWorkspaceId || "-")}
+              </span>
+            </p>
+          </article>
+
+          <article className="health-card">
+            <h3>Notes</h3>
+            <p className="muted">This editor stores an overlay that narrows the contract policy at runtime.</p>
+            <p className="muted">Use newline-separated relative paths and command names. Blank fields leave the contract policy unchanged.</p>
+          </article>
+        </div>
+        {workspacePolicyMessage ? <p className="muted restart-note">{workspacePolicyMessage}</p> : null}
+        <form className="form-grid" onSubmit={onSaveWorkspacePolicy}>
+          <label>
+            Workspace
+            <select
+              value={workspacePolicyWorkspaceId}
+              onChange={(event) => {
+                const nextWorkspaceId = event.target.value;
+                setWorkspacePolicyWorkspaceId(nextWorkspaceId);
+                setWorkspacePolicyDrafts((current) => {
+                  if (current[nextWorkspaceId]) {
+                    return current;
+                  }
+                  const existingPolicy = workspacePolicyOverview?.policies.find(
+                    (entry) => entry.workspace_id === nextWorkspaceId
+                  );
+                  return {
+                    ...current,
+                    [nextWorkspaceId]: existingPolicy
+                      ? policyDraftFromJson(existingPolicy.policy_json)
+                      : EMPTY_POLICY_DRAFT
+                  };
+                });
+              }}
+              required
+            >
+              {(workspacePolicyOverview?.workspaces ?? []).map((workspace) => (
+                <option key={workspace.id} value={workspace.id}>
+                  {workspace.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Allowed Read Paths
+            <textarea
+              rows={3}
+              value={selectedWorkspacePolicyDraft.allowedReadPaths}
+              onChange={(event) =>
+                setWorkspacePolicyDrafts((current) => ({
+                  ...current,
+                  [workspacePolicyWorkspaceId]: {
+                    ...selectedWorkspacePolicyDraft,
+                    allowedReadPaths: event.target.value
+                  }
+                }))
+              }
+              placeholder={".\npackages/shared"}
+            />
+          </label>
+          <label>
+            Allowed Write Paths
+            <textarea
+              rows={3}
+              value={selectedWorkspacePolicyDraft.allowedWritePaths}
+              onChange={(event) =>
+                setWorkspacePolicyDrafts((current) => ({
+                  ...current,
+                  [workspacePolicyWorkspaceId]: {
+                    ...selectedWorkspacePolicyDraft,
+                    allowedWritePaths: event.target.value
+                  }
+                }))
+              }
+              placeholder={".\npackages/shared"}
+            />
+          </label>
+          <label>
+            Forbidden Paths
+            <textarea
+              rows={3}
+              value={selectedWorkspacePolicyDraft.forbiddenPaths}
+              onChange={(event) =>
+                setWorkspacePolicyDrafts((current) => ({
+                  ...current,
+                  [workspacePolicyWorkspaceId]: {
+                    ...selectedWorkspacePolicyDraft,
+                    forbiddenPaths: event.target.value
+                  }
+                }))
+              }
+              placeholder={".git\nnode_modules"}
+            />
+          </label>
+          <label>
+            Allowed Commands
+            <textarea
+              rows={3}
+              value={selectedWorkspacePolicyDraft.allowedCommands}
+              onChange={(event) =>
+                setWorkspacePolicyDrafts((current) => ({
+                  ...current,
+                  [workspacePolicyWorkspaceId]: {
+                    ...selectedWorkspacePolicyDraft,
+                    allowedCommands: event.target.value
+                  }
+                }))
+              }
+              placeholder={"echo\npnpm\nnode"}
+            />
+          </label>
+          <label>
+            Allowed Command CWDs
+            <textarea
+              rows={3}
+              value={selectedWorkspacePolicyDraft.allowedCommandCwds}
+              onChange={(event) =>
+                setWorkspacePolicyDrafts((current) => ({
+                  ...current,
+                  [workspacePolicyWorkspaceId]: {
+                    ...selectedWorkspacePolicyDraft,
+                    allowedCommandCwds: event.target.value
+                  }
+                }))
+              }
+              placeholder={".\npackages/shared"}
+            />
+          </label>
+          <label>
+            Command Timeout (ms)
+            <input
+              min="1"
+              step="1"
+              type="number"
+              value={selectedWorkspacePolicyDraft.commandTimeoutMs}
+              onChange={(event) =>
+                setWorkspacePolicyDrafts((current) => ({
+                  ...current,
+                  [workspacePolicyWorkspaceId]: {
+                    ...selectedWorkspacePolicyDraft,
+                    commandTimeoutMs: event.target.value
+                  }
+                }))
+              }
+              placeholder="20000"
+            />
+          </label>
+          <button
+            className="button-link"
+            disabled={workspacePolicySavingKey === workspacePolicyWorkspaceId || !workspacePolicyWorkspaceId}
+            type="submit"
+          >
+            {workspacePolicySavingKey === workspacePolicyWorkspaceId ? "Saving..." : "Save workspace policy"}
+          </button>
+        </form>
       </section>
 
       <section className="panel">

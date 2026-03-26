@@ -38,6 +38,7 @@ if (!databaseUrl) {
         public.salvo_research_documents,
         public.salvo_evaluations,
         public.salvo_leads,
+        public.salvo_workspace_tool_policies,
         public.salvo_artifacts,
         public.salvo_run_events,
         public.salvo_runs,
@@ -1175,9 +1176,53 @@ if (!databaseUrl) {
             entry.agent_profile === "builder" &&
             entry.trust_tier === "probation" &&
             entry.managed_by === "manual"
-        ),
+      ),
       true
     );
+  });
+
+  test("workspace policy endpoints expose workspaces and persist overlays", async () => {
+    const workspace = await repo.ensureWorkspace(`policy-api-${randomUUID()}`, process.cwd());
+
+    const initial = await app.inject({
+      method: "GET",
+      url: "/workspace-policies"
+    });
+    assert.equal(initial.statusCode, 200);
+    const initialPayload = initial.json();
+    assert.equal(
+      initialPayload.workspaces.some((entry: { id: string }) => entry.id === workspace.id),
+      true
+    );
+
+    const saved = await app.inject({
+      method: "POST",
+      url: "/workspace-policies",
+      payload: {
+        workspaceId: workspace.id,
+        allowedReadPaths: [".", "packages/shared"],
+        allowedWritePaths: ["packages/shared"],
+        forbiddenPaths: [".git"],
+        allowedCommands: ["pnpm", "node"],
+        allowedCommandCwds: ["."],
+        commandTimeoutMs: 9000
+      }
+    });
+    assert.equal(saved.statusCode, 200);
+    assert.equal(saved.json().ok, true);
+    assert.equal(saved.json().policy.workspace_id, workspace.id);
+
+    const afterSave = await app.inject({
+      method: "GET",
+      url: "/workspace-policies"
+    });
+    assert.equal(afterSave.statusCode, 200);
+    const savedPolicy = afterSave
+      .json()
+      .policies.find((entry: { workspace_id: string }) => entry.workspace_id === workspace.id);
+    assert.ok(savedPolicy);
+    assert.deepEqual(savedPolicy.policy_json.allowedCommands, ["pnpm", "node"]);
+    assert.equal(savedPolicy.policy_json.commandTimeoutMs, 9000);
   });
 
   test("integration config update endpoint persists llm_api settings", async () => {
