@@ -236,6 +236,9 @@ importers:
 
   packages/evaluation:
     dependencies:
+      '@salvo/contracts':
+        specifier: workspace:*
+        version: link:../contracts
       '@salvo/shared':
         specifier: workspace:*
         version: link:../shared

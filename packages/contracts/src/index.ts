@@ -33,6 +33,48 @@ export const ContractCapabilitiesSchema = z.object({
   slack_send: z.boolean().default(false)
 });
 
+export const ContractAssertionSchema = z.union([
+  z.string().min(1),
+  z
+    .object({
+      type: z.literal("artifact_exists"),
+      path: z.string().min(1),
+      artifact_type: z.string().trim().min(1).optional()
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("artifact_contains"),
+      path: z.string().min(1),
+      text: z.string().min(1),
+      case_sensitive: z.boolean().default(false).optional()
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("command_exit_code"),
+      command: z.string().min(1),
+      exit_code: z.number().int()
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("token_budget"),
+      max_input_tokens: z.number().int().positive().optional(),
+      max_output_tokens: z.number().int().positive().optional(),
+      max_total_tokens: z.number().int().positive().optional(),
+      max_cost_usd: z.number().positive().optional()
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("final_payload_present")
+    })
+    .strict()
+]);
+
+export type ContractAssertion = z.infer<typeof ContractAssertionSchema>;
+
 export const ContractV1Schema = z.object({
   schema_version: z.literal(1),
   contract_id: z.string().uuid(),
@@ -71,7 +113,7 @@ export const ContractV1Schema = z.object({
   }),
   success_criteria: z.object({
     required_test_commands: z.array(z.string()).default([]),
-    assertions: z.array(z.string()).default([])
+    assertions: z.array(ContractAssertionSchema).default([])
   }),
   failure_handling: z.object({
     stop_on_policy_denial: z.boolean().default(true)

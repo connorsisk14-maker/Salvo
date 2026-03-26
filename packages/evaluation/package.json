@@ -12,6 +12,7 @@
     "test": "tsx --test test/*.test.ts"
   },
   "dependencies": {
+    "@salvo/contracts": "workspace:*",
     "@salvo/shared": "workspace:*"
   },
   "devDependencies": {

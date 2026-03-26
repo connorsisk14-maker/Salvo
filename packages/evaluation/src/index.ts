@@ -1,3 +1,4 @@
+import type { ContractAssertion } from "@salvo/contracts";
 import type { EvaluationOutcome } from "@salvo/shared";
 
 export const EVALUATION_WEIGHTS = {
@@ -9,17 +10,36 @@ export const EVALUATION_WEIGHTS = {
 } as const;
 
 export type EvaluationInput = {
-  contractCompliance: number;
+  contractCompliance?: number;
   testsExitCode?: number;
   testsRun?: ReadonlyArray<{ command?: string; exit_code?: number; denied?: boolean }>;
   requiredTestCommands?: readonly string[];
-  requiredAssertions?: readonly string[];
+  requiredAssertions?: readonly ContractAssertion[];
   finalPayloadPresent?: boolean;
   requiredDeliverables: readonly string[];
   producedDeliverables: readonly string[];
   evidencePresent: boolean;
   learningsCount: number;
   policyDeniedCount: number;
+  artifacts?: ReadonlyArray<{
+    path: string;
+    content?: string;
+    artifactType?: string;
+  }>;
+  commandResults?: ReadonlyArray<{
+    command?: string;
+    exit_code?: number;
+    denied?: boolean;
+  }>;
+  tokenUsage?: {
+    inputTokens?: number;
+    outputTokens?: number;
+    costUsd?: number;
+    maxInputTokens?: number;
+    maxOutputTokens?: number;
+    maxTotalTokens?: number;
+    maxCostUsd?: number;
+  };
 };
 
 export type EvaluationResult = {
@@ -36,32 +56,154 @@ type AssertionEvaluation = {
   passed: boolean;
 };
 
-function evaluateAssertions(input: EvaluationInput): AssertionEvaluation[] {
-  const results: AssertionEvaluation[] = [];
-  for (const assertion of input.requiredAssertions ?? []) {
+function normalizePath(value: string): string {
+  return value.replace(/\\/g, "/").replace(/\/+/g, "/").replace(/\/$/, "");
+}
+
+function matchesArtifactPath(actualPath: string, expectedPath: string): boolean {
+  const normalizedActual = normalizePath(actualPath).toLowerCase();
+  const normalizedExpected = normalizePath(expectedPath).toLowerCase();
+  return (
+    normalizedActual === normalizedExpected ||
+    normalizedActual.endsWith(`/${normalizedExpected}`) ||
+    normalizedActual.endsWith(normalizedExpected)
+  );
+}
+
+function readArtifactContent(
+  artifacts: ReadonlyArray<{ path: string; content?: string }>
+  , targetPath: string
+): string | undefined {
+  const match = artifacts.find((artifact) => matchesArtifactPath(artifact.path, targetPath));
+  return match?.content;
+}
+
+function evaluateStructuredAssertion(
+  assertion: ContractAssertion,
+  input: EvaluationInput
+): AssertionEvaluation {
+  if (typeof assertion === "string") {
     if (assertion === "Runner emits a final payload event.") {
-      results.push({
+      return {
         assertion,
         recognized: true,
         passed: Boolean(input.finalPayloadPresent)
-      });
-      continue;
+      };
     }
 
     if (assertion === "At least one deliverable produced.") {
-      results.push({
+      return {
         assertion,
         recognized: true,
         passed: input.producedDeliverables.length > 0
-      });
-      continue;
+      };
     }
 
-    results.push({
+    return {
       assertion,
       recognized: false,
       passed: true
-    });
+    };
+  }
+
+  if (assertion.type === "final_payload_present") {
+    return {
+      assertion: "final_payload_present",
+      recognized: true,
+      passed: Boolean(input.finalPayloadPresent)
+    };
+  }
+
+  if (assertion.type === "artifact_exists") {
+    const artifact = input.artifacts?.find((candidate) =>
+      matchesArtifactPath(candidate.path, assertion.path)
+    );
+    const artifactTypeMatches =
+      !assertion.artifact_type ||
+      artifact?.artifactType === assertion.artifact_type ||
+      artifact?.artifactType?.toLowerCase() === assertion.artifact_type.toLowerCase();
+    return {
+      assertion: `artifact_exists:${assertion.path}`,
+      recognized: true,
+      passed: Boolean(artifact) && artifactTypeMatches
+    };
+  }
+
+  if (assertion.type === "artifact_contains") {
+    const artifactContent = readArtifactContent(input.artifacts ?? [], assertion.path);
+    if (artifactContent === undefined) {
+      return {
+        assertion: `artifact_contains:${assertion.path}`,
+        recognized: true,
+        passed: false
+      };
+    }
+
+    const haystack = assertion.case_sensitive ? artifactContent : artifactContent.toLowerCase();
+    const needle = assertion.case_sensitive ? assertion.text : assertion.text.toLowerCase();
+    return {
+      assertion: `artifact_contains:${assertion.path}`,
+      recognized: true,
+      passed: haystack.includes(needle)
+    };
+  }
+
+  if (assertion.type === "command_exit_code") {
+    const commandResult = input.commandResults?.find(
+      (candidate) => candidate.command === assertion.command
+    );
+    const passed =
+      commandResult !== undefined &&
+      commandResult.denied !== true &&
+      commandResult.exit_code === assertion.exit_code;
+    return {
+      assertion: `command_exit_code:${assertion.command}`,
+      recognized: true,
+      passed
+    };
+  }
+
+  if (assertion.type === "token_budget") {
+    const usage = input.tokenUsage;
+    if (!usage) {
+      return {
+        assertion: "token_budget",
+        recognized: true,
+        passed: true
+      };
+    }
+
+    const inputTokens = usage.inputTokens ?? 0;
+    const outputTokens = usage.outputTokens ?? 0;
+    const totalTokens = inputTokens + outputTokens;
+    const withinInput =
+      assertion.max_input_tokens === undefined || inputTokens <= assertion.max_input_tokens;
+    const withinOutput =
+      assertion.max_output_tokens === undefined || outputTokens <= assertion.max_output_tokens;
+    const withinTotal =
+      assertion.max_total_tokens === undefined || totalTokens <= assertion.max_total_tokens;
+    const withinCost =
+      assertion.max_cost_usd === undefined ||
+      usage.costUsd === undefined ||
+      usage.costUsd <= assertion.max_cost_usd;
+    return {
+      assertion: "token_budget",
+      recognized: true,
+      passed: withinInput && withinOutput && withinTotal && withinCost
+    };
+  }
+
+  return {
+    assertion: JSON.stringify(assertion),
+    recognized: false,
+    passed: true
+  };
+}
+
+function evaluateAssertions(input: EvaluationInput): AssertionEvaluation[] {
+  const results: AssertionEvaluation[] = [];
+  for (const assertion of input.requiredAssertions ?? []) {
+    results.push(evaluateStructuredAssertion(assertion, input));
   }
 
   return results;
@@ -145,12 +287,67 @@ export function evaluateRun(input: EvaluationInput): EvaluationResult {
   const skippedAssertions = assertionResults.filter((result) => !result.recognized);
   findings.push(...skippedAssertions.map((result) => `Assertion not recognized and skipped: ${result.assertion}`));
 
+  const tokenUsage = input.tokenUsage;
+  if (tokenUsage) {
+    const inputTokens = tokenUsage.inputTokens ?? 0;
+    const outputTokens = tokenUsage.outputTokens ?? 0;
+    const totalTokens = inputTokens + outputTokens;
+
+    if (tokenUsage.maxInputTokens !== undefined && inputTokens > tokenUsage.maxInputTokens) {
+      return {
+        outcome: "hard_failed",
+        passed: false,
+        score: 0,
+        hardFailReason: "Input token budget exceeded.",
+        findings: [
+          `Hard fail: input token budget exceeded (${inputTokens} > ${tokenUsage.maxInputTokens}).`
+        ]
+      };
+    }
+
+    if (tokenUsage.maxOutputTokens !== undefined && outputTokens > tokenUsage.maxOutputTokens) {
+      return {
+        outcome: "hard_failed",
+        passed: false,
+        score: 0,
+        hardFailReason: "Output token budget exceeded.",
+        findings: [
+          `Hard fail: output token budget exceeded (${outputTokens} > ${tokenUsage.maxOutputTokens}).`
+        ]
+      };
+    }
+
+    if (tokenUsage.maxTotalTokens !== undefined && totalTokens > tokenUsage.maxTotalTokens) {
+      return {
+        outcome: "hard_failed",
+        passed: false,
+        score: 0,
+        hardFailReason: "Total token budget exceeded.",
+        findings: [
+          `Hard fail: total token budget exceeded (${totalTokens} > ${tokenUsage.maxTotalTokens}).`
+        ]
+      };
+    }
+
+    if (tokenUsage.maxCostUsd !== undefined && tokenUsage.costUsd !== undefined) {
+      if (tokenUsage.costUsd > tokenUsage.maxCostUsd) {
+        return {
+          outcome: "hard_failed",
+          passed: false,
+          score: 0,
+          hardFailReason: "Cost budget exceeded.",
+          findings: [
+            `Hard fail: cost budget exceeded (${tokenUsage.costUsd} > ${tokenUsage.maxCostUsd}).`
+          ]
+        };
+      }
+    }
+  }
+
   const recognizedResults = assertionResults.filter((result) => result.recognized);
   const satisfiedAssertions = recognizedResults.filter((result) => result.passed).length;
-  const requiredTestCount = input.requiredTestCommands?.length ?? 0;
-  const totalCriteria = recognizedResults.length + requiredTestCount;
-  const satisfiedCriteria = satisfiedAssertions + requiredTestCount;
-  const contractComplianceScore = totalCriteria === 0 ? 1 : satisfiedCriteria / totalCriteria;
+  const contractComplianceScore =
+    recognizedResults.length === 0 ? 1 : satisfiedAssertions / recognizedResults.length;
   const testsScore = input.testsExitCode === 0 || input.testsExitCode === undefined ? 1 : 0;
   const deliverablesScore = 1;
   const evidenceScore = input.evidencePresent ? 1 : 0;

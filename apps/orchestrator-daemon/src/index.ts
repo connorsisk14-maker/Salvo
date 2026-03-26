@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
+import { readFile, stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import type { ContractV1 } from "@salvo/contracts";
+import path from "node:path";
+import type { ContractAssertion, ContractV1 } from "@salvo/contracts";
 import {
   createDbPool,
   SalvoRepository,
@@ -55,6 +57,83 @@ const logger = createLogger({
   component: "orchestrator-daemon",
   daemon_id: workerId
 });
+const TEXT_ARTIFACT_EXTENSIONS = new Set([
+  ".md",
+  ".txt",
+  ".json",
+  ".log",
+  ".yaml",
+  ".yml",
+  ".ts",
+  ".tsx",
+  ".js",
+  ".jsx",
+  ".css",
+  ".html"
+]);
+
+function isTextArtifact(filePath: string): boolean {
+  return TEXT_ARTIFACT_EXTENSIONS.has(path.extname(filePath).toLowerCase());
+}
+
+async function loadArtifactSnapshot(artifactPath: string): Promise<{ path: string; content?: string }> {
+  if (!isTextArtifact(artifactPath)) {
+    return { path: artifactPath };
+  }
+
+  try {
+    const fileInfo = await stat(artifactPath);
+    if (!fileInfo.isFile()) {
+      return { path: artifactPath };
+    }
+    const maxBytes = Math.min(64_000, fileInfo.size);
+    const content = await readFile(artifactPath, "utf8");
+    return {
+      path: artifactPath,
+      content: content.slice(0, maxBytes)
+    };
+  } catch {
+    return { path: artifactPath };
+  }
+}
+
+function summarizeUsage(events: DbRunEvent[]): {
+  inputTokens?: number;
+  outputTokens?: number;
+  costUsd?: number;
+  maxInputTokens?: number;
+  maxOutputTokens?: number;
+  maxTotalTokens?: number;
+} | undefined {
+  const usageEvents = events.filter((event) => event.event_type === "usage.reported");
+  if (usageEvents.length === 0) {
+    return undefined;
+  }
+
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let costUsd = 0;
+  for (const event of usageEvents) {
+    const input = Number(event.payload_json?.input_tokens ?? 0);
+    const output = Number(event.payload_json?.output_tokens ?? 0);
+    const cost = Number(event.payload_json?.cost_usd ?? 0);
+    if (Number.isFinite(input)) {
+      inputTokens += input;
+    }
+    if (Number.isFinite(output)) {
+      outputTokens += output;
+    }
+    if (Number.isFinite(cost)) {
+      costUsd += cost;
+    }
+  }
+
+  return {
+    inputTokens,
+    outputTokens,
+    costUsd
+  };
+}
 
 function readPositiveIntegerEnv(name: string, fallback: number): number {
   const value = Number(process.env[name] ?? fallback);
@@ -925,7 +1004,12 @@ export class OrchestratorDaemon {
 
     const finalPayload = await this.repo.getRunFinalPayload(runId);
     const events = await this.repo.listRunEvents(runId);
+    const artifacts = await this.repo.listArtifactsForRun(runId);
     const policyDeniedCount = this.findPolicyDeniedCount(events);
+    const artifactSnapshots = await Promise.all(
+      artifacts.map(async (artifact) => loadArtifactSnapshot(artifact.path))
+    );
+    const usage = summarizeUsage(events);
 
     const payload = (finalPayload ?? {}) as {
       deliverables?: string[];
@@ -940,10 +1024,15 @@ export class OrchestratorDaemon {
     const firstExitCode = commandResults.find((item) => item.exit_code !== undefined)?.exit_code;
 
     const contractJson = detail.contract.contract_json as {
+      constraints?: {
+        max_total_input_tokens?: number;
+        max_total_output_tokens?: number;
+        max_total_cost_usd?: number;
+      };
       deliverables?: { required_artifacts?: string[] };
       success_criteria?: {
         required_test_commands?: string[];
-        assertions?: string[];
+        assertions?: Array<ContractAssertion>;
       };
     };
 
@@ -958,7 +1047,23 @@ export class OrchestratorDaemon {
       producedDeliverables: payload.deliverables ?? [],
       evidencePresent: payload.evidence !== undefined,
       learningsCount: payload.learnings?.length ?? 0,
-      policyDeniedCount
+      policyDeniedCount,
+      artifacts: artifactSnapshots,
+      commandResults,
+      tokenUsage: usage
+        ? {
+            ...usage,
+            maxInputTokens: contractJson.constraints?.max_total_input_tokens,
+            maxOutputTokens: contractJson.constraints?.max_total_output_tokens,
+            maxTotalTokens:
+              contractJson.constraints?.max_total_input_tokens &&
+              contractJson.constraints?.max_total_output_tokens
+                ? contractJson.constraints.max_total_input_tokens +
+                  contractJson.constraints.max_total_output_tokens
+                : undefined,
+            maxCostUsd: contractJson.constraints?.max_total_cost_usd
+          }
+        : undefined
     });
 
     await this.repo.recordEvaluation({

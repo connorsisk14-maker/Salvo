@@ -1,4 +1,4 @@
-import type { ContractV1 } from "@salvo/contracts";
+import type { ContractAssertion, ContractV1 } from "@salvo/contracts";
 
 export type PromptMemoryExcerpt = {
   id?: string;
@@ -42,6 +42,18 @@ function formatCapabilityList(contract: ContractV1): string {
 
   return capabilityEntries
     .map(([name, enabled]) => `- ${name}: ${enabled ? "granted" : "denied"}`)
+    .join("\n");
+}
+
+function formatAssertionList(assertions: ContractAssertion[]): string {
+  if (assertions.length === 0) {
+    return "- none";
+  }
+
+  return assertions
+    .map((assertion) =>
+      typeof assertion === "string" ? `- ${assertion}` : `- ${JSON.stringify(assertion)}`
+    )
     .join("\n");
 }
 
@@ -96,7 +108,7 @@ export function buildSystemPrompt(input: BuildSystemPromptInput): string {
     `- summary_required: ${input.contract.deliverables.summary_required ? "true" : "false"}`,
     "## Success Criteria",
     `Required test commands:\n${formatList(input.contract.success_criteria.required_test_commands)}`,
-    `Assertions:\n${formatList(input.contract.success_criteria.assertions)}`,
+    `Assertions:\n${formatAssertionList(input.contract.success_criteria.assertions)}`,
     "## Completion Protocol",
     `When tool calling is available, finish by calling \`${completionToolName}\` with the final payload once the work is complete.`,
     "If the runtime asks for plain JSON output instead, return a strict JSON object with keys `plan_steps`, `summary`, `artifacts`, and `learnings`.",

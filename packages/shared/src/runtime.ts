@@ -207,6 +207,8 @@ export type AgentProfileDefinition = {
       network_access: boolean;
       db_read: boolean;
       db_write: boolean;
+      email_send: boolean;
+      slack_send: boolean;
     };
     constraints: {
       max_runtime_minutes: number;
@@ -236,7 +238,9 @@ export const AGENT_PROFILE_DEFINITIONS: Record<AgentProfile, AgentProfileDefinit
         install_packages: true,
         network_access: true,
         db_read: true,
-        db_write: true
+        db_write: true,
+        email_send: false,
+        slack_send: false
       },
       constraints: {
         max_runtime_minutes: 30,
@@ -262,7 +266,9 @@ export const AGENT_PROFILE_DEFINITIONS: Record<AgentProfile, AgentProfileDefinit
         install_packages: false,
         network_access: true,
         db_read: true,
-        db_write: false
+        db_write: false,
+        email_send: false,
+        slack_send: false
       },
       constraints: {
         max_runtime_minutes: 20,
@@ -288,7 +294,9 @@ export const AGENT_PROFILE_DEFINITIONS: Record<AgentProfile, AgentProfileDefinit
         install_packages: false,
         network_access: true,
         db_read: true,
-        db_write: false
+        db_write: false,
+        email_send: false,
+        slack_send: false
       },
       constraints: {
         max_runtime_minutes: 18,
@@ -314,7 +322,9 @@ export const AGENT_PROFILE_DEFINITIONS: Record<AgentProfile, AgentProfileDefinit
           install_packages: false,
           network_access: true,
           db_read: true,
-          db_write: false
+          db_write: false,
+          email_send: false,
+          slack_send: false
         },
         constraints: {
           max_runtime_minutes: 20,
@@ -341,7 +351,9 @@ export const AGENT_PROFILE_DEFINITIONS: Record<AgentProfile, AgentProfileDefinit
         install_packages: false,
         network_access: true,
         db_read: true,
-        db_write: false
+        db_write: false,
+        email_send: false,
+        slack_send: false
       },
       constraints: {
         max_runtime_minutes: 18,
@@ -369,7 +381,9 @@ export const AGENT_PROFILE_DEFINITIONS: Record<AgentProfile, AgentProfileDefinit
         install_packages: false,
         network_access: true,
         db_read: true,
-        db_write: false
+        db_write: false,
+        email_send: false,
+        slack_send: false
       },
       constraints: {
         max_runtime_minutes: 18,
@@ -399,7 +413,9 @@ export const AGENT_PROFILE_DEFINITIONS: Record<AgentProfile, AgentProfileDefinit
         install_packages: false,
         network_access: true,
         db_read: true,
-        db_write: false
+        db_write: false,
+        email_send: false,
+        slack_send: false
       },
       constraints: {
         max_runtime_minutes: 22,
@@ -429,7 +445,9 @@ export const AGENT_PROFILE_DEFINITIONS: Record<AgentProfile, AgentProfileDefinit
         install_packages: false,
         network_access: true,
         db_read: true,
-        db_write: false
+        db_write: false,
+        email_send: false,
+        slack_send: false
       },
       constraints: {
         max_runtime_minutes: 15,
