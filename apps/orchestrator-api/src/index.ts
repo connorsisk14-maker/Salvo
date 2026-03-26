@@ -1474,36 +1474,35 @@ export async function buildServer() {
   );
 
   app.get("/leads", async () => {
+    const leadMetrics = await repo.listLeadFunnelMetrics();
     const leadRuns = await repo.listLeadRunSummaries(12);
-    const scraperRuns = leadRuns.filter((run) => run.agent_profile === "lead_scraper");
-    const strategistRuns = leadRuns.filter((run) => run.agent_profile === "lead_strategist");
-    const completedScraperRuns = scraperRuns.filter((run) => run.status === "completed").length;
-    const completedStrategistRuns = strategistRuns.filter((run) => run.status === "completed").length;
-    const progressionCount = leadRuns.filter((run) =>
-      ["provisioning", "starting", "running", "evaluating"].includes(run.status)
-    ).length;
     const sheetId = SALVO_LEAD_PIPELINE_SHEET_ID.trim();
     const sheetUrl = sheetId ? `https://docs.google.com/spreadsheets/d/${sheetId}` : null;
-    const now = Date.now();
 
     const funnel = [
       {
-        id: "raw",
-        label: "Raw leads ingested",
-        count: scraperRuns.length * 8 + completedScraperRuns,
-        detail: `${scraperRuns.length} scraper runs visible`
+        id: "scraped",
+        label: "Scraped leads",
+        count: leadMetrics.scraped_count,
+        detail: "Real lead rows captured in salvo_leads."
       },
       {
-        id: "enriched",
-        label: "Enriched leads ready",
-        count: strategistRuns.length * 5 + completedStrategistRuns,
-        detail: `${strategistRuns.length} strategist runs captured`
+        id: "qualified",
+        label: "Qualified leads",
+        count: leadMetrics.qualified_count,
+        detail: "Rows promoted into strategist follow-up."
       },
       {
-        id: "in_progress",
-        label: "Strategist queue",
-        count: progressionCount,
-        detail: `${progressionCount} runs progressing`
+        id: "contacted",
+        label: "Contacted leads",
+        count: leadMetrics.contacted_count,
+        detail: "Rows with outreach logged."
+      },
+      {
+        id: "converted",
+        label: "Converted leads",
+        count: leadMetrics.converted_count,
+        detail: "Rows that reached conversion."
       }
     ];
 
@@ -1521,7 +1520,7 @@ export async function buildServer() {
         progress,
         status,
         scrapes_this_week: scrapesThisWeek,
-        last_updated_at: new Date(now - zone.priority * 60 * 60 * 1000).toISOString()
+        last_updated_at: new Date(Date.now() - zone.priority * 60 * 60 * 1000).toISOString()
       };
     });
 
@@ -1561,7 +1560,7 @@ export async function buildServer() {
 
     return {
       sheet_url: sheetUrl,
-      updated_at: new Date().toISOString(),
+      updated_at: leadMetrics.updated_at,
       funnel,
       zones,
       runs

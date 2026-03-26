@@ -163,6 +163,30 @@ export type DbLeadRunChain = {
   created_at: string;
 };
 
+export type DbLeadRecord = {
+  id: string;
+  workspace_id: string;
+  lead_key: string;
+  row_context: Record<string, unknown>;
+  source_scraper_run_id: string | null;
+  source_strategist_task_id: string | null;
+  source_strategist_run_id: string | null;
+  scraped_at: string;
+  qualified_at: string | null;
+  contacted_at: string | null;
+  converted_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type DbLeadFunnelMetrics = {
+  scraped_count: number;
+  qualified_count: number;
+  contacted_count: number;
+  converted_count: number;
+  updated_at: string;
+};
+
 export type DbRunEvent = {
   id: number;
   run_id: string;

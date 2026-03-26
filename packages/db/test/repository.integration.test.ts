@@ -34,7 +34,8 @@ if (!databaseUrl) {
         public.salvo_research_findings,
         public.salvo_research_experiments,
         public.salvo_research_ingestions,
-        public.salvo_research_documents,
+      public.salvo_research_documents,
+      public.salvo_leads,
       public.salvo_evaluations,
       public.salvo_artifacts,
       public.salvo_run_events,
@@ -751,6 +752,38 @@ if (!databaseUrl) {
       referenceContext.map((entry) => entry.id),
       promptContext.map((entry) => entry.id)
     );
+  });
+
+  test("lead funnel metrics count actual stage timestamps", async () => {
+    const workspace = await repo.ensureWorkspace(`lead-metrics-${randomUUID()}`, process.cwd());
+    await repo.upsertLeadRecord({
+      workspaceId: workspace.id,
+      leadKey: "lead-one",
+      rowContext: {
+        company: "Northwind",
+        contact: "Casey"
+      },
+      scrapedAt: new Date(),
+      qualifiedAt: new Date()
+    });
+    await repo.upsertLeadRecord({
+      workspaceId: workspace.id,
+      leadKey: "lead-two",
+      rowContext: {
+        company: "Contoso",
+        contact: "Jordan"
+      },
+      scrapedAt: new Date(),
+      qualifiedAt: new Date(),
+      contactedAt: new Date(),
+      convertedAt: new Date()
+    });
+
+    const metrics = await repo.listLeadFunnelMetrics(workspace.id);
+    assert.equal(metrics.scraped_count, 2);
+    assert.equal(metrics.qualified_count, 2);
+    assert.equal(metrics.contacted_count, 1);
+    assert.equal(metrics.converted_count, 1);
   });
 
   test("accepted experiment publishing creates linked memory and exposes it in contract memory context", async () => {

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { readFile, stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -1188,7 +1188,7 @@ export class OrchestratorDaemon {
     }
 
     if (detail.run.agent_profile === "lead_strategist") {
-      await this.linkLeadStrategistRun(detail.task.id, runId);
+      await this.linkLeadStrategistRun(detail, runId, finalPayload);
     }
   }
 
@@ -1219,6 +1219,14 @@ export class OrchestratorDaemon {
       strategistTaskId: strategistTask.id,
       rowContext
     });
+    await this.recordLeadProgress({
+      workspaceId: detail.task.workspace_id,
+      rowContext,
+      scraperRunId: detail.run.id,
+      strategistTaskId: strategistTask.id,
+      scrapedAt: detail.run.ended_at ? new Date(detail.run.ended_at) : new Date(),
+      qualifiedAt: new Date()
+    });
     const rowSummaryLabel = this.formatLeadRowContextSummary(rowContext);
     logger.info("lead strategist follow-up created", {
       scraper_run_id: detail.run.id,
@@ -1227,17 +1235,147 @@ export class OrchestratorDaemon {
     });
   }
 
-  private async linkLeadStrategistRun(taskId: string, runId: string): Promise<void> {
-    const chain = await this.repo.findLeadRunChainByStrategistTask(taskId);
+  private async linkLeadStrategistRun(
+    detail: Awaited<ReturnType<SalvoRepository["getRunDetail"]>>,
+    runId: string,
+    finalPayload: Record<string, unknown> | null
+  ): Promise<void> {
+    const runDetail = detail;
+    if (!runDetail) {
+      return;
+    }
+
+    const chain = await this.repo.findLeadRunChainByStrategistTask(runDetail.task.id);
     if (!chain || chain.strategist_run_id) {
       return;
     }
     await this.repo.linkLeadRunChainStrategistRun(chain.id, runId);
+    await this.recordLeadProgress({
+      workspaceId: runDetail.task.workspace_id,
+      rowContext: chain.row_context,
+      scraperRunId: chain.scraper_run_id,
+      strategistTaskId: chain.strategist_task_id,
+      strategistRunId: runId,
+      qualifiedAt: new Date(),
+      ...this.extractLeadStageProgress(finalPayload)
+    });
     logger.info("lead strategist run linked to chain", {
-      strategist_task_id: taskId,
+      strategist_task_id: runDetail.task.id,
       strategist_run_id: runId,
       chain_id: chain.id
     });
+  }
+
+  private async recordLeadProgress(input: {
+    workspaceId: string;
+    rowContext: Record<string, unknown> | null;
+    scraperRunId?: string;
+    strategistTaskId?: string;
+    strategistRunId?: string;
+    scrapedAt?: Date;
+    qualifiedAt?: Date;
+    contactedAt?: Date;
+    convertedAt?: Date;
+  }): Promise<void> {
+    const leadKey = this.buildLeadKey(
+      input.rowContext,
+      input.scraperRunId ?? input.strategistTaskId ?? input.strategistRunId ?? input.workspaceId
+    );
+    await this.repo.upsertLeadRecord({
+      workspaceId: input.workspaceId,
+      leadKey,
+      rowContext: input.rowContext,
+      scraperRunId: input.scraperRunId,
+      strategistTaskId: input.strategistTaskId,
+      strategistRunId: input.strategistRunId,
+      scrapedAt: input.scrapedAt,
+      qualifiedAt: input.qualifiedAt,
+      contactedAt: input.contactedAt,
+      convertedAt: input.convertedAt
+    });
+  }
+
+  private extractLeadStageProgress(finalPayload: Record<string, unknown> | null): {
+    contactedAt?: Date;
+    convertedAt?: Date;
+  } {
+    if (!finalPayload) {
+      return {};
+    }
+
+    const result: { contactedAt?: Date; convertedAt?: Date } = {};
+    const contactedAt = this.readLeadStageDate(finalPayload, "contacted_at", "contactedAt");
+    const convertedAt = this.readLeadStageDate(finalPayload, "converted_at", "convertedAt");
+    const stage = this.readLeadStageString(finalPayload, "stage", "status", "lead_stage");
+
+    if (contactedAt) {
+      result.contactedAt = contactedAt;
+    }
+    if (convertedAt) {
+      result.convertedAt = convertedAt;
+    }
+
+    if (stage === "contacted" && !result.contactedAt) {
+      result.contactedAt = new Date();
+    } else if (stage === "converted") {
+      result.contactedAt ??= new Date();
+      result.convertedAt = result.convertedAt ?? new Date();
+    }
+
+    return result;
+  }
+
+  private readLeadStageString(
+    payload: Record<string, unknown>,
+    ...keys: string[]
+  ): string | undefined {
+    for (const key of keys) {
+      const value = payload[key];
+      if (typeof value === "string" && value.trim().length > 0) {
+        return value.trim().toLowerCase();
+      }
+    }
+    return undefined;
+  }
+
+  private readLeadStageDate(
+    payload: Record<string, unknown>,
+    ...keys: string[]
+  ): Date | undefined {
+    for (const key of keys) {
+      const value = payload[key];
+      if (typeof value === "string" && value.trim().length > 0) {
+        const parsed = new Date(value);
+        if (!Number.isNaN(parsed.getTime())) {
+          return parsed;
+        }
+      }
+    }
+    return undefined;
+  }
+
+  private buildLeadKey(rowContext: Record<string, unknown> | null, fallbackSeed: string): string {
+    const stable = this.stableStringify(rowContext ?? { fallbackSeed });
+    return createHash("sha256").update(stable).digest("hex");
+  }
+
+  private stableStringify(value: unknown): string {
+    const canonicalize = (input: unknown): unknown => {
+      if (Array.isArray(input)) {
+        return input.map((entry) => canonicalize(entry));
+      }
+      if (this.isPlainRecord(input)) {
+        return Object.keys(input)
+          .sort()
+          .reduce<Record<string, unknown>>((acc, key) => {
+            acc[key] = canonicalize(input[key]);
+            return acc;
+          }, {});
+      }
+      return input;
+    };
+
+    return JSON.stringify(canonicalize(value));
   }
 
   private buildLeadStrategistRequest(

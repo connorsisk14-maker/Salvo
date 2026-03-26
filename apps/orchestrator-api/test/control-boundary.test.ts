@@ -37,6 +37,7 @@ if (!databaseUrl) {
         public.salvo_research_ingestions,
         public.salvo_research_documents,
         public.salvo_evaluations,
+        public.salvo_leads,
         public.salvo_artifacts,
         public.salvo_run_events,
         public.salvo_runs,
@@ -866,6 +867,43 @@ if (!databaseUrl) {
     });
     assert.equal(content.statusCode, 200);
     assert.ok(content.body.includes("# proof"));
+  });
+
+  test("lead funnel endpoint counts actual lead stage records", async () => {
+    const workspace = await repo.ensureWorkspace(`leads-${randomUUID()}`, process.cwd());
+    await repo.upsertLeadRecord({
+      workspaceId: workspace.id,
+      leadKey: "lead-one",
+      rowContext: {
+        company: "Acme HVAC",
+        contact: "Avery"
+      },
+      scrapedAt: new Date(),
+      qualifiedAt: new Date()
+    });
+    await repo.upsertLeadRecord({
+      workspaceId: workspace.id,
+      leadKey: "lead-two",
+      rowContext: {
+        company: "North Dallas Services",
+        contact: "Blair"
+      },
+      scrapedAt: new Date(),
+      qualifiedAt: new Date(),
+      contactedAt: new Date(),
+      convertedAt: new Date()
+    });
+
+    const leads = await app.inject({
+      method: "GET",
+      url: "/leads"
+    });
+    assert.equal(leads.statusCode, 200);
+    const funnel = leads.json().funnel as Array<{ id: string; count: number }>;
+    assert.equal(funnel.find((entry) => entry.id === "scraped")?.count, 2);
+    assert.equal(funnel.find((entry) => entry.id === "qualified")?.count, 2);
+    assert.equal(funnel.find((entry) => entry.id === "contacted")?.count, 1);
+    assert.equal(funnel.find((entry) => entry.id === "converted")?.count, 1);
   });
 
   test("integrations endpoint exposes Google Sheets entry", async () => {

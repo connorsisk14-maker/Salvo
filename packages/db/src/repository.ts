@@ -39,6 +39,8 @@ import type {
   DbAgentTrustTier,
   DbBudgetLimit,
   DbBudgetStatus,
+  DbLeadFunnelMetrics,
+  DbLeadRecord,
   DbSkillSetting,
   DbSkillUsage,
   DbContractMemoryContext,
@@ -542,6 +544,90 @@ export class SalvoRepository {
       [input.scraperRunId, input.strategistTaskId, input.rowContext ?? null]
     );
     return this.singleOrThrow(result.rows, "Failed to create lead run chain.");
+  }
+
+  async upsertLeadRecord(input: {
+    workspaceId: string;
+    leadKey: string;
+    rowContext?: Record<string, unknown> | null;
+    scraperRunId?: string | null;
+    strategistTaskId?: string | null;
+    strategistRunId?: string | null;
+    scrapedAt?: Date | null;
+    qualifiedAt?: Date | null;
+    contactedAt?: Date | null;
+    convertedAt?: Date | null;
+  }): Promise<DbLeadRecord> {
+    const result = await this.pool.query<DbLeadRecord>(
+      `insert into public.salvo_leads (
+         workspace_id,
+         lead_key,
+         row_context,
+         source_scraper_run_id,
+         source_strategist_task_id,
+         source_strategist_run_id,
+         scraped_at,
+         qualified_at,
+         contacted_at,
+         converted_at
+       )
+       values ($1, $2, $3, $4, $5, $6, coalesce($7, now()), $8, $9, $10)
+       on conflict (workspace_id, lead_key)
+       do update
+         set row_context = coalesce(excluded.row_context, row_context),
+             source_scraper_run_id = coalesce(excluded.source_scraper_run_id, source_scraper_run_id),
+             source_strategist_task_id = coalesce(excluded.source_strategist_task_id, source_strategist_task_id),
+             source_strategist_run_id = coalesce(excluded.source_strategist_run_id, source_strategist_run_id),
+             scraped_at = coalesce(excluded.scraped_at, scraped_at),
+             qualified_at = coalesce(excluded.qualified_at, qualified_at),
+             contacted_at = coalesce(excluded.contacted_at, contacted_at),
+             converted_at = coalesce(excluded.converted_at, converted_at),
+             updated_at = now()
+       returning *`,
+      [
+        input.workspaceId,
+        input.leadKey,
+        JSON.stringify(input.rowContext ?? {}),
+        input.scraperRunId ?? null,
+        input.strategistTaskId ?? null,
+        input.strategistRunId ?? null,
+        input.scrapedAt?.toISOString() ?? null,
+        input.qualifiedAt?.toISOString() ?? null,
+        input.contactedAt?.toISOString() ?? null,
+        input.convertedAt?.toISOString() ?? null
+      ]
+    );
+
+    return this.singleOrThrow(result.rows, "Failed to upsert lead record.");
+  }
+
+  async listLeadFunnelMetrics(workspaceId?: string): Promise<DbLeadFunnelMetrics> {
+    const result = await this.pool.query<{
+      scraped_count: string;
+      qualified_count: string;
+      contacted_count: string;
+      converted_count: string;
+      updated_at: string | null;
+    }>(
+      `select
+         count(*) filter (where scraped_at is not null)::integer as scraped_count,
+         count(*) filter (where qualified_at is not null)::integer as qualified_count,
+         count(*) filter (where contacted_at is not null)::integer as contacted_count,
+         count(*) filter (where converted_at is not null)::integer as converted_count,
+         coalesce(max(updated_at), now()) as updated_at
+       from public.salvo_leads
+       where ($1::uuid is null or workspace_id = $1)`,
+      [workspaceId ?? null]
+    );
+
+    const row = result.rows[0];
+    return {
+      scraped_count: Number(row?.scraped_count ?? 0),
+      qualified_count: Number(row?.qualified_count ?? 0),
+      contacted_count: Number(row?.contacted_count ?? 0),
+      converted_count: Number(row?.converted_count ?? 0),
+      updated_at: row?.updated_at ?? new Date().toISOString()
+    };
   }
 
   async findLeadRunChainByScraperRun(scraperRunId: string): Promise<DbLeadRunChain | null> {
