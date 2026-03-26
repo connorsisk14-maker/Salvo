@@ -243,6 +243,7 @@ export function BoardPage() {
 
   const [tasks, setTasks] = useState<ApiTask[]>([]);
   const [runs, setRuns] = useState<ApiRun[]>([]);
+  const [hasLoaded, setHasLoaded] = useState(false);
   const [queueFilter, setQueueFilter] = useState<QueueFilter>("all");
   const [categoryFilter, setCategoryFilter] = useState("all");
   const [error, setError] = useState<string | null>(null);
@@ -313,6 +314,7 @@ export function BoardPage() {
       const [nextTasks, nextRuns] = await Promise.all([listTasks(), listRuns()]);
       setTasks(nextTasks);
       setRuns(nextRuns);
+      setHasLoaded(true);
       setError(null);
     } catch (refreshError) {
       setError((refreshError as Error).message);
@@ -739,8 +741,14 @@ export function BoardPage() {
             </label>
           </div>
 
-          {visibleItems.length === 0 ? (
-            <p className="muted">No tasks match this filter.</p>
+          {!hasLoaded && tasks.length === 0 ? (
+            <>
+              <div className="skeleton skeleton-card" style={{ width: "100%" }} />
+              <div className="skeleton skeleton-card" style={{ width: "100%" }} />
+              <div className="skeleton skeleton-card" style={{ width: "100%" }} />
+            </>
+          ) : hasLoaded && visibleItems.length === 0 ? (
+            <div className="empty-state">No tasks yet — use Orchestrator Chat to create one.</div>
           ) : (
             <ul className="board-queue-list">
               {visibleItems.map((item) => {

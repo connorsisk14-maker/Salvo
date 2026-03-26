@@ -289,11 +289,13 @@ export class OrchestratorDaemon {
 
   private async publishHeartbeat(extra?: Record<string, unknown>): Promise<void> {
     const queueDepth = await this.readQueueDepth();
+    const pendingTaskCount = await this.repo.countQueuedTasks();
     await this.repo.upsertDaemonHeartbeat("orchestrator", workerId, {
       active_runs: this.activeRuns.size,
       max_concurrent_runs: this.maxConcurrentRunners,
       available_runner_slots: Math.max(this.maxConcurrentRunners - this.activeRuns.size, 0),
       queue_depth: queueDepth,
+      pending_tasks: pendingTaskCount,
       ...extra
     });
   }
@@ -667,6 +669,24 @@ export class OrchestratorDaemon {
       });
 
       if (retry.disposition === "scheduled" && retry.retryRun) {
+        if (this.activeRuns.size >= this.maxConcurrentRunners) {
+          logger.warn("retry run deferred: runner pool at capacity", { runId: retry.retryRun.id });
+          continue;
+        }
+
+        // Copy checkpoint from stale run to retry run so agent-loop can resume
+        const checkpointCopied = await this.repo.copyRunCheckpoint(
+          staleRun.id,
+          retry.retryRun.id,
+          agentLoopCheckpointKey
+        );
+        if (checkpointCopied) {
+          logger.info("checkpoint transferred to retry run", {
+            fromRunId: staleRun.id,
+            toRunId: retry.retryRun.id,
+          });
+        }
+
         await this.repo.appendRunEvent(retry.retryRun.id, "run.started", "info", {
           reason: "retry_from_stale_run",
           source_run_id: staleRun.id

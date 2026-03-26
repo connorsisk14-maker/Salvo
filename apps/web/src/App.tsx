@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useRef, useState } from "react";
+import { FormEvent, createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { NavLink, Navigate, Route, Routes, useNavigate } from "react-router-dom";
 import { clearStoredApiToken, getStoredApiToken, setStoredApiToken, subscribeToApiToken } from "./api/auth";
 import { approveTaskChat, sendTaskChat, type ApiProposedContract, type ApiTaskChatApproveResponse } from "./api/control-plane";
@@ -11,6 +11,7 @@ import { IntegrationsPage } from "./pages/IntegrationsPage";
 import { SkillsPage } from "./pages/SkillsPage";
 import { AnalyticsPage } from "./pages/AnalyticsPage";
 import { ContractReviewPage } from "./pages/ContractReviewPage";
+import { MemoriesPage } from "./pages/MemoriesPage";
 
 const chatSessionStorageKey = "salvo.dashboard.chat.session.v1";
 
@@ -170,6 +171,10 @@ function extractApprovedTaskId(response: ApiTaskChatApproveResponse): string | n
   return null;
 }
 
+type Toast = { id: string; message: string; type: "error" | "info" };
+const ToastContext = createContext<(msg: string, type?: "error" | "info") => void>(() => {});
+export const useToast = () => useContext(ToastContext);
+
 export function AppShell() {
   const navigate = useNavigate();
   const [apiToken, setApiToken] = useState(() => getStoredApiToken());
@@ -188,6 +193,27 @@ export function AppShell() {
   const [proposalEditorOpenByMessageId, setProposalEditorOpenByMessageId] = useState<Record<string, boolean>>({});
   const [editedProposalByMessageId, setEditedProposalByMessageId] = useState<Record<string, boolean>>({});
   const chatTranscriptRef = useRef<HTMLDivElement | null>(null);
+
+  const [theme, setTheme] = useState<"light" | "dark" | "auto">(() => {
+    return (localStorage.getItem("salvo-theme") as "light" | "dark" | "auto") ?? "auto";
+  });
+
+  const [toasts, setToasts] = useState<Toast[]>([]);
+  const addToast = useCallback((message: string, type: "error" | "info" = "info") => {
+    const id = Math.random().toString(36).slice(2);
+    setToasts(prev => [...prev, { id, message, type }]);
+    setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 5000);
+  }, []);
+
+  const [navOpen, setNavOpen] = useState(false);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    if (theme === "dark") root.setAttribute("data-theme", "dark");
+    else if (theme === "light") root.setAttribute("data-theme", "light");
+    else root.removeAttribute("data-theme");
+    localStorage.setItem("salvo-theme", theme);
+  }, [theme]);
 
   useEffect(() => {
     return subscribeToApiToken(() => {
@@ -399,71 +425,90 @@ export function AppShell() {
     }
   }
 
+  const themeLabel = theme === "dark" ? "☀️" : theme === "light" ? "🌙" : "◐";
+
   return (
+    <ToastContext.Provider value={addToast}>
     <div className="app-frame">
       <main className="main-panel">
-        <nav className="top-nav">
-          <NavLink
-            to="/"
-            end
-            className={({ isActive }) => `top-nav-link ${isActive ? "top-nav-link-active" : ""}`}
-          >
-            Control Center
-          </NavLink>
-          <NavLink
-            to="/board"
-            className={({ isActive }) => `top-nav-link ${isActive ? "top-nav-link-active" : ""}`}
-          >
-            Tasks & Runs Board
-          </NavLink>
-          <NavLink
-            to="/research"
-            className={({ isActive }) => `top-nav-link ${isActive ? "top-nav-link-active" : ""}`}
-          >
-            Research Review
-          </NavLink>
-          <NavLink
-            to="/contracts"
-            className={({ isActive }) => `top-nav-link ${isActive ? "top-nav-link-active" : ""}`}
-          >
-            Contract Review
-          </NavLink>
-          <NavLink
-            to="/leads"
-            className={({ isActive }) => `top-nav-link ${isActive ? "top-nav-link-active" : ""}`}
-          >
-            Leads
-          </NavLink>
-          <NavLink
-            to="/skills"
-            className={({ isActive }) => `top-nav-link ${isActive ? "top-nav-link-active" : ""}`}
-          >
-            Skills
-          </NavLink>
-          <NavLink
-            to="/integrations"
-            className={({ isActive }) => `top-nav-link ${isActive ? "top-nav-link-active" : ""}`}
-          >
-            Integrations
-          </NavLink>
-          <NavLink
-            to="/analytics"
-            className={({ isActive }) => `top-nav-link ${isActive ? "top-nav-link-active" : ""}`}
-          >
-            Analytics
-          </NavLink>
+        <nav className="top-nav" style={{ position: "relative" }}>
           <button
+            className="nav-hamburger"
             type="button"
-            className="top-nav-chat"
-            disabled={!tokenConfigured}
-            title="Open orchestrator chat (Ctrl/Cmd + K)"
-            onClick={() => {
-              setChatError(null);
-              setChatModalOpen(true);
-            }}
+            onClick={() => setNavOpen(o => !o)}
+            aria-label="Toggle navigation"
           >
-            Orchestrator Chat
+            ☰
           </button>
+          <div className={`top-nav-links${navOpen ? " open" : ""}`}>
+            <NavLink
+              to="/"
+              end
+              className={({ isActive }) => `top-nav-link ${isActive ? "top-nav-link-active" : ""}`}
+            >
+              Control Center
+            </NavLink>
+            <NavLink
+              to="/board"
+              className={({ isActive }) => `top-nav-link ${isActive ? "top-nav-link-active" : ""}`}
+            >
+              Tasks & Runs Board
+            </NavLink>
+            <NavLink
+              to="/research"
+              className={({ isActive }) => `top-nav-link ${isActive ? "top-nav-link-active" : ""}`}
+            >
+              Research Review
+            </NavLink>
+            <NavLink
+              to="/memories"
+              className={({ isActive }) => `top-nav-link ${isActive ? "top-nav-link-active" : ""}`}
+            >
+              Memory
+            </NavLink>
+            <NavLink
+              to="/contracts"
+              className={({ isActive }) => `top-nav-link ${isActive ? "top-nav-link-active" : ""}`}
+            >
+              Contract Review
+            </NavLink>
+            <NavLink
+              to="/leads"
+              className={({ isActive }) => `top-nav-link ${isActive ? "top-nav-link-active" : ""}`}
+            >
+              Leads
+            </NavLink>
+            <NavLink
+              to="/skills"
+              className={({ isActive }) => `top-nav-link ${isActive ? "top-nav-link-active" : ""}`}
+            >
+              Skills
+            </NavLink>
+            <NavLink
+              to="/integrations"
+              className={({ isActive }) => `top-nav-link ${isActive ? "top-nav-link-active" : ""}`}
+            >
+              Integrations
+            </NavLink>
+            <NavLink
+              to="/analytics"
+              className={({ isActive }) => `top-nav-link ${isActive ? "top-nav-link-active" : ""}`}
+            >
+              Analytics
+            </NavLink>
+            <button
+              type="button"
+              className="top-nav-chat"
+              disabled={!tokenConfigured}
+              title="Open orchestrator chat (Ctrl/Cmd + K)"
+              onClick={() => {
+                setChatError(null);
+                setChatModalOpen(true);
+              }}
+            >
+              Orchestrator Chat
+            </button>
+          </div>
           <button
             type="button"
             className="top-nav-token"
@@ -474,6 +519,14 @@ export function AppShell() {
           >
             API Token
           </button>
+          <button
+            type="button"
+            className="top-nav-token"
+            title="Toggle color theme"
+            onClick={() => setTheme(t => t === "auto" ? "dark" : t === "dark" ? "light" : "auto")}
+          >
+            {themeLabel}
+          </button>
         </nav>
 
         {tokenConfigured ? (
@@ -481,6 +534,7 @@ export function AppShell() {
             <Route path="/" element={<ControlCenterPage />} />
             <Route path="/board" element={<BoardPage />} />
             <Route path="/research" element={<ResearchReviewPage />} />
+            <Route path="/memories" element={<MemoriesPage />} />
             <Route path="/contracts" element={<ContractReviewPage />} />
             <Route path="/leads" element={<LeadsPage />} />
             <Route path="/skills" element={<SkillsPage />} />
@@ -744,6 +798,13 @@ export function AppShell() {
           </section>
         </div>
       ) : null}
+
+      <div className="toast-container">
+        {toasts.map(t => (
+          <div key={t.id} className={`toast toast-${t.type}`}>{t.message}</div>
+        ))}
+      </div>
     </div>
+    </ToastContext.Provider>
   );
 }

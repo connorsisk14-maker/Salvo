@@ -937,6 +937,7 @@ async function createTaskChatProposal(input: {
   workspacePath: string;
   request: string;
   integrationConfigs: Array<{ integration_key: string; config_json: Record<string, unknown> }>;
+  chatHistory?: Array<{ role: "user" | "assistant"; content: string }>;
 }): Promise<TaskChatProposal> {
   const baseProposal = buildTaskChatProposal(input.workspaceId, input.request);
   const baseContract = validateContractV1(baseProposal.contract_json);
@@ -976,6 +977,52 @@ async function createTaskChatProposal(input: {
   }
 
   try {
+    const contextPayload = JSON.stringify(
+      {
+        request: enrichedProposal.request,
+        title: enrichedProposal.title,
+        workspace: {
+          id: input.workspaceId,
+          local_path: input.workspacePath,
+          relevant_files: relevantFiles
+        },
+        recent_runs: recentRuns,
+        memory_excerpts: memories.map((memory) => ({
+          id: memory.id,
+          title: memory.title,
+          summary: memory.summary,
+          body_markdown: memory.body_markdown.slice(0, taskChatMemoryBodyChars),
+          confidence: memory.confidence,
+          source_run_ids: memory.source_run_ids
+        })),
+        research_context: researchContext.map((entry) => ({
+          id: entry.id,
+          confidence: entry.confidence,
+          source_run_ids: entry.source_run_ids
+        })),
+        base_contract: enrichedContract
+      },
+      null,
+      2
+    );
+
+    const priorHistory = input.chatHistory ?? [];
+    const llmMessages: Array<{ role: "user" | "assistant"; content: string }> =
+      priorHistory.length > 0
+        ? [
+            ...priorHistory,
+            {
+              role: "user",
+              content: contextPayload
+            }
+          ]
+        : [
+            {
+              role: "user",
+              content: contextPayload
+            }
+          ];
+
     const response = await new LlmClient(llmConfig).createMessage(
       [
         "You are SALVO task-chat planner.",
@@ -983,39 +1030,7 @@ async function createTaskChatProposal(input: {
         "Preserve the provided contract_id, task_id, workspace_id, created_at, family_key, and agent_profile.",
         "Use the provided workspace, recent run, and memory context to populate contract.context."
       ].join("\n"),
-      [
-        {
-          role: "user",
-          content: JSON.stringify(
-            {
-              request: enrichedProposal.request,
-              title: enrichedProposal.title,
-              workspace: {
-                id: input.workspaceId,
-                local_path: input.workspacePath,
-                relevant_files: relevantFiles
-              },
-              recent_runs: recentRuns,
-              memory_excerpts: memories.map((memory) => ({
-                id: memory.id,
-                title: memory.title,
-                summary: memory.summary,
-                body_markdown: memory.body_markdown.slice(0, taskChatMemoryBodyChars),
-                confidence: memory.confidence,
-                source_run_ids: memory.source_run_ids
-              })),
-              research_context: researchContext.map((entry) => ({
-                id: entry.id,
-                confidence: entry.confidence,
-                source_run_ids: entry.source_run_ids
-              })),
-              base_contract: enrichedContract
-            },
-            null,
-            2
-          )
-        }
-      ]
+      llmMessages
     );
     const rawText = response.content
       .filter((block) => block.type === "text")
@@ -2103,6 +2118,7 @@ export async function buildServer() {
 
     const userMessage = body.message.trim();
     let targetWorkspaceId = workspaceId;
+    let priorMessages: Array<{ role: "user" | "assistant"; content: string }> = [];
     let priorUserMessages: string[] = [];
     if (sessionId) {
       const existingSession = await repo.getTaskChatSession(sessionId);
@@ -2112,8 +2128,12 @@ export async function buildServer() {
         });
       }
       targetWorkspaceId = existingSession.workspace_id;
-      const messages = await repo.listTaskChatMessages(sessionId);
-      priorUserMessages = messages
+      const dbMessages = await repo.listTaskChatMessages(sessionId);
+      priorMessages = dbMessages.map((m) => ({
+        role: m.role as "user" | "assistant",
+        content: m.message_text
+      }));
+      priorUserMessages = dbMessages
         .filter((message) => message.role === "user")
         .map((message) => message.message_text);
     }
@@ -2140,8 +2160,9 @@ export async function buildServer() {
         repo,
         workspaceId: targetWorkspaceId,
         workspacePath: targetWorkspace.local_path,
-        request: fullRequest,
-        integrationConfigs
+        request: userMessage,
+        integrationConfigs,
+        chatHistory: priorMessages
       });
       response = `I drafted a contract proposal for "${proposedContract.title}". Approve it to create the task and contract.`;
     }

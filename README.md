@@ -2,6 +2,33 @@
 
 Local-first agentic harness with a strict runtime contract, policy-enforced adapters, deterministic evaluation, and provenance-safe research synthesis.
 
+→ **[Quick Start Guide](QUICKSTART.md)** — get running in 3 minutes
+
+## Architecture
+
+```
+┌─────────────────────┐  HTTP   ┌─────────────────────────┐
+│   Web Dashboard     │ ──────► │  orchestrator-api :8787 │
+│   (Vite / React)    │         │  Fastify REST + SSE      │
+└─────────────────────┘         └────────────┬────────────┘
+                                             │ PostgreSQL
+┌─────────────────────┐         ┌────────────▼────────────┐
+│ orchestrator-daemon │ ◄────── │  salvo_db               │
+│ claim · plan · spawn│         │  PostgreSQL (local)      │
+└──────────┬──────────┘         └────────────▲────────────┘
+           │ spawn                            │
+           ▼                                 │
+┌─────────────────────┐                      │
+│    agent-runner     │ ── artifacts ────────┘
+│  bounded LLM loop   │
+└──────────┬──────────┘
+           │ policy-enforced adapters
+┌──────────▼──────────────────────────────────────┐
+│  Email (SMTP) · Slack API · HTTP · Google Sheets │
+│  Filesystem · Command · LLM API                  │
+└─────────────────────────────────────────────────┘
+```
+
 ## Components
 
 - `apps/web`: Vite dashboard (Control Center, Tasks & Runs Board, Research Review, Integrations, Run Detail)
@@ -13,7 +40,6 @@ Local-first agentic harness with a strict runtime contract, policy-enforced adap
 
 The DFW lead pipeline relies on `docs/LEAD_PIPELINE_TEMPLATE.md`, which describes the raw intake, enrichment, zone tracking, and run history tabs plus the seeded zone priorities and creation steps. After copying the template into your workspace, target the copy by setting `SALVO_LEAD_PIPELINE_SHEET_ID` with the new spreadsheet ID in your environment or orchestration layer. Update `packages/shared/src/lead-pipeline.ts` whenever the template layout or zone list changes so automation code and docs stay in sync.
 
-Dashboard polish currently emphasizes the light, high-contrast feel used across the Control Center; dark mode has been deferred until after the remaining panels are fully wired.
 - `apps/research-daemon`: analysis-only learning daemon (ingest, experiment, accepted-only publish)
 
 ## Packages
@@ -55,16 +81,14 @@ For local bootstrap, `.env.example` only documents optional overrides. The `ux:*
 
 ## Migrations
 
-Raw SQL migrations live in `supabase/migrations`.
+Raw SQL migrations live in `supabase/migrations/` and are applied automatically by `pnpm db:migrate`. There are currently 20 migrations — new ones are numbered sequentially and applied idempotently.
 
-- `0001_bootstrap.sql` bootstrap tables from initial setup
-- `0002_runtime_contract.sql` runtime contract tables/indexes, append-only event guard, terminal run immutability
-- `0003_daemon_heartbeats.sql` daemon heartbeat table for orchestrator/research health
-- `0004_run_cancellation.sql` deferred cancellation marker (`cancellation_requested_at`) for active run cancellation
-- `0005_integration_configs.sql` integration configuration storage
-- `0006_llm_api_integration_cutover.sql` `claude_local -> llm_api` migration with compatibility merge
-- `0007_research_analysis_pipeline.sql` research ingestion/experiment tables + contract-family memory scope
-- `0008_idempotency_recovery.sql` idempotency record storage + recovery support metadata
+Key migration groups:
+
+- `0001–0002`: bootstrap tables, runtime contracts, tasks, runs, evaluations
+- `0003–0008`: heartbeats, cancellation, integrations, LLM cutover, research pipeline, idempotency/recovery
+- `0009–0014`: budget caps, trust tiers, contract review chat, Google Sheets/email/Slack, skill settings, task dependencies, lead run chains
+- `0015–0020`: preferred agent profile, memory similarity search (pg_trgm), run checkpoints, task priority, lead funnel metrics, workspace tool policies
 
 ## UX Quick Start
 

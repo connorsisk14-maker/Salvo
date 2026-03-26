@@ -48,6 +48,7 @@ const MAX_EVENT_RUNS = 8;
 export function AnalyticsPage() {
   const [costData, setCostData] = useState<ApiCostAnalytics | null>(null);
   const [runs, setRuns] = useState<ApiRun[]>([]);
+  const [hasLoaded, setHasLoaded] = useState(false);
   const [fromDate, setFromDate] = useState(defaultFromIso);
   const [toDate, setToDate] = useState(todayIso);
   const [loading, setLoading] = useState(false);
@@ -64,6 +65,7 @@ export function AnalyticsPage() {
       .then(([payload, runList]) => {
         setCostData(payload);
         setRuns(runList);
+        setHasLoaded(true);
       })
       .catch((requestError) => {
         setError((requestError as Error).message);
@@ -327,8 +329,14 @@ export function AnalyticsPage() {
                 <h3>Daily Costs</h3>
               </header>
               <div className="analytics-chart">
-                {dayBars.length === 0 ? (
-                  <p className="muted">No data for this range.</p>
+                {!hasLoaded ? (
+                  <>
+                    <div className="skeleton skeleton-card" style={{ width: "100%" }} />
+                    <div className="skeleton skeleton-card" style={{ width: "100%" }} />
+                    <div className="skeleton skeleton-card" style={{ width: "100%" }} />
+                  </>
+                ) : dayBars.length === 0 ? (
+                  <div className="empty-state">No cost data for this period.</div>
                 ) : (
                   dayBars.map((row) => (
                     <div key={row.date} className="analytics-row">
@@ -345,36 +353,63 @@ export function AnalyticsPage() {
 
             <article className="analytics-card">
               <h3>Cost by Model</h3>
-              <ul className="analytics-list">
-                {(costData?.byModel ?? []).map((entry) => (
-                  <li key={entry.label}>
-                    <span>{entry.label}</span>
-                    <span>{formatCost(entry.costUsd)}</span>
-                  </li>
-                ))}
-              </ul>
+              {!hasLoaded ? (
+                <>
+                  <div className="skeleton skeleton-line" style={{ width: "100%" }} />
+                  <div className="skeleton skeleton-line" style={{ width: "100%" }} />
+                </>
+              ) : (costData?.byModel ?? []).length === 0 ? (
+                <div className="empty-state">No cost data for this period.</div>
+              ) : (
+                <ul className="analytics-list">
+                  {(costData?.byModel ?? []).map((entry) => (
+                    <li key={entry.label}>
+                      <span>{entry.label}</span>
+                      <span>{formatCost(entry.costUsd)}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
             </article>
             <article className="analytics-card">
               <h3>Cost by Agent Profile</h3>
-              <ul className="analytics-list">
-                {(costData?.byAgentProfile ?? []).map((entry) => (
-                  <li key={entry.label}>
-                    <span>{entry.label}</span>
-                    <span>{formatCost(entry.costUsd)}</span>
-                  </li>
-                ))}
-              </ul>
+              {!hasLoaded ? (
+                <>
+                  <div className="skeleton skeleton-line" style={{ width: "100%" }} />
+                  <div className="skeleton skeleton-line" style={{ width: "100%" }} />
+                </>
+              ) : (costData?.byAgentProfile ?? []).length === 0 ? (
+                <div className="empty-state">No cost data for this period.</div>
+              ) : (
+                <ul className="analytics-list">
+                  {(costData?.byAgentProfile ?? []).map((entry) => (
+                    <li key={entry.label}>
+                      <span>{entry.label}</span>
+                      <span>{formatCost(entry.costUsd)}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
             </article>
             <article className="analytics-card">
               <h3>Cost by Category</h3>
-              <ul className="analytics-list">
-                {(costData?.byCategory ?? []).map((entry) => (
-                  <li key={entry.label}>
-                    <span>{entry.label}</span>
-                    <span>{formatCost(entry.costUsd)}</span>
-                  </li>
-                ))}
-              </ul>
+              {!hasLoaded ? (
+                <>
+                  <div className="skeleton skeleton-line" style={{ width: "100%" }} />
+                  <div className="skeleton skeleton-line" style={{ width: "100%" }} />
+                </>
+              ) : (costData?.byCategory ?? []).length === 0 ? (
+                <div className="empty-state">No cost data for this period.</div>
+              ) : (
+                <ul className="analytics-list">
+                  {(costData?.byCategory ?? []).map((entry) => (
+                    <li key={entry.label}>
+                      <span>{entry.label}</span>
+                      <span>{formatCost(entry.costUsd)}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
             </article>
           </div>
         </>

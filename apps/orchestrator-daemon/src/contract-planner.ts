@@ -10,6 +10,10 @@ import {
 import { resolveLlmProviderAndModel, type AgentProfile } from "@salvo/shared";
 import { buildOrchestratorSoulPrompt } from "./soul";
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 const MAX_WORKSPACE_ENTRIES = 12;
 const MAX_MEMORY_BODY_CHARS = 600;
 const DEFAULT_CONTRACT_MODEL_BY_PROVIDER: Record<string, string> = {
@@ -214,32 +218,36 @@ export async function planContract(input: {
   const client = input.client ?? new LlmClient(input.llmConfig);
   const prompts = buildContractPlanningPrompts(input);
 
-  try {
-    const response = await client.createMessage(prompts.system, [
-      {
-        role: "user",
-        content: prompts.user
-      }
-    ]);
-    const rawText = response.content
-      .filter((block) => block.type === "text")
-      .map((block) => block.text)
-      .join("\n")
-      .trim();
+  const MAX_LLM_ATTEMPTS = 2;
+  let lastError: Error | undefined;
+  for (let attempt = 1; attempt <= MAX_LLM_ATTEMPTS; attempt++) {
+    try {
+      const response = await client.createMessage(prompts.system, [
+        {
+          role: "user",
+          content: prompts.user
+        }
+      ]);
+      const rawText = response.content
+        .filter((block) => block.type === "text")
+        .map((block) => block.text)
+        .join("\n")
+        .trim();
 
-    const contract = parseContractResponseText(rawText);
-    return {
-      contract,
-      source: "llm",
-      rawText
-    };
-  } catch (error) {
-    return {
-      contract: input.baseContract,
-      source: "fallback",
-      reason: (error as Error).message
-    };
+      const contract = parseContractResponseText(rawText);
+      return {
+        contract,
+        source: "llm",
+        rawText
+      };
+    } catch (err) {
+      lastError = err as Error;
+      if (attempt < MAX_LLM_ATTEMPTS) {
+        await sleep(800 * attempt);
+      }
+    }
   }
+  return { contract: input.baseContract, source: "fallback", reason: lastError?.message ?? "llm_retry_exhausted" };
 }
 
 export function buildHeuristicContract(input: {

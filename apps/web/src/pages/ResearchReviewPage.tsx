@@ -27,6 +27,7 @@ export function ResearchReviewPage() {
   const [docs, setDocs] = useState<ApiResearchDoc[]>([]);
   const [experiments, setExperiments] = useState<ApiResearchExperiment[]>([]);
   const [memories, setMemories] = useState<ApiMemory[]>([]);
+  const [hasLoaded, setHasLoaded] = useState(false);
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
@@ -41,6 +42,7 @@ export function ResearchReviewPage() {
       setDocs(nextDocs);
       setExperiments(nextExperiments);
       setMemories(nextMemories);
+      setHasLoaded(true);
       setError(null);
     } catch (refreshError) {
       setError((refreshError as Error).message);
@@ -229,10 +231,10 @@ export function ResearchReviewPage() {
                 </td>
               </tr>
             ))}
-            {filteredDocs.length === 0 ? (
+            {hasLoaded && filteredDocs.length === 0 ? (
               <tr>
-                <td colSpan={5} className="muted">
-                  No research documents match this filter.
+                <td colSpan={5}>
+                  <div className="empty-state">No research findings yet.</div>
                 </td>
               </tr>
             ) : null}
@@ -303,10 +305,10 @@ export function ResearchReviewPage() {
                 </td>
               </tr>
             ))}
-            {filteredExperiments.length === 0 ? (
+            {hasLoaded && filteredExperiments.length === 0 ? (
               <tr>
-                <td colSpan={6} className="muted">
-                  No research experiments match this filter.
+                <td colSpan={6}>
+                  <div className="empty-state">No research findings yet.</div>
                 </td>
               </tr>
             ) : null}
@@ -360,10 +362,10 @@ export function ResearchReviewPage() {
                 </td>
               </tr>
             ))}
-            {filteredMemories.length === 0 ? (
+            {hasLoaded && filteredMemories.length === 0 ? (
               <tr>
-                <td colSpan={5} className="muted">
-                  No memories match this filter.
+                <td colSpan={5}>
+                  <div className="empty-state">No research findings yet.</div>
                 </td>
               </tr>
             ) : null}

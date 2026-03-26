@@ -62,13 +62,23 @@ export type ApiRunEvent = {
   created_at: string;
 };
 
+export type ApiDaemonHealthMetadata = {
+  active_runs?: number;
+  max_concurrent_runs?: number;
+  available_runner_slots?: number;
+  queue_depth?: number | null;
+  pending_tasks?: number;
+  processing?: boolean;
+  [key: string]: unknown;
+};
+
 export type ApiDaemonHealth = {
   status: "healthy" | "stale" | "offline";
   daemon_id?: string;
   heartbeat_at?: string;
   age_seconds?: number;
   threshold_seconds: number;
-  metadata?: Record<string, unknown>;
+  metadata?: ApiDaemonHealthMetadata;
 };
 
 export type ApiRestartTarget = "orchestrator" | "research" | "all";

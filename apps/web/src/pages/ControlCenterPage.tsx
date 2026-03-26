@@ -164,6 +164,7 @@ export function ControlCenterPage() {
   const [requiresApproval, setRequiresApproval] = useState(false);
   const [tasks, setTasks] = useState<ApiTask[]>([]);
   const [runs, setRuns] = useState<ApiRun[]>([]);
+  const [hasLoaded, setHasLoaded] = useState(false);
   const [orchestratorHealth, setOrchestratorHealth] = useState<ApiDaemonHealth | null>(null);
   const [researchHealth, setResearchHealth] = useState<ApiDaemonHealth | null>(null);
   const [backupStatus, setBackupStatus] = useState<ApiBackupStatus | null>(null);
@@ -284,6 +285,7 @@ export function ControlCenterPage() {
         }
         return next;
       });
+      setHasLoaded(true);
       setError(null);
     } catch (refreshError) {
       setError((refreshError as Error).message);
@@ -483,21 +485,60 @@ export function ControlCenterPage() {
               </span>
             </div>
             <p className="muted">
-              Daemon: <span className="mono">{orchestratorHealth?.daemon_id ?? "-"}</span>
-            </p>
-            <p className="muted">Heartbeat: {renderHeartbeatDate(orchestratorHealth?.heartbeat_at)}</p>
-            <p className="muted">Age: {orchestratorHealth?.age_seconds ?? "-"}s</p>
-            <p className="muted">
-              Active runs: {(orchestratorHealth?.metadata?.active_runs as number | undefined) ?? "-"}
-            </p>
-            <p className="muted">
-              Capacity: {(orchestratorHealth?.metadata?.max_concurrent_runs as number | undefined) ?? "-"}
+              Daemon:{" "}
+              {!hasLoaded ? (
+                <span className="skeleton skeleton-line" style={{ display: "inline-block", width: "80px" }} />
+              ) : (
+                <span className="mono">{orchestratorHealth?.daemon_id ?? "-"}</span>
+              )}
             </p>
             <p className="muted">
-              Available slots: {(orchestratorHealth?.metadata?.available_runner_slots as number | undefined) ?? "-"}
+              Heartbeat:{" "}
+              {!hasLoaded ? (
+                <span className="skeleton skeleton-line" style={{ display: "inline-block", width: "80px" }} />
+              ) : (
+                renderHeartbeatDate(orchestratorHealth?.heartbeat_at)
+              )}
             </p>
             <p className="muted">
-              Queue depth: {(orchestratorHealth?.metadata?.queue_depth as number | undefined) ?? "-"}
+              Age:{" "}
+              {!hasLoaded ? (
+                <span className="skeleton skeleton-line" style={{ display: "inline-block", width: "80px" }} />
+              ) : (
+                <>{orchestratorHealth?.age_seconds ?? "-"}s</>
+              )}
+            </p>
+            <p className="muted">
+              Active runs:{" "}
+              {!hasLoaded ? (
+                <span className="skeleton skeleton-line" style={{ display: "inline-block", width: "80px" }} />
+              ) : (
+                orchestratorHealth?.metadata?.active_runs ?? "-"
+              )}
+            </p>
+            <p className="muted">
+              Capacity:{" "}
+              {!hasLoaded ? (
+                <span className="skeleton skeleton-line" style={{ display: "inline-block", width: "80px" }} />
+              ) : (
+                orchestratorHealth?.metadata?.max_concurrent_runs ?? "-"
+              )}
+            </p>
+            <p className="muted">
+              Available slots:{" "}
+              {!hasLoaded ? (
+                <span className="skeleton skeleton-line" style={{ display: "inline-block", width: "80px" }} />
+              ) : (
+                orchestratorHealth?.metadata?.available_runner_slots ?? "-"
+              )}
+            </p>
+            <p className="muted">
+              Queue depth:{" "}
+              {!hasLoaded ? (
+                <span className="skeleton skeleton-line" style={{ display: "inline-block", width: "80px" }} />
+              ) : (
+                orchestratorHealth?.metadata?.queue_depth ?? "-"
+              )}
             </p>
           </article>
 
@@ -509,15 +550,38 @@ export function ControlCenterPage() {
               </span>
             </div>
             <p className="muted">
-              Daemon: <span className="mono">{researchHealth?.daemon_id ?? "-"}</span>
+              Daemon:{" "}
+              {!hasLoaded ? (
+                <span className="skeleton skeleton-line" style={{ display: "inline-block", width: "80px" }} />
+              ) : (
+                <span className="mono">{researchHealth?.daemon_id ?? "-"}</span>
+              )}
             </p>
-            <p className="muted">Heartbeat: {renderHeartbeatDate(researchHealth?.heartbeat_at)}</p>
-            <p className="muted">Age: {researchHealth?.age_seconds ?? "-"}s</p>
+            <p className="muted">
+              Heartbeat:{" "}
+              {!hasLoaded ? (
+                <span className="skeleton skeleton-line" style={{ display: "inline-block", width: "80px" }} />
+              ) : (
+                renderHeartbeatDate(researchHealth?.heartbeat_at)
+              )}
+            </p>
+            <p className="muted">
+              Age:{" "}
+              {!hasLoaded ? (
+                <span className="skeleton skeleton-line" style={{ display: "inline-block", width: "80px" }} />
+              ) : (
+                <>{researchHealth?.age_seconds ?? "-"}s</>
+              )}
+            </p>
             <p className="muted">
               Processing:{" "}
-              {typeof researchHealth?.metadata?.processing === "boolean"
-                ? String(researchHealth.metadata.processing)
-                : "-"}
+              {!hasLoaded ? (
+                <span className="skeleton skeleton-line" style={{ display: "inline-block", width: "80px" }} />
+              ) : researchHealth?.metadata?.processing !== undefined ? (
+                String(researchHealth.metadata.processing)
+              ) : (
+                "-"
+              )}
             </p>
           </article>
         </div>
@@ -561,6 +625,80 @@ export function ControlCenterPage() {
           </div>
           {restartMessage ? <p className="muted restart-note">{restartMessage}</p> : null}
         </details>
+      </section>
+
+      <section className="panel">
+        <h2>Worker Pool</h2>
+        <div className="health-grid">
+          <article className="health-card">
+            <h3>Utilization</h3>
+            <p className="muted">
+              Active runners:{" "}
+              {!hasLoaded ? (
+                <span className="skeleton skeleton-line" style={{ display: "inline-block", width: "60px" }} />
+              ) : (
+                <>
+                  <strong>{orchestratorHealth?.metadata?.active_runs ?? 0}</strong>
+                  {" / "}
+                  {orchestratorHealth?.metadata?.max_concurrent_runs ?? 4}
+                </>
+              )}
+            </p>
+            {hasLoaded ? (
+              <div
+                className="lead-progress-bar"
+                style={{ marginTop: "0.5rem" }}
+                title={`${orchestratorHealth?.metadata?.active_runs ?? 0} of ${orchestratorHealth?.metadata?.max_concurrent_runs ?? 4} slots in use`}
+              >
+                <span
+                  className="lead-progress-fill"
+                  style={{
+                    width: `${Math.min(
+                      100,
+                      Math.round(
+                        ((orchestratorHealth?.metadata?.active_runs ?? 0) /
+                          Math.max(orchestratorHealth?.metadata?.max_concurrent_runs ?? 4, 1)) *
+                          100
+                      )
+                    )}%`
+                  }}
+                />
+              </div>
+            ) : null}
+            <p className="muted" style={{ marginTop: "0.5rem" }}>
+              Available slots:{" "}
+              {!hasLoaded ? (
+                <span className="skeleton skeleton-line" style={{ display: "inline-block", width: "40px" }} />
+              ) : (
+                <strong>{orchestratorHealth?.metadata?.available_runner_slots ?? 0}</strong>
+              )}
+            </p>
+            <p className="muted">
+              Queued tasks:{" "}
+              {!hasLoaded ? (
+                <span className="skeleton skeleton-line" style={{ display: "inline-block", width: "40px" }} />
+              ) : (
+                <strong>{orchestratorHealth?.metadata?.pending_tasks ?? 0}</strong>
+              )}
+            </p>
+          </article>
+
+          <article className="health-card">
+            <h3>Configuration</h3>
+            <p className="muted">
+              <span>Max concurrent runners</span>
+              <br />
+              <span className="mono" style={{ fontSize: "1.25rem" }}>
+                {orchestratorHealth?.metadata?.max_concurrent_runs ?? 4}
+              </span>
+            </p>
+            <p className="muted" style={{ marginTop: "0.5rem" }}>
+              Set via{" "}
+              <span className="mono">SALVO_MAX_CONCURRENT_RUNNERS</span> env var.
+              Changing this value requires a daemon restart to take effect.
+            </p>
+          </article>
+        </div>
       </section>
 
       <section className="panel">

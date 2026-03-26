@@ -1016,6 +1016,16 @@ export class SalvoRepository {
     return Number(result.rows[0]?.count ?? "0");
   }
 
+  async countQueuedTasks(workspaceId?: string): Promise<number> {
+    const result = await this.pool.query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM salvo_tasks
+       WHERE status IN ('queued', 'starting')
+       ${workspaceId ? "AND workspace_id = $1" : ""}`,
+      workspaceId ? [workspaceId] : []
+    );
+    return parseInt(result.rows[0]?.count ?? "0", 10);
+  }
+
   async getTask(taskId: string): Promise<DbTask | null> {
     const result = await this.pool.query<DbTask>(
       `select * from public.salvo_tasks where id = $1 limit 1`,
@@ -2827,6 +2837,19 @@ export class SalvoRepository {
          and checkpoint_key = $2`,
       [runId, checkpointKey]
     );
+  }
+
+  async copyRunCheckpoint(fromRunId: string, toRunId: string, checkpointKey: string): Promise<boolean> {
+    const result = await this.pool.query<{ copied: string }>(
+      `INSERT INTO salvo_run_checkpoints (run_id, checkpoint_key, checkpoint_state, created_at, updated_at)
+       SELECT $2, checkpoint_key, checkpoint_state, now(), now()
+       FROM salvo_run_checkpoints
+       WHERE run_id = $1 AND checkpoint_key = $3
+       ON CONFLICT (run_id, checkpoint_key) DO NOTHING
+       RETURNING run_id`,
+      [fromRunId, toRunId, checkpointKey]
+    );
+    return (result.rowCount ?? 0) > 0;
   }
 
   async getRunFinalPayload(runId: string): Promise<Record<string, unknown> | null> {

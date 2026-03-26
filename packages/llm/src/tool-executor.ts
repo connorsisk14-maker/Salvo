@@ -1,6 +1,7 @@
 import path from "node:path";
 import type { LlmContentBlock } from "./types";
 import type { EmailAdapter, SlackAdapter } from "@salvo/adapters";
+import { executeAdapterRunWithReliability } from "@salvo/adapters";
 
 export type ToolUseBlock = Extract<LlmContentBlock, { type: "tool_use" }>;
 export type ToolResultBlock = Extract<LlmContentBlock, { type: "tool_result" }>;
@@ -669,10 +670,7 @@ export async function executeToolUse(input: ExecuteToolUseInput): Promise<ToolEx
 
     const runId = input.runId ?? input.block.id;
     const payload = input.block.input ?? {};
-    const result = await input.emailAdapter.run({
-      runId,
-      payload
-    });
+    const result = await executeAdapterRunWithReliability("email", () => input.emailAdapter!.run({ runId, payload }));
     const emailOutput = isRecord(result.output) ? result.output : {};
     const metadata = {
       success: result.ok,
@@ -795,10 +793,7 @@ export async function executeToolUse(input: ExecuteToolUseInput): Promise<ToolEx
 
     const runId = input.runId ?? input.block.id;
     const payload = input.block.input ?? {};
-    const result = await input.slackAdapter.run({
-      runId,
-      payload
-    });
+    const result = await executeAdapterRunWithReliability("slack", () => input.slackAdapter!.run({ runId, payload }));
     const slackOutput = isRecord(result.output) ? result.output : {};
     const metadata = {
       success: result.ok,
