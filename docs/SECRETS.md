@@ -33,8 +33,12 @@ SALVO_SECRETS_BACKEND=file
 SALVO_SECRETS_FILE_PATH=./config/secrets.enc.json
 SALVO_WORKSPACE_ROOT=.salvo-workspace
 SALVO_API_PORT=8787
+SALVO_LOCAL_DB_MODE=external
+SALVO_DATABASE_URL=
 VITE_SALVO_API_URL=http://localhost:8787
 ```
+
+Set `SALVO_DATABASE_URL` through your shell environment or secrets backend, then point `pnpm ux:up` at that same local Postgres instance.
 
 If you use the encrypted-file backend, provide `SALVO_SECRETS_FILE_PASSPHRASE` from your shell or terminal session, not from `.env`.
 
@@ -46,6 +50,7 @@ Use this when your launcher or host already injects secrets:
 export SALVO_SECRETS_BACKEND=env
 export SALVO_DATABASE_URL='postgres://...'
 export SALVO_API_TOKEN='...'
+export SALVO_LOCAL_DB_MODE=external
 pnpm ux:up
 ```
 

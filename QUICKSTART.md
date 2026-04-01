@@ -42,7 +42,7 @@ pnpm build
 node scripts/prod-up.mjs
 ```
 
-Open **http://localhost:5173** and enter your `SALVO_API_TOKEN` when prompted.
+Open **http://localhost:5173** in Chrome or any browser on the same machine and enter your `SALVO_API_TOKEN` when prompted.
 
 ---
 
@@ -117,7 +117,7 @@ Uses a fake LLM stub so you can develop and test without spending tokens:
 ```bash
 export SALVO_LOCAL_DB_MODE=external
 export SALVO_DATABASE_URL=postgresql://localhost/salvo_dev
-pnpm ux:up      # starts everything including fake LLM stub
+pnpm ux:up      # starts the browser dashboard, API, daemons, and fake LLM stub
 pnpm ux:smoke   # run smoke tests
 pnpm ux:down    # stop
 ```

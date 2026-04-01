@@ -11,7 +11,7 @@ const envFilePath = path.join(rootDir, ".env");
 const migrationsDir = path.join(rootDir, "supabase", "migrations");
 
 const localDefaults = {
-  dbMode: "docker",
+  dbMode: "external",
   llmMode: "fake",
   postgresContainer: "salvo-postgres",
   postgresPort: 54329,
@@ -493,7 +493,7 @@ async function runDoctor(env, options = {}) {
       }
     }
   } else if (!env.SALVO_DATABASE_URL) {
-    report.errors.push("SALVO_DATABASE_URL (or SALVO_TEST_DATABASE_URL) is required in external DB mode.");
+    report.errors.push("SALVO_DATABASE_URL (or SALVO_TEST_DATABASE_URL) is required when SALVO_LOCAL_DB_MODE=external.");
   }
 
   if (env.SALVO_LOCAL_LLM_MODE === "fake") {
@@ -538,7 +538,7 @@ async function runDbUp(env) {
     if (!env.SALVO_DATABASE_URL) {
       throw new Error("External DB mode requires SALVO_DATABASE_URL.");
     }
-    console.log("[ux] external DB mode selected; skipping local Docker Postgres bootstrap.");
+    console.log("[ux] external DB mode selected; using host PostgreSQL.");
     return;
   }
 
@@ -700,7 +700,7 @@ async function runUp(env) {
   }
 
   console.log("[ux] stack is up");
-  console.log("[ux] dashboard: http://localhost:5173");
+  console.log("[ux] dashboard: http://localhost:5173 (open in Chrome or any browser on this machine)");
   console.log(`[ux] api: ${env.SALVO_E2E_API_URL}`);
   console.log(`[ux] health: ${env.SALVO_E2E_API_URL}/health`);
 }
